@@ -129,6 +129,15 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.highest_prices = {}
         self.entry_times = {}
         self.trade_count = 0
+        
+        # === EXECUTION HARDENING ===
+        self._pending_orders = {}  # Track pending order quantities per symbol
+        self._cancel_cooldowns = {}  # Cancel→wait→exit safety cooldowns per symbol
+        self._exit_cooldowns = {}  # Per-symbol cooldown after exits (avoid re-entry)
+        self._recent_scores = {}  # Track recent net scores for signal stability
+        self.cash_reserve_pct = 0.15  # Reserve 15% of cash
+        self.exit_cooldown_hours = 2  # Hours to wait after exit before re-entry
+        self.cancel_cooldown_minutes = 1  # Minutes to wait after cancel before exit
 
         # === BTC REFERENCE ===
         self.btc_symbol = None
@@ -315,6 +324,14 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         except: return quantity
 
     def _smart_liquidate(self, symbol, tag="Liquidate"):
+        # Exit gating: return early if open orders exist
+        if len(self.Transactions.GetOpenOrders(symbol)) > 0:
+            return
+        
+        # Cancel→wait→exit safety: check cooldown
+        if symbol in self._cancel_cooldowns and self.Time < self._cancel_cooldowns[symbol]:
+            return
+        
         if symbol not in self.Portfolio or self.Portfolio[symbol].Quantity == 0: return
         self.Transactions.CancelOpenOrders(symbol)
         holding_qty = self.Portfolio[symbol].Quantity
@@ -357,6 +374,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     self.Debug(f"Canceling stale: {ticker} (age: {order_age/60:.1f}m)")
                     
                     self.Transactions.CancelOrder(order.Id)
+                    
+                    # Set cancel cooldown to prevent immediate exit attempts
+                    self._cancel_cooldowns[order.Symbol] = self.Time + timedelta(minutes=self.cancel_cooldown_minutes)
                     
                     # Aggressive blacklist for stuck orders to prevent loop
                     if len(self._session_blacklist) < self._max_session_blacklist_size:
@@ -461,6 +481,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             'rs_vs_btc': deque(maxlen=self.medium_period),
             'zscore': deque(maxlen=self.short_period),
             'last_price': 0,
+            'recent_net_scores': deque(maxlen=3),  # For signal stability filter
         }
 
     def OnSecuritiesChanged(self, changes):
@@ -603,7 +624,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
         if dd > self.max_drawdown_limit:
             self.drawdown_cooldown = self.cooldown_hours
-            self._notify(f"Drawdown {dd:.1%} exceeded limit. Cooling down.")
+            self.Debug(f"Drawdown {dd:.1%} exceeded limit. Cooling down.")
             return
 
         if self.consecutive_losses >= self.max_consecutive_losses:
@@ -667,32 +688,88 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             
             sym = cand['symbol']
             comp_score = cand.get('composite_score', 0.5)
+            net_score = cand.get('net_score', 0.5)
 
+            # Check for pending orders (partial fill tracking)
+            if sym in self._pending_orders and self._pending_orders[sym] > 0:
+                continue
+            
             if self.Transactions.GetOpenOrders(sym): continue
             if self._is_invested_not_dust(sym): continue
             
+            # Per-symbol cooldown after exits (avoid re-entry)
+            if sym in self._exit_cooldowns and self.Time < self._exit_cooldowns[sym]:
+                continue
+            
             sec = self.Securities[sym]
-            cash = self.Portfolio.Cash * 0.95
+            
+            # Cash reserve handling via CashBook
+            try:
+                available_cash = self.Portfolio.CashBook["USD"].Amount
+            except:
+                available_cash = self.Portfolio.Cash
+            
+            # Apply reserve (15% by default)
+            reserved_cash = available_cash * (1 - self.cash_reserve_pct)
             
             min_qty = self._get_min_quantity(sym)
-            if min_qty * sec.Price > cash * 0.6: continue
+            if min_qty * sec.Price > reserved_cash * 0.6: continue
 
-            vol = self._annualized_vol(self.crypto_data[sym])
+            # Get crypto data for add-ons
+            crypto = self.crypto_data.get(sym)
+            if not crypto: continue
+            
+            # === SELECTION ADD-ONS ===
+            
+            # 1. Trend confirmation: EMA short > EMA medium and recent return > 0
+            if crypto['ema_short'].IsReady and crypto['ema_medium'].IsReady:
+                ema_short = crypto['ema_short'].Current.Value
+                ema_medium = crypto['ema_medium'].Current.Value
+                if ema_short <= ema_medium:
+                    continue  # Trend not confirmed
+                
+                # Check recent return > 0
+                if len(crypto['returns']) >= 3:
+                    recent_return = np.mean(list(crypto['returns'])[-3:])
+                    if recent_return <= 0:
+                        continue  # Recent return not positive
+            
+            # 2. Signal stability filter: 2 of last 3 bars above threshold
+            crypto['recent_net_scores'].append(net_score)
+            if len(crypto['recent_net_scores']) >= 3:
+                above_threshold_count = sum(1 for score in crypto['recent_net_scores'] if score > threshold_now)
+                if above_threshold_count < 2:
+                    continue  # Signal not stable
+            
+            # 3. Calculate base size
+            vol = self._annualized_vol(crypto)
             size = self._calculate_position_size(comp_score, threshold_now, vol)
-            val = cash * size
+            
+            # 4. Volatility-aware size scaler (reduce size in high vol regime)
+            if self.volatility_regime == "high":
+                size *= 0.7  # Reduce size by 30% in high volatility
+            
+            # 5. Price impact sizing: scale down if order is large vs recent dollar volume
+            if len(crypto['dollar_volume']) >= 6:
+                recent_dollar_vol = np.mean(list(crypto['dollar_volume'])[-6:])
+                order_value_estimate = reserved_cash * size
+                if recent_dollar_vol > 0:
+                    impact_ratio = order_value_estimate / recent_dollar_vol
+                    if impact_ratio > 0.1:  # Order is >10% of recent volume
+                        size *= max(0.3, 1.0 - impact_ratio)  # Scale down, min 30% of original
+            
+            val = reserved_cash * size
             
             qty = self._round_quantity(sym, val / sec.Price)
             if qty < min_qty:
                 qty = self._round_quantity(sym, min_qty)
                 val = qty * sec.Price
             
-            if val < self.min_notional or val > cash: continue
+            if val < self.min_notional or val > reserved_cash: continue
 
             try:
                 self.MarketOrder(sym, qty)
-                self.entry_prices[sym] = sec.Price
-                self.highest_prices[sym] = sec.Price
-                self.entry_times[sym] = self.Time
+                # Entry tracking moved to OnOrderEvent (on fill)
                 self.trade_count += 1
                 self._debug_limited(f"ORDER: {sym.Value} | ${val:.2f}")
             except Exception as e:
@@ -796,6 +873,14 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             self._check_exit(kvp.Key, self.Securities[kvp.Key].Price, kvp.Value)
 
     def _check_exit(self, symbol, price, holding):
+        # Exit gating: return early if open orders exist
+        if len(self.Transactions.GetOpenOrders(symbol)) > 0:
+            return
+        
+        # Cancel→wait→exit safety: check cooldown
+        if symbol in self._cancel_cooldowns and self.Time < self._cancel_cooldowns[symbol]:
+            return
+        
         if symbol not in self.entry_prices:
              self.entry_prices[symbol] = holding.AveragePrice
              self.highest_prices[symbol] = holding.AveragePrice
@@ -838,6 +923,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if tag:
             self._smart_liquidate(symbol, tag)
             self._cleanup_position(symbol)
+            
+            # Set exit cooldown to prevent immediate re-entry
+            self._exit_cooldowns[symbol] = self.Time + timedelta(hours=self.exit_cooldown_hours)
+            
             if pnl > 0: 
                 self.winning_trades += 1
                 self.consecutive_losses = 0
@@ -861,16 +950,57 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
     def OnOrderEvent(self, event):
         try:
-            if event.Status == OrderStatus.Filled:
-                if event.Direction == OrderDirection.Buy: 
+            symbol = event.Symbol
+            
+            if event.Status == OrderStatus.Submitted:
+                # Track pending order quantity
+                if symbol not in self._pending_orders:
+                    self._pending_orders[symbol] = 0
+                self._pending_orders[symbol] += abs(event.FillQuantity) if event.FillQuantity != 0 else abs(event.Quantity)
+            
+            elif event.Status == OrderStatus.PartiallyFilled:
+                # Update pending quantity on partial fill
+                if symbol in self._pending_orders:
+                    self._pending_orders[symbol] -= abs(event.FillQuantity)
+                    if self._pending_orders[symbol] <= 0:
+                        self._pending_orders.pop(symbol, None)
+                
+                # Set entry tracking on BUY fills
+                if event.Direction == OrderDirection.Buy:
+                    if symbol not in self.entry_prices:
+                        self.entry_prices[symbol] = event.FillPrice
+                        self.highest_prices[symbol] = event.FillPrice
+                        self.entry_times[symbol] = self.Time
+                    self._debug_limited(f"PARTIAL BUY: {symbol.Value} @ ${event.FillPrice:.4f}")
+            
+            elif event.Status == OrderStatus.Filled:
+                # Clear pending order tracking
+                self._pending_orders.pop(symbol, None)
+                
+                if event.Direction == OrderDirection.Buy:
+                    # Entry tracking on BUY fill
+                    self.entry_prices[symbol] = event.FillPrice
+                    self.highest_prices[symbol] = event.FillPrice
+                    self.entry_times[symbol] = self.Time
                     self.daily_trade_count += 1
-                    self._debug_limited(f"FILLED BUY: {event.Symbol.Value} @ ${event.FillPrice:.4f}")
+                    self._debug_limited(f"FILLED BUY: {symbol.Value} @ ${event.FillPrice:.4f}")
                 else:
-                    self._debug_limited(f"FILLED SELL: {event.Symbol.Value} @ ${event.FillPrice:.4f}")
+                    # Clear tracking on SELL fill
+                    self._cleanup_position(symbol)
+                    self._debug_limited(f"FILLED SELL: {symbol.Value} @ ${event.FillPrice:.4f}")
+            
+            elif event.Status == OrderStatus.Canceled:
+                # Clear pending order tracking
+                self._pending_orders.pop(symbol, None)
+                self._debug_limited(f"CANCELED: {symbol.Value}")
+            
             elif event.Status == OrderStatus.Invalid:
-                self.Debug(f"INVALID: {event.Symbol.Value} - {event.Message}")
-                self._session_blacklist.add(event.Symbol.Value)
-        except: pass
+                # Clear pending order tracking
+                self._pending_orders.pop(symbol, None)
+                self.Debug(f"INVALID: {symbol.Value} - {event.Message}")
+                self._session_blacklist.add(symbol.Value)
+        except Exception as e:
+            self.Debug(f"OnOrderEvent error: {e}")
         
     def OnEndOfAlgorithm(self):
         total = self.winning_trades + self.losing_trades
