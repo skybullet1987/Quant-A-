@@ -412,10 +412,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             return
         # Verify fee reserve before selling (Kraken cash account requirement)
         if self.LiveMode and holding_qty > 0:
-            estimated_fee = price * abs(holding_qty) * 0.006  # 0.4% fee + safety buffer
+            estimated_fee = price * abs(holding_qty) * 0.006  # 0.6% (0.4% fee + 0.2% safety buffer)
             try:
                 available_usd = self.Portfolio.CashBook["USD"].Amount
-            except:
+            except (KeyError, AttributeError):
                 available_usd = self.Portfolio.Cash
             if available_usd < estimated_fee:
                 self.Debug(f"⚠️ SKIP SELL {symbol.Value}: fee reserve too low "
@@ -727,6 +727,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     def _spread_ok(self, symbol):
         sp = self._get_spread_pct(symbol)
         if sp is None:
+            # In live mode, fail-closed (reject if spread unknown); in backtest, allow
             return not self.LiveMode
         effective_spread_cap = self.max_spread_pct
         if self.LiveMode and (self.volatility_regime == "high" or self.market_regime == "sideways"):
@@ -891,7 +892,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             total_value = self.Portfolio.TotalPortfolioValue
             try:
                 available_cash = self.Portfolio.CashBook["USD"].Amount
-            except:
+            except (KeyError, AttributeError):
                 available_cash = self.Portfolio.Cash
             # Reserve based on portfolio value, not just remaining cash
             portfolio_reserve = total_value * self.cash_reserve_pct
@@ -1209,7 +1210,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     self.entry_times[symbol] = self.Time
                     self.daily_trade_count += 1
                 else:
-                    entry = self.entry_prices.get(symbol, event.FillPrice)
+                    entry = self.entry_prices.get(symbol, None)
+                    if entry is None:
+                        # Fallback for missing entry tracking
+                        entry = event.FillPrice
+                        self.Debug(f"⚠️ WARNING: Missing entry price for {symbol.Value} sell, using fill price")
                     pnl = (event.FillPrice - entry) / entry if entry > 0 else 0
                     if pnl > 0:
                         self.winning_trades += 1
