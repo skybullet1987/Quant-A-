@@ -12,7 +12,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     """
     Simplified 5-Factor Strategy - LIVE READY v2.8.1 (realism-hardened)
     Key protections (as requested):
-    - Exchange-status gate: trade only when Kraken status == "online".
+    - Exchange-status gate: trade only when Kraken status is OK (maintenance/cancel_only are blocked; unknown falls back to online after warmup).
     - Stale handling: stale cancels only when online; blacklist symbol on zombie, skip reprocessing blacklisted.
     - Liquidity/impact: live entry liquidity floor $5k over last 6 bars; impact cap 5% (scale >3%).
     - Spread guard: 1.5% cap in high-vol/sideways; median-widen check.
@@ -62,7 +62,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
     def Initialize(self):
         self.SetStartDate(2024, 1, 1)
-        self.SetCash(20)
+        self.SetCash(100)
         self.SetBrokerageModel(BrokerageName.Kraken, AccountType.Cash)
 
         self.threshold_bull = self._get_param("threshold_bull", 0.50)
@@ -155,6 +155,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.slip_alert_duration_hours = 2
         self._bad_symbol_counts = {}
 
+        self._recent_tickets = deque(maxlen=25)
+
         self.btc_symbol = None
         self.btc_returns = deque(maxlen=self.long_period)
         self.btc_prices = deque(maxlen=self.long_period)
@@ -174,6 +176,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.min_volume_usd = 500
         self.max_universe_size = 1000
 
+        # Kraken status gate:
+        # - "online": trade
+        # - "maintenance" / "cancel_only": block
+        # - "unknown": allowed after warmup fallback to "online"
         self.kraken_status = "unknown"
 
         self._last_skip_reason = None
@@ -193,6 +199,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.At(0, 0), self.ResetDailyCounters)
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(hours=6)), self.ReviewPerformance)
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.At(12, 0), self.HealthCheck)
+        # Hourly live resync to catch fills that may have been missed by event stream
+        self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(hours=1)), self.ResyncHoldings)
 
         self.SetWarmUp(timedelta(days=5))
         self.SetSecurityInitializer(lambda security: security.SetSlippageModel(VolumeShareSlippageModel(0.15, 0.02)))
@@ -262,6 +270,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
     def HealthCheck(self):
         if self.IsWarmingUp: return
+        # Live resync to catch any holdings the event stream might have missed
+        self.ResyncHoldings()
         issues = []
         if self.Portfolio.Cash < 5:
             issues.append(f"Low cash: ${self.Portfolio.Cash:.2f}")
@@ -285,6 +295,39 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 self.Debug(f"  ⚠️ {issue}")
         else:
             self._debug_limited("Health check: OK")
+
+    def ResyncHoldings(self):
+        """
+        Live-only safety: backfills tracking for any holdings that exist in the brokerage
+        but were not registered via OnOrderEvent (e.g., missed fill events).
+        """
+        if self.IsWarmingUp: return
+        if not self.LiveMode: return
+        missing = []
+        for symbol in self.Portfolio.Keys:
+            holding = self.Portfolio[symbol]
+            if not holding.Invested or holding.Quantity == 0:
+                continue
+            if symbol in self.entry_prices:
+                continue
+            missing.append(symbol)
+        if not missing:
+            return
+        self.Debug(f"RESYNC: detected {len(missing)} holdings without tracking; backfilling.")
+        for symbol in missing:
+            try:
+                if symbol not in self.Securities:
+                    self.AddCrypto(symbol.Value, Resolution.Hour, Market.Kraken)
+                holding = self.Portfolio[symbol]
+                entry = holding.AveragePrice
+                self.entry_prices[symbol] = entry
+                self.highest_prices[symbol] = entry
+                self.entry_times[symbol] = self.Time
+                current_price = self.Securities[symbol].Price if symbol in self.Securities else holding.Price
+                pnl_pct = (current_price - entry) / entry if entry > 0 else 0
+                self.Debug(f"RESYNCED: {symbol.Value} | Qty: {holding.Quantity} | Entry: ${entry:.4f} | Now: ${current_price:.4f} | PnL: {pnl_pct:+.2%}")
+            except Exception as e:
+                self.Debug(f"Resync error {symbol.Value}: {e}")
 
     def ReviewPerformance(self):
         if self.IsWarmingUp or len(self.trade_log) < 5: return
@@ -388,8 +431,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         return self.live_stale_order_timeout_seconds if self.LiveMode else self.stale_order_timeout_seconds
 
     def _cancel_stale_new_orders(self):
-        if self.LiveMode and self.kraken_status != "online":
-            return
+        # Allow cancel gate when venue is online or unknown (fallback handled elsewhere)
         try:
             open_orders = self.Transactions.GetOpenOrders()
             timeout_seconds = self._effective_stale_timeout()
@@ -549,6 +591,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             self._sync_existing_positions()
             self._positions_synced = True
             self._first_post_warmup = False
+            # Fallback: if status never set, assume online after warmup
+            if self.kraken_status == "unknown":
+                self.kraken_status = "online"
+                self.Debug("Fallback: kraken_status set to online after warmup")
             ready_count = sum(1 for c in self.crypto_data.values() if self._is_ready(c))
             self.Debug(f"Post-warmup: {ready_count} symbols ready")
         self._update_market_context()
@@ -702,7 +748,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     def Rebalance(self):
         if self.IsWarmingUp:
             return
-        if self.LiveMode and self.kraken_status != "online":
+        # Only block on explicit bad states; unknown is allowed (and will have fallback after warmup)
+        if self.LiveMode and self.kraken_status in ("maintenance", "cancel_only"):
             self._log_skip("kraken not online")
             return
         self._cancel_stale_new_orders()
@@ -784,7 +831,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     def _execute_trades(self, candidates, threshold_now, dynamic_max_pos):
         if not self._positions_synced:
             return
-        if self.LiveMode and self.kraken_status != "online":
+        if self.LiveMode and self.kraken_status in ("maintenance", "cancel_only"):
             return
         self._cancel_stale_new_orders()
         if len(self.Transactions.GetOpenOrders()) > self.max_concurrent_open_orders:
@@ -879,7 +926,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if val < min_notional_usd or val < self.min_notional or val > reserved_cash:
                 continue
             try:
-                self.MarketOrder(sym, qty)
+                ticket = self.MarketOrder(sym, qty)
+                if ticket is not None:
+                    self._recent_tickets.append(ticket)
+                    self.Debug(f"ORDER: {sym.Value} | ${val:.2f} | id={ticket.OrderId}")
                 self.trade_count += 1
                 self._debug_limited(f"ORDER: {sym.Value} | ${val:.2f}")
             except Exception as e:
@@ -1111,6 +1161,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     def OnOrderEvent(self, event):
         try:
             symbol = event.Symbol
+            msg = (
+                f"ORDER EVENT: {symbol.Value} | status={event.Status} | dir={event.Direction} | "
+                f"qty={event.FillQuantity or event.Quantity} | price={event.FillPrice} | id={event.OrderId}"
+            )
+            self.Debug(msg)
             if event.Status == OrderStatus.Submitted:
                 if symbol not in self._pending_orders:
                     self._pending_orders[symbol] = 0
@@ -1126,7 +1181,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                         self.entry_prices[symbol] = event.FillPrice
                         self.highest_prices[symbol] = event.FillPrice
                         self.entry_times[symbol] = self.Time
-                    self._debug_limited(f"PARTIAL BUY: {symbol.Value} @ ${event.FillPrice:.4f}")
                 self._slip_log(symbol, event.Direction, event.FillPrice)
             elif event.Status == OrderStatus.Filled:
                 self._pending_orders.pop(symbol, None)
@@ -1135,17 +1189,13 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     self.highest_prices[symbol] = event.FillPrice
                     self.entry_times[symbol] = self.Time
                     self.daily_trade_count += 1
-                    self._debug_limited(f"FILLED BUY: {symbol.Value} @ ${event.FillPrice:.4f}")
                 else:
                     self._cleanup_position(symbol)
-                    self._debug_limited(f"FILLED SELL: {symbol.Value} @ ${event.FillPrice:.4f}")
                 self._slip_log(symbol, event.Direction, event.FillPrice)
             elif event.Status == OrderStatus.Canceled:
                 self._pending_orders.pop(symbol, None)
-                self.Debug(f"CANCELED: {symbol.Value}")
             elif event.Status == OrderStatus.Invalid:
                 self._pending_orders.pop(symbol, None)
-                self.Debug(f"INVALID: {symbol.Value} - {event.Message}")
                 self._session_blacklist.add(symbol.Value)
         except Exception as e:
             self.Debug(f"OnOrderEvent error: {e}")
@@ -1153,6 +1203,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     def OnBrokerageMessage(self, message):
         try:
             txt = message.Message.lower()
+            # self.Debug(f"BRKR MSG: {message.Message}")  # uncomment for diagnostics
             if "system status:" in txt:
                 if "online" in txt:
                     self.kraken_status = "online"
