@@ -144,8 +144,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.exit_cooldown_hours = 2
         self.cancel_cooldown_minutes = 1
 
-        self.partial_tp_ratio = 0.5
-        self.tp1_atr_mult = 1.2
         self.trailing_grace_hours = 2
         self.atr_trail_mult = 1.2
 
@@ -233,7 +231,20 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         return []
 
     def _persist_state(self):
-        return
+        if not self.LiveMode:
+            return
+        try:
+            state = {
+                "session_blacklist": list(self._session_blacklist),
+                "winning_trades": self.winning_trades,
+                "losing_trades": self.losing_trades,
+                "total_pnl": self.total_pnl,
+                "consecutive_losses": self.consecutive_losses,
+                "daily_trade_count": self.daily_trade_count,
+            }
+            self.ObjectStore.Save("live_state", json.dumps(state))
+        except Exception as e:
+            self.Debug(f"Persist error: {e}")
 
     def _load_persisted_state(self):
         try:
@@ -241,7 +252,13 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 raw = self.ObjectStore.Read("live_state")
                 data = json.loads(raw)
                 self._session_blacklist = set(data.get("session_blacklist", []))
-                self.Debug(f"Loaded persisted state: blacklist {len(self._session_blacklist)}")
+                self.winning_trades = data.get("winning_trades", 0)
+                self.losing_trades = data.get("losing_trades", 0)
+                self.total_pnl = data.get("total_pnl", 0.0)
+                self.consecutive_losses = data.get("consecutive_losses", 0)
+                self.daily_trade_count = data.get("daily_trade_count", 0)
+                self.Debug(f"Loaded persisted state: blacklist {len(self._session_blacklist)}, "
+                           f"trades W:{self.winning_trades}/L:{self.losing_trades}")
         except Exception as e:
             self.Debug(f"Load persist error: {e}")
 
@@ -530,11 +547,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         for symbol, ticker, pnl_pct, reason in positions_to_close:
             self.Debug(f"IMMEDIATE {reason}: {ticker} at {pnl_pct:+.2%}")
             self._smart_liquidate(symbol, reason)
-            if pnl_pct > 0:
-                self.winning_trades += 1
-            else:
-                self.losing_trades += 1
-            self._cleanup_position(symbol)
+            # Let OnOrderEvent handle cleanup and PnL tracking on fill
 
     def UniverseFilter(self, universe):
         selected = []
@@ -581,9 +594,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             symbol = security.Symbol
             if not self.IsWarmingUp and self._is_invested_not_dust(symbol):
                 self._smart_liquidate(symbol, "Removed from universe")
-                self._cleanup_position(symbol)
+                # Don't cleanup here — let OnOrderEvent handle it on fill
                 self.Debug(f"FORCED EXIT: {symbol.Value} - removed from universe")
-            if symbol in self.crypto_data:
+            # Only delete crypto_data if not invested (otherwise OnOrderEvent needs it)
+            if symbol in self.crypto_data and not self._is_invested_not_dust(symbol):
                 del self.crypto_data[symbol]
 
     def OnData(self, data):
@@ -1099,8 +1113,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         highest = self.highest_prices.get(symbol, entry)
         if price > highest:
             self.highest_prices[symbol] = price
-        pnl = (price - entry) / entry
-        dd = (highest - price) / highest
+        pnl = (price - entry) / entry if entry > 0 else 0
+        dd = (highest - price) / highest if highest > 0 else 0
         hours = (self.Time - self.entry_times.get(symbol, self.Time)).total_seconds() / 3600
         sl, tp = self.base_stop_loss, self.base_take_profit
         if self.volatility_regime == "high":
@@ -1134,14 +1148,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             tag = "Bear Exit"
         elif hours > 24 and pnl < 0.01:
             tag = "Time Exit"
-        if atr and entry > 0 and holding.Quantity > 0:
-            tp1 = entry + atr * self.tp1_atr_mult
-            if price >= tp1 and not tag:
-                qty_half = self._round_quantity(symbol, holding.Quantity * self.partial_tp_ratio)
-                rem_qty = holding.Quantity - qty_half
-                rem_val = rem_qty * price
-                if qty_half > 0 and rem_val >= min_notional_usd * 0.9:
-                    self.MarketOrder(symbol, -qty_half, tag="TP1 Partial")
         if not tag and trailing_allowed and atr and entry > 0 and holding.Quantity != 0:
             trail_offset = atr * self.atr_trail_mult
             trail_level = price - trail_offset
