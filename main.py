@@ -412,7 +412,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             return
         # Verify fee reserve before selling (Kraken cash account requirement)
         if self.LiveMode and holding_qty > 0:
-            estimated_fee = price * abs(holding_qty) * 0.006  # 0.6% (0.4% fee + 0.2% safety buffer)
+            estimated_fee = price * abs(holding_qty) * 0.006  # 0.6% fee estimate (0.4% base + 0.2% safety buffer)
             try:
                 available_usd = self.Portfolio.CashBook["USD"].Amount
             except (KeyError, AttributeError):
@@ -896,8 +896,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 available_cash = self.Portfolio.Cash
             # Reserve based on portfolio value, not just remaining cash
             portfolio_reserve = total_value * self.cash_reserve_pct
-            fee_floor = total_value * 0.02  # Always keep 2% for fee coverage
-            effective_reserve = max(portfolio_reserve, fee_floor)
+            fee_reserve = total_value * 0.02  # Reserve 2% of portfolio value for fee coverage
+            effective_reserve = max(portfolio_reserve, fee_reserve)
             reserved_cash = available_cash - effective_reserve
             if reserved_cash <= 0:
                 continue
@@ -954,8 +954,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 qty = self._round_quantity(sym, min_qty)
                 val = qty * price
             # Verify total cost with fees doesn't breach reserve
-            total_cost_with_fee = val * 1.006
-            if total_cost_with_fee > available_cash - fee_floor:
+            total_cost_with_fee = val * 1.006  # Include 0.6% fee in total cost
+            if total_cost_with_fee > available_cash - fee_reserve:
                 continue
             if val < min_notional_usd or val < self.min_notional or val > reserved_cash:
                 continue
