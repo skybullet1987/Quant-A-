@@ -94,6 +94,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.max_positions = self.base_max_positions
         self.position_size_pct = 0.45
         self.min_notional = 5.0  # lowered per request
+        self.min_price_usd = 0.005
 
         self.expected_round_trip_fees = 0.0026
         self.fee_slippage_buffer = 0.003
@@ -310,6 +311,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 continue
             if symbol in self.entry_prices:
                 continue
+            if symbol in self._exit_cooldowns and self.Time < self._exit_cooldowns[symbol]:
+                continue
+            if self._has_open_orders(symbol):
+                continue
             missing.append(symbol)
         if not missing:
             return
@@ -405,6 +410,21 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         price = self.Securities[symbol].Price if symbol in self.Securities else 0
         if price * abs(holding_qty) < min_notional * 0.9:
             return
+        # Verify fee reserve before selling (Kraken cash account requirement)
+        if self.LiveMode and holding_qty > 0:
+            estimated_fee = price * abs(holding_qty) * 0.006  # 0.4% fee + safety buffer
+            try:
+                available_usd = self.Portfolio.CashBook["USD"].Amount
+            except:
+                available_usd = self.Portfolio.Cash
+            if available_usd < estimated_fee:
+                self.Debug(f"⚠️ SKIP SELL {symbol.Value}: fee reserve too low "
+                           f"(need ${estimated_fee:.4f}, have ${available_usd:.4f})")
+                if symbol not in self.entry_prices:
+                    self.entry_prices[symbol] = self.Portfolio[symbol].AveragePrice
+                    self.highest_prices[symbol] = self.Portfolio[symbol].AveragePrice
+                    self.entry_times[symbol] = self.Time
+                return
         self.Transactions.CancelOpenOrders(symbol)
         if abs(holding_qty) < min_qty:
             return
@@ -707,7 +727,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     def _spread_ok(self, symbol):
         sp = self._get_spread_pct(symbol)
         if sp is None:
-            return True
+            return not self.LiveMode
         effective_spread_cap = self.max_spread_pct
         if self.LiveMode and (self.volatility_regime == "high" or self.market_regime == "sideways"):
             effective_spread_cap = min(effective_spread_cap, 0.015)
@@ -860,17 +880,26 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             price = sec.Price
             if price is None or price <= 0:
                 continue
+            if price < self.min_price_usd:
+                continue
 
             effective_size_cap = self.position_size_pct
             if self.LiveMode and (self.volatility_regime == "high" or self.market_regime == "sideways"):
                 effective_size_cap = min(effective_size_cap, 0.25)
 
             corr_downscale = 1.0
+            total_value = self.Portfolio.TotalPortfolioValue
             try:
                 available_cash = self.Portfolio.CashBook["USD"].Amount
             except:
                 available_cash = self.Portfolio.Cash
-            reserved_cash = available_cash * (1 - self.cash_reserve_pct)
+            # Reserve based on portfolio value, not just remaining cash
+            portfolio_reserve = total_value * self.cash_reserve_pct
+            fee_floor = total_value * 0.02  # Always keep 2% for fee coverage
+            effective_reserve = max(portfolio_reserve, fee_floor)
+            reserved_cash = available_cash - effective_reserve
+            if reserved_cash <= 0:
+                continue
             min_qty = self._get_min_quantity(sym)
             min_notional_usd = self._get_min_notional_usd(sym)
             if min_qty * price > reserved_cash * 0.6:
@@ -923,6 +952,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if qty < min_qty:
                 qty = self._round_quantity(sym, min_qty)
                 val = qty * price
+            # Verify total cost with fees doesn't breach reserve
+            total_cost_with_fee = val * 1.006
+            if total_cost_with_fee > available_cash - fee_floor:
+                continue
             if val < min_notional_usd or val < self.min_notional or val > reserved_cash:
                 continue
             try:
@@ -1134,21 +1167,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if price * abs(holding.Quantity) < min_notional_usd * 0.9:
                 return
             self._smart_liquidate(symbol, tag)
-            self._cleanup_position(symbol)
             self._exit_cooldowns[symbol] = self.Time + timedelta(hours=self.exit_cooldown_hours)
-            if pnl > 0:
-                self.winning_trades += 1
-                self.consecutive_losses = 0
-            else:
-                self.losing_trades += 1
-                self.consecutive_losses += 1
-            self.total_pnl += pnl
-            self.trade_log.append({
-                'time': self.Time,
-                'symbol': symbol.Value,
-                'pnl_pct': pnl,
-                'exit_reason': tag,
-            })
             self.Debug(f"{tag}: {symbol.Value} | PnL:{pnl:+.2%} | Held:{hours:.0f}h")
 
     def _cleanup_position(self, symbol):
@@ -1190,12 +1209,41 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     self.entry_times[symbol] = self.Time
                     self.daily_trade_count += 1
                 else:
+                    entry = self.entry_prices.get(symbol, event.FillPrice)
+                    pnl = (event.FillPrice - entry) / entry if entry > 0 else 0
+                    if pnl > 0:
+                        self.winning_trades += 1
+                        self.consecutive_losses = 0
+                    else:
+                        self.losing_trades += 1
+                        self.consecutive_losses += 1
+                    self.total_pnl += pnl
+                    self.trade_log.append({
+                        'time': self.Time,
+                        'symbol': symbol.Value,
+                        'pnl_pct': pnl,
+                        'exit_reason': 'filled_sell',
+                    })
                     self._cleanup_position(symbol)
                 self._slip_log(symbol, event.Direction, event.FillPrice)
             elif event.Status == OrderStatus.Canceled:
                 self._pending_orders.pop(symbol, None)
+                if event.Direction == OrderDirection.Sell and symbol not in self.entry_prices:
+                    if self._is_invested_not_dust(symbol):
+                        holding = self.Portfolio[symbol]
+                        self.entry_prices[symbol] = holding.AveragePrice
+                        self.highest_prices[symbol] = holding.AveragePrice
+                        self.entry_times[symbol] = self.Time
+                        self.Debug(f"RE-TRACKED after cancel: {symbol.Value}")
             elif event.Status == OrderStatus.Invalid:
                 self._pending_orders.pop(symbol, None)
+                if event.Direction == OrderDirection.Sell and symbol not in self.entry_prices:
+                    if self._is_invested_not_dust(symbol):
+                        holding = self.Portfolio[symbol]
+                        self.entry_prices[symbol] = holding.AveragePrice
+                        self.highest_prices[symbol] = holding.AveragePrice
+                        self.entry_times[symbol] = self.Time
+                        self.Debug(f"RE-TRACKED after invalid: {symbol.Value}")
                 self._session_blacklist.add(symbol.Value)
         except Exception as e:
             self.Debug(f"OnOrderEvent error: {e}")
