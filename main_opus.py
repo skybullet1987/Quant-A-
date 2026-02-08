@@ -6,56 +6,21 @@ import numpy as np
 from collections import deque
 from datetime import timedelta
 from scipy import stats as scipy_stats
+from scoring import OpusScoringEngine
 # endregion
 
 
 class OpusCryptoStrategy(QCAlgorithm):
     """
     OPUS - Ultra-Aggressive Crypto Strategy v1.0
-    
     Goal: $20 → $10,000 in 1 year on Kraken Cash
     
-    Architecture:
-    ────────────────────────────────────────────────────
-    1. MULTI-TIMEFRAME MOMENTUM CASCADE
-       - 3h/6h/12h/24h momentum alignment
-       - Only enter when 3+ timeframes agree
-       - Captures micro-trends that larger accounts can't
-    
-    2. REGIME-ADAPTIVE POSITION SIZING
-       - Bull regime: max 3 positions, 55% each (overlap OK)
-       - Sideways: 2 positions, 45% each
-       - Bear: 1 position, 35% (defensive)
-       - High-vol: tighten everything
-    
-    3. BREAKOUT DETECTION ENGINE
-       - Volume spike detection (>2x median)
-       - Price breakout from 24h range
-       - Bollinger Band squeeze-and-release
-       - RSI divergence signals
-    
-    4. INTELLIGENT EXIT CASCADE
-       - Phase 1 (0-2h): Only hard stop loss
-       - Phase 2 (2-6h): ATR trail activates
-       - Phase 3 (6-12h): Signal decay check
-       - Phase 4 (12h+): Tighten trailing, time pressure
-       - Phase 5 (24h+): Must show >2% or exit
-    
-    5. PORTFOLIO HEAT MANAGEMENT
-       - Correlation-aware (avoid double-exposure to BTC-correlated moves)
-       - Sector rotation (DeFi / L1 / L2 / Meme / Privacy)
-       - Dynamic kelly-fraction sizing
-    
-    6. ANTI-OVERFITTING MEASURES
-       - Realistic slippage model (VolumeShareSlippage)
-       - Fee-adjusted scoring (must beat 0.52% round-trip)
-       - Impact estimation on thin books
-       - Exit slippage penalty for micro-caps
-    
-    Restricted coins from user's file are INCLUDED in the tradeable universe.
+    Features: 8-factor scoring (multi-timeframe, breakout detection), 
+    regime-adaptive sizing, Kelly criterion, ATR-based exits, sector rotation.
+    Scoring logic in scoring.py to stay under 64K character limit.
     """
 
-    # ─── BLACKLIST: only genuinely untradeable / stablecoin / wrapped ───
+    # BLACKLIST: only genuinely untradeable / stablecoin / wrapped
     SYMBOL_BLACKLIST = {
         "BTCUSD", "ETHUSD",                    # Too expensive for $20 account, low edge
         "USDTUSD", "USDCUSD", "PYUSDUSD",      # Stablecoins
@@ -98,13 +63,13 @@ class OpusCryptoStrategy(QCAlgorithm):
         self.SetCash(20)
         self.SetBrokerageModel(BrokerageName.Kraken, AccountType.Cash)
 
-        # ─── AGGRESSIVE SIGNAL THRESHOLDS ───
+        # AGGRESSIVE SIGNAL THRESHOLDS
         self.threshold_bull = 0.42        # Lower = more trades in bull
         self.threshold_bear = 0.58        # Higher = fewer trades in bear
         self.threshold_sideways = 0.48    # Moderate
         self.threshold_high_vol = 0.52    # Slightly tighter in chaos
 
-        # ─── EXIT PARAMETERS ───
+        # EXIT PARAMETERS
         self.trailing_activation = 0.04   # Start trailing at +4%
         self.trailing_stop_pct = 0.025    # 2.5% trail
         self.base_stop_loss = 0.045       # Tight 4.5% stop
@@ -112,14 +77,14 @@ class OpusCryptoStrategy(QCAlgorithm):
         self.atr_sl_mult = 1.4            # ATR-based SL multiplier
         self.atr_tp_mult = 2.8            # ATR-based TP multiplier
 
-        # ─── RISK PARAMETERS ───
+        # RISK PARAMETERS
         self.target_position_ann_vol = 0.30   # Target 30% annualized vol per position
         self.portfolio_vol_cap = 0.50         # Allow higher portfolio volatility
         self.signal_decay_buffer = 0.04       # Signal must decay significantly to exit
         self.min_signal_age_hours = 4         # Check signal decay after 4h (faster)
         self.cash_reserve_pct = 0.08          # Only 8% reserve (aggressive)
 
-        # ─── TIMEFRAME PERIODS ───
+        # TIMEFRAME PERIODS
         self.ultra_short_period = 3
         self.short_period = 6
         self.medium_period = 12
@@ -129,18 +94,18 @@ class OpusCryptoStrategy(QCAlgorithm):
         self.sqrt_annualization = np.sqrt(24 * 365)
         self.min_asset_vol_floor = 0.05
 
-        # ─── POSITION MANAGEMENT ───
+        # POSITION MANAGEMENT
         self.base_max_positions = 3           # Up to 3 concurrent positions
         self.max_positions = self.base_max_positions
         self.position_size_pct = 0.55         # 55% max per position
         self.min_notional = 5.0
         self.min_price_usd = 0.001            # Allow cheaper coins
 
-        # ─── FEE ACCOUNTING ───
+        # FEE ACCOUNTING
         self.expected_round_trip_fees = 0.0052  # 0.26% * 2 = 0.52%
         self.fee_slippage_buffer = 0.002
 
-        # ─── SPREAD & LIQUIDITY ───
+        # SPREAD & LIQUIDITY
         self.max_spread_pct = 0.03            # Allow wider spreads (micro-caps)
         self.spread_median_window = 12
         self.spread_widen_mult = 2.0
@@ -152,13 +117,13 @@ class OpusCryptoStrategy(QCAlgorithm):
         self.live_stale_order_timeout_seconds = 900
         self.max_concurrent_open_orders = 3
 
-        # ─── SESSION STATE ───
+        # SESSION STATE
         self._positions_synced = False
         self._session_blacklist = set()
         self._max_session_blacklist_size = 100
         self._first_post_warmup = True
 
-        # ─── 8-FACTOR SCORING WEIGHTS ───
+        # 8-FACTOR SCORING WEIGHTS
         self.weights = {
             'relative_strength': 0.18,
             'volume_momentum': 0.18,
@@ -170,7 +135,7 @@ class OpusCryptoStrategy(QCAlgorithm):
             'multi_timeframe': 0.08,       # NEW: multi-TF alignment
         }
 
-        # ─── DRAWDOWN MANAGEMENT ───
+        # DRAWDOWN MANAGEMENT
         self.peak_value = None
         self.max_drawdown_limit = 0.30        # Allow 30% drawdown (aggressive)
         self.drawdown_cooldown = 0
@@ -178,7 +143,7 @@ class OpusCryptoStrategy(QCAlgorithm):
         self.consecutive_losses = 0
         self.max_consecutive_losses = 8
 
-        # ─── DATA STRUCTURES ───
+        # DATA STRUCTURES
         self.crypto_data = {}
         self.entry_prices = {}
         self.highest_prices = {}
@@ -203,7 +168,7 @@ class OpusCryptoStrategy(QCAlgorithm):
 
         self._recent_tickets = deque(maxlen=25)
 
-        # ─── MARKET CONTEXT ───
+        # MARKET CONTEXT
         self.btc_symbol = None
         self.btc_returns = deque(maxlen=self.trend_period)
         self.btc_prices = deque(maxlen=self.trend_period)
@@ -215,7 +180,7 @@ class OpusCryptoStrategy(QCAlgorithm):
         self.volatility_regime = "normal"
         self.market_breadth = 0.5
 
-        # ─── PERFORMANCE TRACKING ───
+        # PERFORMANCE TRACKING
         self.winning_trades = 0
         self.losing_trades = 0
         self.total_pnl = 0.0
@@ -223,7 +188,7 @@ class OpusCryptoStrategy(QCAlgorithm):
         self.log_budget = 0
         self.last_log_time = None
 
-        # ─── SECTOR TRACKING (for diversification) ───
+        # SECTOR TRACKING (for diversification)
         self.coin_sectors = {
             'SOLUSD': 'L1', 'ADAUSD': 'L1', 'AVAXUSD': 'L1', 'DOTUSD': 'L1',
             'NEARUSD': 'L1', 'ATOMUSD': 'L1', 'FTMUSD': 'L1', 'ALGOUSD': 'L1',
@@ -235,7 +200,7 @@ class OpusCryptoStrategy(QCAlgorithm):
             'SHIBUSD': 'MEME', 'DOGEUSD': 'MEME',
         }
 
-        # ─── UNIVERSE ───
+        # UNIVERSE
         self.min_volume_usd = 500
         self.max_universe_size = 1000
         self.base_min_volume_usd = 500
@@ -252,12 +217,12 @@ class OpusCryptoStrategy(QCAlgorithm):
         self.kraken_status = "unknown"
         self._last_skip_reason = None
 
-        # ─── KELLY CRITERION TRACKING ───
+        # KELLY CRITERION TRACKING
         self._rolling_wins = deque(maxlen=50)
         self._rolling_win_sizes = deque(maxlen=50)
         self._rolling_loss_sizes = deque(maxlen=50)
 
-        # ─── SETUP ───
+        # SETUP
         self.UniverseSettings.Resolution = Resolution.Hour
         self.AddUniverse(CryptoUniverse.Kraken(self.UniverseFilter))
 
@@ -281,6 +246,9 @@ class OpusCryptoStrategy(QCAlgorithm):
         self.Settings.FreePortfolioValuePercentage = 0.03   # Minimal reserved
         self.Settings.InsightScore = False
 
+        # SCORING ENGINE
+        self.scoring_engine = OpusScoringEngine(self)
+
         if self.LiveMode:
             self._load_persisted_state()
             self.Debug("=" * 50)
@@ -290,9 +258,9 @@ class OpusCryptoStrategy(QCAlgorithm):
             self.Debug(f"Position size: {self.position_size_pct:.0%}")
             self.Debug("=" * 50)
 
-    # ══════════════════════════════════════════════════════════
+    # =======
     # UTILITY METHODS
-    # ══════════════════════════════════════════════════════════
+    # =======
 
     def EmitInsights(self, *insights):
         return []
@@ -389,7 +357,7 @@ class OpusCryptoStrategy(QCAlgorithm):
                 sectors.add(sector)
         return sectors
 
-    # ══════════════════════════════════════════════════════════
+    # =======
     # UNIVERSE & DATA
     # ══════════════════════���═══════════════════════════════════
 
@@ -796,9 +764,9 @@ class OpusCryptoStrategy(QCAlgorithm):
         if total_ready > 10:
             self.market_breadth = uptrend_count / total_ready
 
-    # ══════════════════════════════════════════════════════════
+    # =======
     # SCORING ENGINE (8-Factor)
-    # ══════════════════════════════════════════════════════════
+    # =======
 
     def _annualized_vol(self, crypto):
         if crypto is None:
@@ -869,243 +837,9 @@ class OpusCryptoStrategy(QCAlgorithm):
     def _is_ready(self, c):
         return len(c['prices']) >= self.medium_period and c['rsi'].IsReady
 
-    def _normalize(self, v, mn, mx):
-        return max(0, min(1, (v - mn) / (mx - mn)))
-
-    def _calculate_factor_scores(self, symbol, crypto):
-        try:
-            scores = {}
-
-            # 1. RELATIVE STRENGTH vs BTC
-            if len(crypto['rs_vs_btc']) >= 3:
-                scores['relative_strength'] = self._normalize(np.mean(list(crypto['rs_vs_btc'])[-3:]), -0.05, 0.05)
-            else:
-                scores['relative_strength'] = 0.5
-
-            # 2. VOLUME MOMENTUM (enhanced)
-            if len(crypto['volume_ma']) >= 2 and len(crypto['returns']) >= 3:
-                vol_ma_prev = crypto['volume_ma'][-2]
-                vol_trend = (crypto['volume_ma'][-1] / (vol_ma_prev + 1e-8)) - 1
-                price_trend = np.mean(list(crypto['returns'])[-3:])
-                # Volume spike detection
-                if len(crypto['volume']) >= 12:
-                    median_vol = np.median(list(crypto['volume'])[-12:])
-                    current_vol = crypto['volume'][-1]
-                    vol_spike = current_vol / (median_vol + 1e-8)
-                else:
-                    vol_spike = 1.0
-                if vol_trend > 0 and price_trend > 0:
-                    base = min(0.5 + vol_trend * 5 + price_trend * 25, 1.0)
-                    if vol_spike > 2.0:
-                        base = min(base + 0.15, 1.0)  # Volume spike bonus
-                    scores['volume_momentum'] = base
-                elif price_trend > 0:
-                    scores['volume_momentum'] = 0.55
-                else:
-                    scores['volume_momentum'] = 0.3
-            else:
-                scores['volume_momentum'] = 0.5
-
-            # 3. TREND STRENGTH (enhanced with more EMAs)
-            if crypto['ema_short'].IsReady and crypto['ema_trend'].IsReady:
-                us = crypto['ema_ultra_short'].Current.Value
-                s = crypto['ema_short'].Current.Value
-                m = crypto['ema_medium'].Current.Value
-                l = crypto['ema_long'].Current.Value
-                t = crypto['ema_trend'].Current.Value
-                aligned = sum([us > s, s > m, m > l, l > t])
-                if aligned >= 4:
-                    scores['trend_strength'] = min(0.7 + ((s - t) / t) * 8, 1.0)
-                elif aligned >= 3:
-                    scores['trend_strength'] = 0.7
-                elif aligned >= 2:
-                    scores['trend_strength'] = 0.55
-                elif us < s < m < l:
-                    scores['trend_strength'] = 0.15
-                else:
-                    scores['trend_strength'] = 0.35
-            elif crypto['ema_short'].IsReady:
-                s = crypto['ema_short'].Current.Value
-                m = crypto['ema_medium'].Current.Value
-                l = crypto['ema_long'].Current.Value
-                if s > m > l:
-                    scores['trend_strength'] = min(0.6 + ((s - l) / l) * 10, 1.0)
-                elif s > m:
-                    scores['trend_strength'] = 0.6
-                else:
-                    scores['trend_strength'] = 0.3
-            else:
-                scores['trend_strength'] = 0.5
-
-            # 4. MEAN REVERSION (enhanced)
-            if len(crypto['zscore']) >= 1:
-                z = crypto['zscore'][-1]
-                rsi = crypto['rsi'].Current.Value
-                if z < -2.0 and rsi < 25:
-                    scores['mean_reversion'] = 1.0     # Extreme oversold
-                elif z < -1.5 and rsi < 35:
-                    scores['mean_reversion'] = 0.9
-                elif z < -1.0 and rsi < 40:
-                    scores['mean_reversion'] = 0.75
-                elif z > 2.5 or rsi > 80:
-                    scores['mean_reversion'] = 0.05    # Extremely overbought — avoid
-                elif z > 2.0 or rsi > 75:
-                    scores['mean_reversion'] = 0.1
-                else:
-                    scores['mean_reversion'] = 0.5
-            else:
-                scores['mean_reversion'] = 0.5
-
-            # 5. LIQUIDITY
-            if len(crypto['dollar_volume']) >= 12:
-                avg = np.mean(list(crypto['dollar_volume'])[-12:])
-                if avg > 10000:
-                    scores['liquidity'] = 0.9
-                elif avg > 5000:
-                    scores['liquidity'] = 0.7
-                elif avg > 1000:
-                    scores['liquidity'] = 0.5
-                else:
-                    scores['liquidity'] = 0.25
-            else:
-                scores['liquidity'] = 0.5
-
-            # 6. RISK-ADJUSTED MOMENTUM (Sharpe-like)
-            if len(crypto['returns']) >= self.medium_period:
-                rets = list(crypto['returns'])[-self.medium_period:]
-                std = np.std(rets)
-                if std > 1e-10:
-                    sharpe = np.mean(rets) / std
-                    scores['risk_adjusted_momentum'] = self._normalize(sharpe, -1, 1)
-                else:
-                    scores['risk_adjusted_momentum'] = 0.5
-            else:
-                scores['risk_adjusted_momentum'] = 0.5
-
-            # 7. BREAKOUT SCORE (NEW)
-            scores['breakout_score'] = self._calculate_breakout_score(crypto)
-
-            # 8. MULTI-TIMEFRAME ALIGNMENT (NEW)
-            scores['multi_timeframe'] = self._calculate_multi_tf_score(crypto)
-
-            return scores
-        except:
-            return None
-
-    def _calculate_breakout_score(self, crypto):
-        """Detect breakouts using price range, volume, and Bollinger Bands."""
-        score = 0.5
-        price = crypto['last_price']
-        if price <= 0:
-            return score
-
-        # Price breakout from recent range
-        if len(crypto['highs']) >= self.long_period:
-            recent_high = max(list(crypto['highs'])[-self.long_period:])
-            recent_low = min(list(crypto['lows'])[-self.long_period:])
-            range_pct = (recent_high - recent_low) / recent_low if recent_low > 0 else 0
-            position_in_range = (price - recent_low) / (recent_high - recent_low) if (recent_high - recent_low) > 0 else 0.5
-
-            if position_in_range > 0.95:  # Breaking out above range
-                score += 0.2
-            elif position_in_range > 0.85:
-                score += 0.1
-
-        # Bollinger Band squeeze (low width → upcoming breakout)
-        if len(crypto['bb_width']) >= self.medium_period:
-            current_width = crypto['bb_width'][-1]
-            avg_width = np.mean(list(crypto['bb_width']))
-            if avg_width > 0:
-                squeeze_ratio = current_width / avg_width
-                if squeeze_ratio < 0.6:  # Squeeze detected
-                    # Check if breaking upward
-                    if len(crypto['bb_upper']) >= 1 and price > crypto['bb_upper'][-1]:
-                        score += 0.25  # Squeeze breakout!
-                    elif len(crypto['returns']) >= 2 and np.mean(list(crypto['returns'])[-2:]) > 0:
-                        score += 0.1   # Squeeze with upward bias
-
-        # Volume confirmation
-        if len(crypto['volume']) >= 12:
-            median_vol = np.median(list(crypto['volume'])[-12:])
-            if median_vol > 0 and crypto['volume'][-1] > 2.0 * median_vol:
-                score += 0.1  # Volume spike confirms breakout
-
-        return min(score, 1.0)
-
-    def _calculate_multi_tf_score(self, crypto):
-        """Score based on multi-timeframe momentum alignment."""
-        if len(crypto['returns']) < self.long_period:
-            return 0.5
-
-        returns = list(crypto['returns'])
-        agreements = 0
-        total_checks = 0
-
-        # 3h momentum
-        if len(returns) >= 3:
-            total_checks += 1
-            if np.mean(returns[-3:]) > 0:
-                agreements += 1
-
-        # 6h momentum
-        if len(returns) >= 6:
-            total_checks += 1
-            if np.mean(returns[-6:]) > 0:
-                agreements += 1
-
-        # 12h momentum
-        if len(returns) >= 12:
-            total_checks += 1
-            if np.mean(returns[-12:]) > 0:
-                agreements += 1
-
-        # 24h momentum
-        if len(returns) >= 24:
-            total_checks += 1
-            if np.mean(returns[-24:]) > 0:
-                agreements += 1
-
-        if total_checks == 0:
-            return 0.5
-
-        alignment = agreements / total_checks
-        if alignment >= 0.75:
-            return 0.85
-        elif alignment >= 0.5:
-            return 0.65
-        elif alignment <= 0.25:
-            return 0.15
-        return 0.4
-
-    def _calculate_composite_score(self, factors):
-        score = sum(factors.get(f, 0.5) * w for f, w in self.weights.items())
-        # Regime adjustments
-        if self.market_regime == "bear":
-            score *= 0.70
-        if self.volatility_regime == "high":
-            score *= 0.80
-        if self.market_breadth > 0.7:
-            score *= 1.08
-        elif self.market_breadth < 0.3:
-            score *= 0.80
-        # Bonus for very strong breakout + multi-TF alignment
-        if factors.get('breakout_score', 0) > 0.8 and factors.get('multi_timeframe', 0) > 0.7:
-            score *= 1.10
-        return min(score, 1.0)
-
-    def _apply_fee_adjustment(self, score):
-        return score - (self.expected_round_trip_fees * 1.1 + self.fee_slippage_buffer)
-
-    def _calculate_position_size(self, score, threshold, asset_vol_ann):
-        conviction_mult = max(0.7, min(1.4, 0.7 + (score - threshold) * 3))
-        vol_floor = max(asset_vol_ann if asset_vol_ann else 0.05, 0.05)
-        risk_mult = max(0.7, min(1.3, self.target_position_ann_vol / vol_floor))
-        kelly_mult = self._kelly_fraction()
-        return self.position_size_pct * conviction_mult * risk_mult * kelly_mult
-
-    # ══════════════════════════════════════════════════════════
+    # =======
     # TRADE EXECUTION
-    # ══════════════════════════════════════════════════════════
+    # =======
 
     def Rebalance(self):
         if self.IsWarmingUp:
@@ -1169,11 +903,11 @@ class OpusCryptoStrategy(QCAlgorithm):
             crypto = self.crypto_data[symbol]
             if not self._is_ready(crypto):
                 continue
-            factor_scores = self._calculate_factor_scores(symbol, crypto)
+            factor_scores = self.scoring_engine.calculate_factor_scores(symbol, crypto)
             if not factor_scores:
                 continue
-            composite_score = self._calculate_composite_score(factor_scores)
-            net_score = self._apply_fee_adjustment(composite_score)
+            composite_score = self.scoring_engine.calculate_composite_score(factor_scores)
+            net_score = self.scoring_engine.apply_fee_adjustment(composite_score)
             if net_score > threshold_now:
                 scores.append({
                     'symbol': symbol,
@@ -1306,7 +1040,7 @@ class OpusCryptoStrategy(QCAlgorithm):
             
             # Position sizing with Kelly fraction (Opus)
             vol = self._annualized_vol(crypto)
-            size = self._calculate_position_size(comp_score, threshold_now, vol)
+            size = self.scoring_engine.calculate_position_size(comp_score, threshold_now, vol)
             size = min(size, effective_size_cap)
             if self.volatility_regime == "high":
                 size *= 0.7
@@ -1481,10 +1215,10 @@ class OpusCryptoStrategy(QCAlgorithm):
         if not tag and hours >= self.min_signal_age_hours:
             try:
                 if crypto and self._is_ready(crypto):
-                    factors = self._calculate_factor_scores(symbol, crypto)
+                    factors = self.scoring_engine.calculate_factor_scores(symbol, crypto)
                     if factors:
-                        comp = self._calculate_composite_score(factors)
-                        net = self._apply_fee_adjustment(comp)
+                        comp = self.scoring_engine.calculate_composite_score(factors)
+                        net = self.scoring_engine.apply_fee_adjustment(comp)
                         if net < self._get_threshold() - self.signal_decay_buffer:
                             tag = "Signal Decay"
             except:
