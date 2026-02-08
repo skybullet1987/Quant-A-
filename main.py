@@ -38,6 +38,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         "EPTUSD", "LMWRUSD",
         "CPOOLUSD",
         "ARCUSD", "PAXGUSD",
+        "BTCPYUSD",
     }
 
     KRAKEN_MIN_QTY_FALLBACK = {
@@ -170,11 +171,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.log_budget = 0
         self.last_log_time = None
 
-        self.min_volume_usd = 500
+        self.min_volume_usd = 1000
         self.max_universe_size = 1000
 
         # Dynamic liquidity scaling — adapts as portfolio grows
-        self.base_min_volume_usd = 500        # floor for small accounts
+        self.base_min_volume_usd = 1000       # floor for small accounts
         self.liquidity_scale_start = 100      # start scaling above this portfolio value
         self.max_order_to_volume_ratio = 0.03 # max 3% of recent 6-bar avg dollar volume
         self.liquidity_tiers = [
@@ -184,7 +185,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             (2000,  5000,  0.30),    # $2k+ portfolio: need $5k vol, max 30% position
             (500,   2000,  0.35),    # $500+ portfolio: need $2k vol, max 35% position
             (100,   1000,  0.40),    # $100+ portfolio: need $1k vol, max 40% position
-            (0,     500,   0.45),    # <$100 portfolio: use base settings
+            (0,     1000,  0.45),    # <$100 portfolio: use base settings
         ]
 
         # Kraken status gate:
@@ -559,6 +560,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if ticker in self.SYMBOL_BLACKLIST or ticker in self._session_blacklist:
                 continue
             if not ticker.endswith("USD"):
+                continue
+            # Filter out pairs where quote currency is not truly USD
+            # e.g., BTCPYUSD = BTC/PYUSD, ETHEURUSD = ETH/EURUSD — these aren't USD-quoted
+            # Known non-USD quote pair prefixes that sneak through the "USD" suffix check
+            if any(ticker.endswith(suffix) for suffix in ["PYUSD", "EURUSD"]):
                 continue
             if crypto.VolumeInUsd is None or crypto.VolumeInUsd == 0:
                 continue
@@ -1130,6 +1136,15 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             self.highest_prices[symbol] = price
         pnl = (price - entry) / entry if entry > 0 else 0
         dd = (highest - price) / highest if highest > 0 else 0
+        # Penalize PnL estimate for micro-cap exit slippage
+        # On thin books, selling causes price impact that the backtest doesn't model
+        exit_slip_estimate = 0.0
+        if crypto and len(crypto.get('dollar_volume', [])) >= 6:
+            avg_dv = np.mean(list(crypto['dollar_volume'])[-6:])
+            exit_value = abs(holding.Quantity) * price
+            if avg_dv > 0 and exit_value / avg_dv > 0.02:
+                exit_slip_estimate = min(0.02, exit_value / avg_dv * 0.1)
+                pnl -= exit_slip_estimate
         hours = (self.Time - self.entry_times.get(symbol, self.Time)).total_seconds() / 3600
         sl, tp = self.base_stop_loss, self.base_take_profit
         if self.volatility_regime == "high":
