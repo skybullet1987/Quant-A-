@@ -173,6 +173,20 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.min_volume_usd = 500
         self.max_universe_size = 1000
 
+        # Dynamic liquidity scaling — adapts as portfolio grows
+        self.base_min_volume_usd = 500        # floor for small accounts
+        self.liquidity_scale_start = 100      # start scaling above this portfolio value
+        self.max_order_to_volume_ratio = 0.03 # max 3% of recent 6-bar avg dollar volume
+        self.liquidity_tiers = [
+            # (portfolio_threshold, min_volume_usd, max_position_pct)
+            (50000, 50000, 0.15),    # $50k+ portfolio: need $50k vol, max 15% position
+            (10000, 20000, 0.20),    # $10k+ portfolio: need $20k vol, max 20% position
+            (2000,  5000,  0.30),    # $2k+ portfolio: need $5k vol, max 30% position
+            (500,   2000,  0.35),    # $500+ portfolio: need $2k vol, max 35% position
+            (100,   1000,  0.40),    # $100+ portfolio: need $1k vol, max 40% position
+            (0,     500,   0.45),    # <$100 portfolio: use base settings
+        ]
+
         # Kraken status gate:
         # - "online": trade
         # - "maintenance" / "cancel_only": block
@@ -221,6 +235,17 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             return default
         except:
             return default
+
+    def _get_dynamic_liquidity_params(self):
+        """
+        Returns (min_volume_usd, max_position_pct) based on current portfolio size.
+        As capital grows, requires higher liquidity and caps position size.
+        """
+        portfolio_value = self.Portfolio.TotalPortfolioValue
+        for threshold, min_vol, max_pos in self.liquidity_tiers:
+            if portfolio_value >= threshold:
+                return min_vol, max_pos
+        return self.base_min_volume_usd, self.position_size_pct
 
     def EmitInsights(self, *insights):
         return []
@@ -526,6 +551,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             # Let OnOrderEvent handle cleanup and PnL tracking on fill
 
     def UniverseFilter(self, universe):
+        dynamic_min_vol, _ = self._get_dynamic_liquidity_params()
+        effective_min_vol = max(self.base_min_volume_usd, dynamic_min_vol)
         selected = []
         for crypto in universe:
             ticker = crypto.Symbol.Value
@@ -535,7 +562,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 continue
             if crypto.VolumeInUsd is None or crypto.VolumeInUsd == 0:
                 continue
-            if crypto.VolumeInUsd > self.min_volume_usd:
+            if crypto.VolumeInUsd > effective_min_vol:
                 selected.append(crypto)
         selected.sort(key=lambda x: x.VolumeInUsd, reverse=True)
         return [c.Symbol for c in selected[:self.max_universe_size]]
@@ -871,8 +898,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if price < self.min_price_usd:
                 continue
 
-            effective_size_cap = self.position_size_pct
-            if self.LiveMode and (self.volatility_regime == "high" or self.market_regime == "sideways"):
+            _, dynamic_max_pos_pct = self._get_dynamic_liquidity_params()
+            effective_size_cap = min(self.position_size_pct, dynamic_max_pos_pct)
+            if self.volatility_regime == "high" or self.market_regime == "sideways":
                 effective_size_cap = min(effective_size_cap, 0.25)
 
             total_value = self.Portfolio.TotalPortfolioValue
@@ -926,9 +954,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if self.volatility_regime == "high":
                 size *= 0.7
 
-            if self.LiveMode and len(crypto['dollar_volume']) >= 6:
+            if len(crypto['dollar_volume']) >= 6:
                 recent_dollar_vol6 = np.mean(list(crypto['dollar_volume'])[-6:])
-                if recent_dollar_vol6 < 5000:
+                dynamic_min_vol, _ = self._get_dynamic_liquidity_params()
+                if recent_dollar_vol6 < dynamic_min_vol:
                     continue
             recent_dollar_vol3 = np.mean(list(crypto['dollar_volume'])[-3:]) if len(crypto['dollar_volume']) >= 3 else 0
 
@@ -936,9 +965,13 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 order_value_estimate = reserved_cash * size
                 if recent_dollar_vol3 > 0:
                     impact_ratio = order_value_estimate / recent_dollar_vol3
-                    if impact_ratio > 0.05:
+                    # Tighter impact cap as portfolio grows
+                    portfolio_value = self.Portfolio.TotalPortfolioValue
+                    impact_hard_cap = 0.05 if portfolio_value < 500 else (0.03 if portfolio_value < 5000 else 0.02)
+                    impact_soft_cap = impact_hard_cap * 0.6
+                    if impact_ratio > impact_hard_cap:
                         continue
-                    if impact_ratio > 0.03:
+                    if impact_ratio > impact_soft_cap:
                         size *= max(0.3, 1.0 - impact_ratio)
                     max_child = 0.15 * recent_dollar_vol3
                     if order_value_estimate > max_child:
@@ -1280,6 +1313,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.Debug(f"Portfolio: ${self.Portfolio.TotalPortfolioValue:.2f} | Cash: ${self.Portfolio.Cash:.2f}")
         self.Debug(f"Positions: {self._get_actual_position_count()}/{self.base_max_positions}")
         self.Debug(f"Regime: {self.market_regime} | Vol: {self.volatility_regime} | Breadth: {self.market_breadth:.0%}")
+        dyn_vol, dyn_pos = self._get_dynamic_liquidity_params()
+        self.Debug(f"Liquidity: min_vol=${dyn_vol:,.0f} | max_pos={dyn_pos:.0%}")
         self.Debug(f"Trades: {total} | WR: {wr:.1%} | Avg: {avg:+.2%}")
         if self._session_blacklist:
             self.Debug(f"Blacklist: {len(self._session_blacklist)} items")
