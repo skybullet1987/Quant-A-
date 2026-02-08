@@ -37,8 +37,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         "MUSD", "ICNTUSD",
         "EPTUSD", "LMWRUSD",
         "CPOOLUSD",
-        "ARCUSD", "PAXGUSD",
-        "BTCPYUSD",
+        "ARCUSD", "PAXGUSD","DAIUSD","WETHUSD", "WBTCUSD", "WAXLUSD","TUSDUSD"
     }
 
     KRAKEN_MIN_QTY_FALLBACK = {
