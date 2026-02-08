@@ -10,7 +10,7 @@ from scoring import OpusScoringEngine
 # endregion
 
 
-class RealisticCryptoSlippage(ISlippageModel):
+class RealisticCryptoSlippage:
     """Volume-aware slippage model for crypto."""
     
     def __init__(self):
@@ -18,7 +18,7 @@ class RealisticCryptoSlippage(ISlippageModel):
         self.volume_impact_factor = 0.10
         self.max_slippage_pct = 0.02
     
-    def GetSlippageApproximation(self, asset, order):
+    def get_slippage_approximation(self, asset, order):
         price = asset.Price
         if price <= 0:
             return 0
