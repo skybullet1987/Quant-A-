@@ -10,6 +10,61 @@ from scoring import OpusScoringEngine
 # endregion
 
 
+class RealisticCryptoSlippage(ISlippageModel):
+    """
+    Volume-aware slippage model for crypto.
+    
+    Applies higher slippage for:
+    - Low-volume coins (order is large relative to hourly volume)
+    - Very cheap coins (wider real-world spreads)
+    - Large orders relative to book depth
+    
+    Base slippage: 0.1% for liquid coins
+    Can scale up to 2% for illiquid micro-caps
+    """
+    
+    def __init__(self, base_slippage_pct=0.001, volume_impact_factor=0.10, max_slippage_pct=0.02):
+        self.base_slippage_pct = base_slippage_pct
+        self.volume_impact_factor = volume_impact_factor
+        self.max_slippage_pct = max_slippage_pct
+    
+    def GetSlippageApproximation(self, asset, order):
+        price = asset.Price
+        if price <= 0:
+            return 0
+        
+        # Base slippage
+        slippage_pct = self.base_slippage_pct
+        
+        # Volume-based impact: if order is large relative to recent volume, increase slippage
+        volume = asset.Volume
+        if volume > 0:
+            order_value = abs(order.Quantity) * price
+            volume_value = volume * price
+            if volume_value > 0:
+                participation_rate = order_value / volume_value
+                # Slippage scales with participation rate raised to power 1.5
+                # (Examples below assume default volume_impact_factor=0.10)
+                # At 1% participation: ~0.01% extra
+                # At 10% participation: ~1% extra  
+                # At 50% participation: capped at max
+                volume_impact = self.volume_impact_factor * (participation_rate ** 1.5)
+                slippage_pct += volume_impact
+        
+        # Price-tier adjustment: cheaper coins have wider real spreads
+        if price < 0.01:
+            slippage_pct *= 3.0    # Sub-penny coins: 3x slippage
+        elif price < 0.10:
+            slippage_pct *= 2.0    # Micro-caps under 10 cents: 2x
+        elif price < 1.0:
+            slippage_pct *= 1.5    # Small-caps under $1: 1.5x
+        
+        # Cap at maximum
+        slippage_pct = min(slippage_pct, self.max_slippage_pct)
+        
+        return price * slippage_pct
+
+
 class OpusCryptoStrategy(QCAlgorithm):
     """
     OPUS - Ultra-Aggressive Crypto Strategy v1.0
@@ -70,18 +125,18 @@ class OpusCryptoStrategy(QCAlgorithm):
         self.threshold_high_vol = 0.52    # Slightly tighter in chaos
 
         # EXIT PARAMETERS
-        self.trailing_activation = 0.04   # Start trailing at +4%
-        self.trailing_stop_pct = 0.025    # 2.5% trail
-        self.base_stop_loss = 0.045       # Tight 4.5% stop
-        self.base_take_profit = 0.10      # Take profit at 10%
+        self.trailing_activation = 0.06   # Start trailing at +6%
+        self.trailing_stop_pct = 0.035    # 3.5% trail
+        self.base_stop_loss = 0.055       # 5.5% stop
+        self.base_take_profit = 0.12      # Take profit at 12%
         self.atr_sl_mult = 1.4            # ATR-based SL multiplier
         self.atr_tp_mult = 2.8            # ATR-based TP multiplier
 
         # RISK PARAMETERS
         self.target_position_ann_vol = 0.30   # Target 30% annualized vol per position
         self.portfolio_vol_cap = 0.50         # Allow higher portfolio volatility
-        self.signal_decay_buffer = 0.04       # Signal must decay significantly to exit
-        self.min_signal_age_hours = 4         # Check signal decay after 4h (faster)
+        self.signal_decay_buffer = 0.06       # Signal must decay significantly to exit
+        self.min_signal_age_hours = 6         # Check signal decay after 6h
         self.cash_reserve_pct = 0.08          # Only 8% reserve (aggressive)
 
         # TIMEFRAME PERIODS
@@ -103,7 +158,7 @@ class OpusCryptoStrategy(QCAlgorithm):
 
         # FEE ACCOUNTING
         self.expected_round_trip_fees = 0.0052  # 0.26% * 2 = 0.52%
-        self.fee_slippage_buffer = 0.002
+        self.fee_slippage_buffer = 0.004
 
         # SPREAD & LIQUIDITY
         self.max_spread_pct = 0.03            # Allow wider spreads (micro-caps)
@@ -157,7 +212,7 @@ class OpusCryptoStrategy(QCAlgorithm):
         self.cancel_cooldown_minutes = 1
 
         self.trailing_grace_hours = 1.5       # Start trailing sooner
-        self.atr_trail_mult = 1.0             # Tighter ATR trail
+        self.atr_trail_mult = 1.3             # ATR trail gives positions room
 
         self._slip_abs = deque(maxlen=50)
         self._slippage_alert_until = None
@@ -242,7 +297,7 @@ class OpusCryptoStrategy(QCAlgorithm):
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(hours=1)), self.ResyncHoldings)
 
         self.SetWarmUp(timedelta(days=5))
-        self.SetSecurityInitializer(lambda security: security.SetSlippageModel(VolumeShareSlippageModel(0.15, 0.02)))
+        self.SetSecurityInitializer(lambda security: security.SetSlippageModel(RealisticCryptoSlippage(0.001, 0.10, 0.02)))
         self.Settings.FreePortfolioValuePercentage = 0.03   # Minimal reserved
         self.Settings.InsightScore = False
 
@@ -345,7 +400,7 @@ class OpusCryptoStrategy(QCAlgorithm):
         b = avg_win / avg_loss  # Win/loss ratio
         kelly = (win_rate * b - (1 - win_rate)) / b
         half_kelly = kelly * 0.5
-        return max(0.3, min(1.5, half_kelly / 0.5))  # Normalize around 1.0
+        return max(0.5, min(1.5, half_kelly / 0.5))  # Normalize around 1.0
 
     def _get_position_sectors(self):
         """Get sectors of currently held positions."""
@@ -975,15 +1030,15 @@ class OpusCryptoStrategy(QCAlgorithm):
             candidate_sector = self.coin_sectors.get(ticker, 'OTHER')
             if candidate_sector in held_sectors and candidate_sector != 'OTHER':
                 # Penalize score if we already hold this sector
-                net_score *= 0.85
-                comp_score *= 0.85
+                net_score *= 0.92
+                comp_score *= 0.92
                 if net_score <= threshold_now:
                     continue
             
             _, dynamic_max_pos_pct = self._get_dynamic_liquidity_params()
             effective_size_cap = min(self.position_size_pct, dynamic_max_pos_pct)
             if self.volatility_regime == "high" or self.market_regime == "sideways":
-                effective_size_cap = min(effective_size_cap, 0.25)
+                effective_size_cap = min(effective_size_cap, 0.40)
             
             total_value = self.Portfolio.TotalPortfolioValue
             try:
@@ -1024,7 +1079,7 @@ class OpusCryptoStrategy(QCAlgorithm):
                 
                 if not is_mean_reversion:
                     # Normal trend-following gate
-                    if ema_short <= ema_medium:
+                    if ema_short < ema_medium * 0.995:
                         continue
                     if len(crypto['returns']) >= 3:
                         recent_return = np.mean(list(crypto['returns'])[-3:])
@@ -1194,8 +1249,8 @@ class OpusCryptoStrategy(QCAlgorithm):
         # Bear regime quick exit
         elif self.market_regime == "bear" and pnl > 0.03:
             tag = "Bear Exit"
-        # Phase 5: Time pressure (24h+, must show >2% or exit)
-        elif hours > 24 and pnl < 0.02:
+        # Phase 5: Time pressure (36h+, must show >1% or exit)
+        elif hours > 36 and pnl < 0.01:
             tag = "Time Exit"
         
         # ATR trailing stop (Opus feature)

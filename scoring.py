@@ -272,9 +272,9 @@ class OpusScoringEngine:
         score = sum(factors.get(f, 0.5) * w for f, w in self.algo.weights.items())
         # Regime adjustments
         if self.algo.market_regime == "bear":
-            score *= 0.70
+            score *= 0.78
         if self.algo.volatility_regime == "high":
-            score *= 0.80
+            score *= 0.85
         if self.algo.market_breadth > 0.7:
             score *= 1.08
         elif self.algo.market_breadth < 0.3:
@@ -308,7 +308,7 @@ class OpusScoringEngine:
         Returns:
             Position size as percentage of portfolio
         """
-        conviction_mult = max(0.7, min(1.4, 0.7 + (score - threshold) * 3))
+        conviction_mult = max(0.8, min(1.5, 0.8 + (score - threshold) * 3.5))
         vol_floor = max(asset_vol_ann if asset_vol_ann else 0.05, 0.05)
         risk_mult = max(0.7, min(1.3, self.algo.target_position_ann_vol / vol_floor))
         kelly_mult = self.algo._kelly_fraction()
