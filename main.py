@@ -1135,6 +1135,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             self.highest_prices[symbol] = price
         pnl = (price - entry) / entry if entry > 0 else 0
         dd = (highest - price) / highest if highest > 0 else 0
+
+        # Must fetch crypto data BEFORE using it for slippage estimate
+        crypto = self.crypto_data.get(symbol)
+
         # Penalize PnL estimate for micro-cap exit slippage
         # On thin books, selling causes price impact that the backtest doesn't model
         exit_slip_estimate = 0.0
@@ -1153,7 +1157,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             sl *= 1.2; tp *= 1.3
         elif self.market_regime == "bear":
             sl *= 0.8; tp *= 0.7
-        crypto = self.crypto_data.get(symbol)
         atr = crypto['atr'].Current.Value if crypto and crypto['atr'].IsReady else None
         if atr and entry > 0:
             atr_sl = (atr * self.atr_sl_mult) / entry
