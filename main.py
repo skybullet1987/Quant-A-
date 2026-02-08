@@ -1140,8 +1140,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         # On thin books, selling causes price impact that the backtest doesn't model
         exit_slip_estimate = 0.0
         if crypto and len(crypto.get('dollar_volume', [])) >= 6:
-            avg_dv = np.mean(list(crypto['dollar_volume'])[-6:])
+            # Get last 6 bars of dollar volume
+            dv_list = list(crypto['dollar_volume'])[-6:]
+            avg_dv = np.mean(dv_list)
             exit_value = abs(holding.Quantity) * price
+            # Apply penalty if exit > 2% of volume: scales linearly from 0 to 2% cap
             if avg_dv > 0 and exit_value / avg_dv > 0.02:
                 exit_slip_estimate = min(0.02, exit_value / avg_dv * 0.1)
                 pnl -= exit_slip_estimate
