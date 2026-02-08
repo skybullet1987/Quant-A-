@@ -1127,4 +1127,535 @@ class OpusCryptoStrategy(QCAlgorithm):
             self.drawdown_cooldown -= 1
             if self.drawdown_cooldown <= 0:
                 self.peak_value = val
-                self.consecutive
+                self.consecutive_losses = 0
+            else:
+                self._log_skip(f"drawdown cooldown {self.drawdown_cooldown}h")
+                return
+        self.peak_value = max(self.peak_value, val)
+        dd = (self.peak_value - val) / self.peak_value if self.peak_value > 0 else 0
+        if dd > self.max_drawdown_limit:
+            self.drawdown_cooldown = self.cooldown_hours
+            self._log_skip(f"drawdown {dd:.1%} > limit")
+            return
+        if self.consecutive_losses >= self.max_consecutive_losses:
+            self.drawdown_cooldown = 12
+            self.consecutive_losses = 0
+            self._log_skip("consecutive loss cooldown")
+            return
+        
+        # Use Opus regime-adaptive max positions
+        dynamic_max_pos = self._get_regime_max_positions()
+        pos_count = self._get_actual_position_count()
+        if pos_count >= dynamic_max_pos:
+            self._log_skip("at max positions")
+            return
+        if len(self.Transactions.GetOpenOrders()) > self.max_concurrent_open_orders:
+            self._log_skip("too many open orders")
+            return
+        if self._compute_portfolio_risk_estimate() > self.portfolio_vol_cap:
+            self._log_skip("risk cap")
+            return
+        
+        # Candidate scoring with 8 factors (Opus)
+        scores = []
+        threshold_now = self._get_threshold()
+        for symbol in list(self.crypto_data.keys()):
+            if symbol.Value in self.SYMBOL_BLACKLIST or symbol.Value in self._session_blacklist:
+                continue
+            if self._has_open_orders(symbol):
+                continue
+            if not self._spread_ok(symbol):
+                continue
+            crypto = self.crypto_data[symbol]
+            if not self._is_ready(crypto):
+                continue
+            factor_scores = self._calculate_factor_scores(symbol, crypto)
+            if not factor_scores:
+                continue
+            composite_score = self._calculate_composite_score(factor_scores)
+            net_score = self._apply_fee_adjustment(composite_score)
+            if net_score > threshold_now:
+                scores.append({
+                    'symbol': symbol,
+                    'composite_score': composite_score,
+                    'net_score': net_score,
+                    'factors': factor_scores,
+                    'volatility': crypto['volatility'][-1] if len(crypto['volatility']) > 0 else 0.05,
+                    'dollar_volume': list(crypto['dollar_volume'])[-6:] if len(crypto['dollar_volume']) >= 6 else [],
+                })
+        
+        if len(scores) == 0:
+            self._log_skip("no candidates passed filters")
+            return
+        
+        # Sort by net score (fee-adjusted)
+        scores.sort(key=lambda x: x['net_score'], reverse=True)
+        self._last_skip_reason = None
+        self._execute_trades(scores, threshold_now, dynamic_max_pos)
+
+    def _execute_trades(self, candidates, threshold_now, dynamic_max_pos):
+        """Execute trades with Opus-specific features: Kelly sizing, sector diversification."""
+        if not self._positions_synced:
+            return
+        if self.LiveMode and self.kraken_status in ("maintenance", "cancel_only"):
+            return
+        self._cancel_stale_new_orders()
+        if len(self.Transactions.GetOpenOrders()) > self.max_concurrent_open_orders:
+            return
+        if self._compute_portfolio_risk_estimate() > self.portfolio_vol_cap:
+            return
+        
+        # Get currently held sectors for diversification penalty
+        held_sectors = self._get_position_sectors()
+        
+        for cand in candidates:
+            if self.daily_trade_count >= self.max_daily_trades:
+                break
+            if self._get_actual_position_count() >= dynamic_max_pos:
+                break
+            
+            sym = cand['symbol']
+            comp_score = cand.get('composite_score', 0.5)
+            net_score = cand.get('net_score', 0.5)
+            
+            if sym in self._pending_orders and self._pending_orders[sym] > 0:
+                continue
+            if self._has_open_orders(sym):
+                continue
+            if self._is_invested_not_dust(sym):
+                continue
+            if not self._spread_ok(sym):
+                continue
+            if sym in self._exit_cooldowns and self.Time < self._exit_cooldowns[sym]:
+                continue
+            
+            sec = self.Securities[sym]
+            price = sec.Price
+            if price is None or price <= 0:
+                continue
+            if price < self.min_price_usd:
+                continue
+            
+            # Apply sector diversification penalty (Opus feature)
+            ticker = sym.Value
+            candidate_sector = self.coin_sectors.get(ticker, 'OTHER')
+            if candidate_sector in held_sectors and candidate_sector != 'OTHER':
+                # Penalize score if we already hold this sector
+                net_score *= 0.85
+                comp_score *= 0.85
+                if net_score <= threshold_now:
+                    continue
+            
+            _, dynamic_max_pos_pct = self._get_dynamic_liquidity_params()
+            effective_size_cap = min(self.position_size_pct, dynamic_max_pos_pct)
+            if self.volatility_regime == "high" or self.market_regime == "sideways":
+                effective_size_cap = min(effective_size_cap, 0.25)
+            
+            total_value = self.Portfolio.TotalPortfolioValue
+            try:
+                available_cash = self.Portfolio.CashBook["USD"].Amount
+            except (KeyError, AttributeError):
+                available_cash = self.Portfolio.Cash
+            
+            # Reserve based on portfolio value
+            portfolio_reserve = total_value * self.cash_reserve_pct
+            fee_reserve = total_value * 0.02  # Reserve 2% for fee coverage
+            effective_reserve = max(portfolio_reserve, fee_reserve)
+            reserved_cash = available_cash - effective_reserve
+            if reserved_cash <= 0:
+                continue
+            
+            min_qty = self._get_min_quantity(sym)
+            min_notional_usd = self._get_min_notional_usd(sym)
+            if min_qty * price > reserved_cash * 0.6:
+                continue
+            
+            crypto = self.crypto_data.get(sym)
+            if not crypto:
+                continue
+            
+            # Trend filter
+            if crypto['ema_short'].IsReady and crypto['ema_medium'].IsReady:
+                ema_short = crypto['ema_short'].Current.Value
+                ema_medium = crypto['ema_medium'].Current.Value
+                
+                # Check if this is a strong mean-reversion candidate
+                is_mean_reversion = False
+                if len(crypto['zscore']) >= 1 and crypto['rsi'].IsReady:
+                    z = crypto['zscore'][-1]
+                    rsi = crypto['rsi'].Current.Value
+                    # Deep oversold: allow entry even against trend
+                    if z < -1.5 and rsi < 35:
+                        is_mean_reversion = True
+                
+                if not is_mean_reversion:
+                    # Normal trend-following gate
+                    if ema_short <= ema_medium:
+                        continue
+                    if len(crypto['returns']) >= 3:
+                        recent_return = np.mean(list(crypto['returns'])[-3:])
+                        if recent_return <= 0:
+                            continue
+            
+            # Signal persistence check
+            crypto['recent_net_scores'].append(net_score)
+            if len(crypto['recent_net_scores']) >= 3:
+                above_threshold_count = sum(1 for score in crypto['recent_net_scores'] if score > threshold_now)
+                if above_threshold_count < 2:
+                    continue
+            
+            # Position sizing with Kelly fraction (Opus)
+            vol = self._annualized_vol(crypto)
+            size = self._calculate_position_size(comp_score, threshold_now, vol)
+            size = min(size, effective_size_cap)
+            if self.volatility_regime == "high":
+                size *= 0.7
+            
+            # Liquidity checks
+            if len(crypto['dollar_volume']) >= 6:
+                recent_dollar_vol6 = np.mean(list(crypto['dollar_volume'])[-6:])
+                dynamic_min_vol, _ = self._get_dynamic_liquidity_params()
+                if recent_dollar_vol6 < dynamic_min_vol:
+                    continue
+            
+            recent_dollar_vol3 = np.mean(list(crypto['dollar_volume'])[-3:]) if len(crypto['dollar_volume']) >= 3 else 0
+            
+            # Impact estimation
+            if len(crypto['dollar_volume']) >= 3:
+                order_value_estimate = reserved_cash * size
+                if recent_dollar_vol3 > 0:
+                    impact_ratio = order_value_estimate / recent_dollar_vol3
+                    # Tighter impact cap as portfolio grows
+                    portfolio_value = self.Portfolio.TotalPortfolioValue
+                    impact_hard_cap = 0.05 if portfolio_value < 500 else (0.03 if portfolio_value < 5000 else 0.02)
+                    impact_soft_cap = impact_hard_cap * 0.6
+                    if impact_ratio > impact_hard_cap:
+                        continue
+                    if impact_ratio > impact_soft_cap:
+                        size *= max(0.3, 1.0 - impact_ratio)
+                    max_child = 0.15 * recent_dollar_vol3
+                    if order_value_estimate > max_child:
+                        size *= max_child / order_value_estimate
+            
+            val = reserved_cash * size
+            qty = self._round_quantity(sym, val / price)
+            if qty < min_qty:
+                qty = self._round_quantity(sym, min_qty)
+                val = qty * price
+            
+            # Verify total cost with fees doesn't breach reserve
+            total_cost_with_fee = val * 1.006  # Include 0.6% fee
+            if total_cost_with_fee > available_cash - fee_reserve:
+                continue
+            if val < min_notional_usd or val < self.min_notional or val > reserved_cash:
+                continue
+            
+            try:
+                ticket = self.MarketOrder(sym, qty)
+                if ticket is not None:
+                    self._recent_tickets.append(ticket)
+                    self.Debug(f"ORDER: {sym.Value} | ${val:.2f} | id={ticket.OrderId}")
+                self.trade_count += 1
+                self._debug_limited(f"ORDER: {sym.Value} | ${val:.2f}")
+            except Exception as e:
+                self.Debug(f"ORDER FAILED: {sym.Value} - {e}")
+                self._session_blacklist.add(sym.Value)
+                continue
+            
+            if self.LiveMode:
+                break
+
+    def _get_threshold(self):
+        """Regime-adaptive signal threshold."""
+        if self.market_regime == "bull" and self.market_breadth > 0.6:
+            return self.threshold_bull
+        elif self.market_regime == "bear":
+            return self.threshold_bear
+        elif self.volatility_regime == "high":
+            return self.threshold_high_vol
+        return self.threshold_sideways
+
+    def CheckExits(self):
+        """Check all positions for exit conditions."""
+        if self.IsWarmingUp:
+            return
+        for kvp in self.Portfolio:
+            if not self._is_invested_not_dust(kvp.Key):
+                continue
+            self._check_exit(kvp.Key, self.Securities[kvp.Key].Price, kvp.Value)
+
+    def _check_exit(self, symbol, price, holding):
+        """Full exit cascade with Opus-specific features: ATR-based SL/TP, exit slippage penalty."""
+        if len(self.Transactions.GetOpenOrders(symbol)) > 0:
+            return
+        if symbol in self._cancel_cooldowns and self.Time < self._cancel_cooldowns[symbol]:
+            return
+        
+        # Backfill entry tracking if missing
+        if symbol not in self.entry_prices:
+            self.entry_prices[symbol] = holding.AveragePrice
+            self.highest_prices[symbol] = holding.AveragePrice
+            self.entry_times[symbol] = self.Time
+        
+        entry = self.entry_prices[symbol]
+        highest = self.highest_prices.get(symbol, entry)
+        if price > highest:
+            self.highest_prices[symbol] = price
+        
+        pnl = (price - entry) / entry if entry > 0 else 0
+        dd = (highest - price) / highest if highest > 0 else 0
+        
+        # Get crypto data for exit slippage penalty
+        crypto = self.crypto_data.get(symbol)
+        
+        # Exit slippage penalty for micro-caps (Opus feature)
+        exit_slip_estimate = 0.0
+        if crypto and len(crypto.get('dollar_volume', [])) >= 6:
+            dv_list = list(crypto['dollar_volume'])[-6:]
+            avg_dv = np.mean(dv_list)
+            exit_value = abs(holding.Quantity) * price
+            # Apply penalty if exit > 2% of volume
+            if avg_dv > 0 and exit_value / avg_dv > 0.02:
+                exit_slip_estimate = min(0.02, exit_value / avg_dv * 0.1)
+                pnl -= exit_slip_estimate
+        
+        hours = (self.Time - self.entry_times.get(symbol, self.Time)).total_seconds() / 3600
+        
+        # Dynamic stop loss and take profit (base + ATR)
+        sl, tp = self.base_stop_loss, self.base_take_profit
+        if self.volatility_regime == "high":
+            sl *= 1.2
+            tp *= 1.3
+        elif self.market_regime == "bear":
+            sl *= 0.8
+            tp *= 0.7
+        
+        # ATR-based dynamic SL/TP (Opus feature)
+        atr = crypto['atr'].Current.Value if crypto and crypto['atr'].IsReady else None
+        if atr and entry > 0:
+            atr_sl = (atr * self.atr_sl_mult) / entry
+            atr_tp = (atr * self.atr_tp_mult) / entry
+            sl = max(sl, atr_sl * 0.8)
+            tp = max(tp, atr_tp * 0.7)
+        
+        trailing_activation = self.trailing_activation
+        trailing_stop_pct = self.trailing_stop_pct
+        if self.volatility_regime == "high" or self.market_regime == "sideways":
+            trailing_activation = 0.04
+            trailing_stop_pct = 0.025
+        
+        tag = ""
+        min_notional_usd = self._get_min_notional_usd(symbol)
+        trailing_allowed = hours >= self.trailing_grace_hours
+        
+        # Phase 1: Hard stop loss (always active)
+        if pnl <= -sl:
+            tag = "Stop Loss"
+        # Take profit
+        elif pnl >= tp:
+            tag = "Take Profit"
+        # Trailing stop (activates after trailing_activation)
+        elif trailing_allowed and pnl > trailing_activation and dd >= trailing_stop_pct:
+            tag = "Trailing Stop"
+        # Bear regime quick exit
+        elif self.market_regime == "bear" and pnl > 0.03:
+            tag = "Bear Exit"
+        # Phase 5: Time pressure (24h+, must show >2% or exit)
+        elif hours > 24 and pnl < 0.02:
+            tag = "Time Exit"
+        
+        # ATR trailing stop (Opus feature)
+        if not tag and trailing_allowed and atr and entry > 0 and holding.Quantity != 0:
+            trail_offset = atr * self.atr_trail_mult
+            trail_level = price - trail_offset
+            current_trail = crypto.get('trail_stop') if crypto else None
+            if current_trail is None or trail_level > current_trail:
+                crypto['trail_stop'] = trail_level
+            if crypto and crypto['trail_stop'] is not None:
+                if holding.Quantity > 0 and price <= crypto['trail_stop']:
+                    tag = "ATR Trail"
+                elif holding.Quantity < 0 and price >= crypto['trail_stop']:
+                    tag = "ATR Trail"
+        
+        # Signal decay check (after min_signal_age_hours)
+        if not tag and hours >= self.min_signal_age_hours:
+            try:
+                if crypto and self._is_ready(crypto):
+                    factors = self._calculate_factor_scores(symbol, crypto)
+                    if factors:
+                        comp = self._calculate_composite_score(factors)
+                        net = self._apply_fee_adjustment(comp)
+                        if net < self._get_threshold() - self.signal_decay_buffer:
+                            tag = "Signal Decay"
+            except:
+                pass
+        
+        if tag:
+            if price * abs(holding.Quantity) < min_notional_usd * 0.9:
+                return
+            self._smart_liquidate(symbol, tag)
+            self._exit_cooldowns[symbol] = self.Time + timedelta(hours=self.exit_cooldown_hours)
+            self.Debug(f"{tag}: {symbol.Value} | PnL:{pnl:+.2%} | Held:{hours:.0f}h")
+
+    def _cleanup_position(self, symbol):
+        """Remove tracking data after position exit."""
+        self.entry_prices.pop(symbol, None)
+        self.highest_prices.pop(symbol, None)
+        self.entry_times.pop(symbol, None)
+        if symbol in self.crypto_data:
+            self.crypto_data[symbol]['trail_stop'] = None
+
+    def OnOrderEvent(self, event):
+        """Process order events with Kelly criterion tracking (Opus feature)."""
+        try:
+            symbol = event.Symbol
+            msg = (
+                f"ORDER EVENT: {symbol.Value} | status={event.Status} | dir={event.Direction} | "
+                f"qty={event.FillQuantity or event.Quantity} | price={event.FillPrice} | id={event.OrderId}"
+            )
+            self.Debug(msg)
+            
+            if event.Status == OrderStatus.Submitted:
+                if symbol not in self._pending_orders:
+                    self._pending_orders[symbol] = 0
+                intended_qty = abs(event.Quantity) if event.Quantity != 0 else abs(event.FillQuantity)
+                self._pending_orders[symbol] += intended_qty
+            
+            elif event.Status == OrderStatus.PartiallyFilled:
+                if symbol in self._pending_orders:
+                    self._pending_orders[symbol] -= abs(event.FillQuantity)
+                    if self._pending_orders[symbol] <= 0:
+                        self._pending_orders.pop(symbol, None)
+                if event.Direction == OrderDirection.Buy:
+                    if symbol not in self.entry_prices:
+                        self.entry_prices[symbol] = event.FillPrice
+                        self.highest_prices[symbol] = event.FillPrice
+                        self.entry_times[symbol] = self.Time
+                self._slip_log(symbol, event.Direction, event.FillPrice)
+            
+            elif event.Status == OrderStatus.Filled:
+                self._pending_orders.pop(symbol, None)
+                if event.Direction == OrderDirection.Buy:
+                    self.entry_prices[symbol] = event.FillPrice
+                    self.highest_prices[symbol] = event.FillPrice
+                    self.entry_times[symbol] = self.Time
+                    self.daily_trade_count += 1
+                else:
+                    # Sell: calculate PnL and update Kelly tracking
+                    entry = self.entry_prices.get(symbol, None)
+                    if entry is None:
+                        entry = event.FillPrice
+                        self.Debug(f"⚠️ WARNING: Missing entry price for {symbol.Value} sell, using fill price")
+                    pnl = (event.FillPrice - entry) / entry if entry > 0 else 0
+                    
+                    # Update Kelly criterion tracking (Opus feature)
+                    if pnl > 0:
+                        self.winning_trades += 1
+                        self.consecutive_losses = 0
+                        self._rolling_wins.append(1)
+                        self._rolling_win_sizes.append(abs(pnl))
+                    else:
+                        self.losing_trades += 1
+                        self.consecutive_losses += 1
+                        self._rolling_wins.append(0)
+                        self._rolling_loss_sizes.append(abs(pnl))
+                    
+                    self.total_pnl += pnl
+                    self.trade_log.append({
+                        'time': self.Time,
+                        'symbol': symbol.Value,
+                        'pnl_pct': pnl,
+                        'exit_reason': 'filled_sell',
+                    })
+                    self._cleanup_position(symbol)
+                self._slip_log(symbol, event.Direction, event.FillPrice)
+            
+            elif event.Status == OrderStatus.Canceled:
+                self._pending_orders.pop(symbol, None)
+                if event.Direction == OrderDirection.Sell and symbol not in self.entry_prices:
+                    if self._is_invested_not_dust(symbol):
+                        holding = self.Portfolio[symbol]
+                        self.entry_prices[symbol] = holding.AveragePrice
+                        self.highest_prices[symbol] = holding.AveragePrice
+                        self.entry_times[symbol] = self.Time
+                        self.Debug(f"RE-TRACKED after cancel: {symbol.Value}")
+            
+            elif event.Status == OrderStatus.Invalid:
+                self._pending_orders.pop(symbol, None)
+                if event.Direction == OrderDirection.Sell and symbol not in self.entry_prices:
+                    if self._is_invested_not_dust(symbol):
+                        holding = self.Portfolio[symbol]
+                        self.entry_prices[symbol] = holding.AveragePrice
+                        self.highest_prices[symbol] = holding.AveragePrice
+                        self.entry_times[symbol] = self.Time
+                        self.Debug(f"RE-TRACKED after invalid: {symbol.Value}")
+                self._session_blacklist.add(symbol.Value)
+        except Exception as e:
+            self.Debug(f"OnOrderEvent error: {e}")
+
+    def OnBrokerageMessage(self, message):
+        """Parse Kraken system status messages."""
+        try:
+            txt = message.Message.lower()
+            if "system status:" in txt:
+                if "online" in txt:
+                    self.kraken_status = "online"
+                elif "maintenance" in txt:
+                    self.kraken_status = "maintenance"
+                elif "cancel_only" in txt:
+                    self.kraken_status = "cancel_only"
+                elif "post_only" in txt:
+                    self.kraken_status = "post_only"
+                else:
+                    self.kraken_status = "unknown"
+                self.Debug(f"Kraken status update: {self.kraken_status}")
+        except Exception as e:
+            self.Debug(f"BrokerageMessage parse error: {e}")
+
+    def OnEndOfAlgorithm(self):
+        """Print final trade report and persist state."""
+        total = self.winning_trades + self.losing_trades
+        wr = self.winning_trades / total if total > 0 else 0
+        self.Debug("=== FINAL REPORT ===")
+        self.Debug(f"Trades: {self.trade_count} | WR: {wr:.1%}")
+        self.Debug(f"Final: ${self.Portfolio.TotalPortfolioValue:.2f}")
+        self.Debug(f"Total PnL: {self.total_pnl:+.2%}")
+        self._persist_state()
+
+    def DailyReport(self):
+        """Print daily portfolio summary."""
+        if self.IsWarmingUp:
+            return
+        total = self.winning_trades + self.losing_trades
+        wr = self.winning_trades / total if total > 0 else 0
+        avg = self.total_pnl / total if total > 0 else 0
+        self.Debug("=" * 50)
+        self.Debug(f"=== DAILY REPORT {self.Time.date()} ===")
+        self.Debug(f"Portfolio: ${self.Portfolio.TotalPortfolioValue:.2f} | Cash: ${self.Portfolio.Cash:.2f}")
+        self.Debug(f"Positions: {self._get_actual_position_count()}/{self._get_regime_max_positions()}")
+        self.Debug(f"Regime: {self.market_regime} | Vol: {self.volatility_regime} | Breadth: {self.market_breadth:.0%}")
+        dyn_vol, dyn_pos = self._get_dynamic_liquidity_params()
+        self.Debug(f"Liquidity: min_vol=${dyn_vol:,.0f} | max_pos={dyn_pos:.0%}")
+        self.Debug(f"Trades: {total} | WR: {wr:.1%} | Avg: {avg:+.2%}")
+        if self._session_blacklist:
+            self.Debug(f"Blacklist: {len(self._session_blacklist)} items")
+        self.Debug("=" * 50)
+        for kvp in self.Portfolio:
+            if self._is_invested_not_dust(kvp.Key):
+                s = kvp.Key
+                entry = self.entry_prices.get(s, kvp.Value.AveragePrice)
+                cur = self.Securities[s].Price if s in self.Securities else kvp.Value.Price
+                pnl = (cur - entry) / entry if entry > 0 else 0
+                self.Debug(f"  {s.Value}: ${entry:.4f}→${cur:.4f} ({pnl:+.2%})")
+        self._persist_state()
+
+    def _debug_limited(self, msg):
+        """Rate-limited debug logging."""
+        if "CANCELED" in msg or "ZOMBIE" in msg or "INVALID" in msg:
+            self.Debug(msg)
+            return
+        if self.log_budget > 0:
+            self.Debug(msg)
+            self.log_budget -= 1
+        elif self.LiveMode:
+            self.Debug(msg)
