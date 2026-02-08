@@ -43,7 +43,8 @@ class RealisticCryptoSlippage(ISlippageModel):
             volume_value = volume * price
             if volume_value > 0:
                 participation_rate = order_value / volume_value
-                # Slippage scales quadratically with participation rate
+                # Slippage scales with participation rate raised to power 1.5
+                # (Examples below assume default volume_impact_factor=0.10)
                 # At 1% participation: ~0.01% extra
                 # At 10% participation: ~1% extra  
                 # At 50% participation: capped at max
