@@ -73,7 +73,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.trailing_stop_pct = self._get_param("trailing_stop_pct", 0.03)
         self.base_stop_loss = self._get_param("base_stop_loss", 0.05)
         self.base_take_profit = self._get_param("base_take_profit", 0.12)
-        self.correlation_threshold = self._get_param("correlation_threshold", 0.85)
         self.atr_sl_mult = self._get_param("atr_sl_mult", 1.6)
         self.atr_tp_mult = self._get_param("atr_tp_mult", 3.0)
 
@@ -102,7 +101,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.max_spread_pct = 0.02
         self.spread_median_window = 12
         self.spread_widen_mult = 1.5
-        self.min_hourly_volume = 500
         self.skip_hours_utc = [2, 3, 4, 5]
         self.max_daily_trades = 6
         self.daily_trade_count = 0
@@ -144,8 +142,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.exit_cooldown_hours = 2
         self.cancel_cooldown_minutes = 1
 
-        self.partial_tp_ratio = 0.5
-        self.tp1_atr_mult = 1.2
         self.trailing_grace_hours = 2
         self.atr_trail_mult = 1.2
 
@@ -233,7 +229,20 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         return []
 
     def _persist_state(self):
-        return
+        if not self.LiveMode:
+            return
+        try:
+            state = {
+                "session_blacklist": list(self._session_blacklist),
+                "winning_trades": self.winning_trades,
+                "losing_trades": self.losing_trades,
+                "total_pnl": self.total_pnl,
+                "consecutive_losses": self.consecutive_losses,
+                "daily_trade_count": self.daily_trade_count,
+            }
+            self.ObjectStore.Save("live_state", json.dumps(state))
+        except Exception as e:
+            self.Debug(f"Persist error: {e}")
 
     def _load_persisted_state(self):
         try:
@@ -241,7 +250,13 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 raw = self.ObjectStore.Read("live_state")
                 data = json.loads(raw)
                 self._session_blacklist = set(data.get("session_blacklist", []))
-                self.Debug(f"Loaded persisted state: blacklist {len(self._session_blacklist)}")
+                self.winning_trades = data.get("winning_trades", 0)
+                self.losing_trades = data.get("losing_trades", 0)
+                self.total_pnl = data.get("total_pnl", 0.0)
+                self.consecutive_losses = data.get("consecutive_losses", 0)
+                self.daily_trade_count = data.get("daily_trade_count", 0)
+                self.Debug(f"Loaded persisted state: blacklist {len(self._session_blacklist)}, "
+                           f"trades W:{self.winning_trades}/L:{self.losing_trades}")
         except Exception as e:
             self.Debug(f"Load persist error: {e}")
 
@@ -472,28 +487,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         except Exception as e:
             self.Debug(f"Error in _cancel_stale_new_orders: {e}")
 
-    def _calculate_correlation(self, symbol1, symbol2):
-        try:
-            if symbol1 not in self.crypto_data or symbol2 not in self.crypto_data: return 0.0
-            returns1 = list(self.crypto_data[symbol1]['returns'])
-            returns2 = list(self.crypto_data[symbol2]['returns'])
-            min_len = min(len(returns1), len(returns2), self.medium_period)
-            if min_len < 10: return 0.0
-            r1 = np.array(returns1[-min_len:])
-            r2 = np.array(returns2[-min_len:])
-            std1, std2 = np.std(r1), np.std(r2)
-            if std1 < 1e-10 or std2 < 1e-10: return 0.0
-            corr = np.corrcoef(r1, r2)[0, 1]
-            if np.isnan(corr) or np.isinf(corr): return 0.0
-            return corr
-        except: return 0.0
-
-    def _check_correlation(self, new_symbol):
-        return True, None, 0.0
-
-    def _dynamic_max_positions(self):
-        return self.base_max_positions
-
     def _sync_existing_positions(self):
         self.Debug("=" * 50)
         self.Debug("=== SYNCING EXISTING POSITIONS ===")
@@ -530,11 +523,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         for symbol, ticker, pnl_pct, reason in positions_to_close:
             self.Debug(f"IMMEDIATE {reason}: {ticker} at {pnl_pct:+.2%}")
             self._smart_liquidate(symbol, reason)
-            if pnl_pct > 0:
-                self.winning_trades += 1
-            else:
-                self.losing_trades += 1
-            self._cleanup_position(symbol)
+            # Let OnOrderEvent handle cleanup and PnL tracking on fill
 
     def UniverseFilter(self, universe):
         selected = []
@@ -581,9 +570,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             symbol = security.Symbol
             if not self.IsWarmingUp and self._is_invested_not_dust(symbol):
                 self._smart_liquidate(symbol, "Removed from universe")
-                self._cleanup_position(symbol)
+                # Don't cleanup here — let OnOrderEvent handle it on fill
                 self.Debug(f"FORCED EXIT: {symbol.Value} - removed from universe")
-            if symbol in self.crypto_data:
+            # Only delete crypto_data if not invested (otherwise OnOrderEvent needs it)
+            if symbol in self.crypto_data and not self._is_invested_not_dust(symbol):
                 del self.crypto_data[symbol]
 
     def OnData(self, data):
@@ -741,9 +731,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 return False
         return True
 
-    def _dynamic_size_throttle(self, size):
-        return size
-
     def _slip_log(self, symbol, direction, fill_price):
         try:
             sec = self.Securities[symbol]
@@ -888,7 +875,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if self.LiveMode and (self.volatility_regime == "high" or self.market_regime == "sideways"):
                 effective_size_cap = min(effective_size_cap, 0.25)
 
-            corr_downscale = 1.0
             total_value = self.Portfolio.TotalPortfolioValue
             try:
                 available_cash = self.Portfolio.CashBook["USD"].Amount
@@ -911,12 +897,24 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if crypto['ema_short'].IsReady and crypto['ema_medium'].IsReady:
                 ema_short = crypto['ema_short'].Current.Value
                 ema_medium = crypto['ema_medium'].Current.Value
-                if ema_short <= ema_medium:
-                    continue
-                if len(crypto['returns']) >= 3:
-                    recent_return = np.mean(list(crypto['returns'])[-3:])
-                    if recent_return <= 0:
+
+                # Check if this is a strong mean-reversion candidate
+                is_mean_reversion = False
+                if len(crypto['zscore']) >= 1 and crypto['rsi'].IsReady:
+                    z = crypto['zscore'][-1]
+                    rsi = crypto['rsi'].Current.Value
+                    # Deep oversold: allow entry even against trend
+                    if z < -1.5 and rsi < 35:
+                        is_mean_reversion = True
+
+                if not is_mean_reversion:
+                    # Normal trend-following gate
+                    if ema_short <= ema_medium:
                         continue
+                    if len(crypto['returns']) >= 3:
+                        recent_return = np.mean(list(crypto['returns'])[-3:])
+                        if recent_return <= 0:
+                            continue
             crypto['recent_net_scores'].append(net_score)
             if len(crypto['recent_net_scores']) >= 3:
                 above_threshold_count = sum(1 for score in crypto['recent_net_scores'] if score > threshold_now)
@@ -927,7 +925,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             size = min(size, effective_size_cap)
             if self.volatility_regime == "high":
                 size *= 0.7
-            size *= corr_downscale
 
             if self.LiveMode and len(crypto['dollar_volume']) >= 6:
                 recent_dollar_vol6 = np.mean(list(crypto['dollar_volume'])[-6:])
@@ -947,7 +944,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     if order_value_estimate > max_child:
                         size *= max_child / order_value_estimate
 
-            size = self._dynamic_size_throttle(size)
             val = reserved_cash * size
             qty = self._round_quantity(sym, val / price)
             if qty < min_qty:
@@ -1099,8 +1095,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         highest = self.highest_prices.get(symbol, entry)
         if price > highest:
             self.highest_prices[symbol] = price
-        pnl = (price - entry) / entry
-        dd = (highest - price) / highest
+        pnl = (price - entry) / entry if entry > 0 else 0
+        dd = (highest - price) / highest if highest > 0 else 0
         hours = (self.Time - self.entry_times.get(symbol, self.Time)).total_seconds() / 3600
         sl, tp = self.base_stop_loss, self.base_take_profit
         if self.volatility_regime == "high":
@@ -1134,14 +1130,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             tag = "Bear Exit"
         elif hours > 24 and pnl < 0.01:
             tag = "Time Exit"
-        if atr and entry > 0 and holding.Quantity > 0:
-            tp1 = entry + atr * self.tp1_atr_mult
-            if price >= tp1 and not tag:
-                qty_half = self._round_quantity(symbol, holding.Quantity * self.partial_tp_ratio)
-                rem_qty = holding.Quantity - qty_half
-                rem_val = rem_qty * price
-                if qty_half > 0 and rem_val >= min_notional_usd * 0.9:
-                    self.MarketOrder(symbol, -qty_half, tag="TP1 Partial")
         if not tag and trailing_allowed and atr and entry > 0 and holding.Quantity != 0:
             trail_offset = atr * self.atr_trail_mult
             trail_level = price - trail_offset
