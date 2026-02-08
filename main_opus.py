@@ -102,7 +102,7 @@ class OpusCryptoStrategy(QCAlgorithm):
         self.portfolio_vol_cap = 0.50
         self.signal_decay_buffer = 0.06
         self.min_signal_age_hours = 6
-        self.cash_reserve_pct = 0.08
+        self.cash_reserve_pct = 0.12  # Was 0.08 - more reserve for live fees
 
         # TIMEFRAME PERIODS
         self.ultra_short_period = 3
@@ -123,19 +123,19 @@ class OpusCryptoStrategy(QCAlgorithm):
 
         # FEE ACCOUNTING
         self.expected_round_trip_fees = 0.0052
-        self.fee_slippage_buffer = 0.004
+        self.fee_slippage_buffer = 0.005  # Was 0.004 - increased for live-safety
 
         # SPREAD & LIQUIDITY
-        self.max_spread_pct = 0.03
+        self.max_spread_pct = 0.02  # Was 0.03 - tighter spread for live
         self.spread_median_window = 12
         self.spread_widen_mult = 2.0
         self.skip_hours_utc = []
-        self.max_daily_trades = 10
+        self.max_daily_trades = 6  # Was 10 - reduce overtrading for live
         self.daily_trade_count = 0
         self.last_trade_date = None
         self.stale_order_timeout_seconds = 300
         self.live_stale_order_timeout_seconds = 900
-        self.max_concurrent_open_orders = 3
+        self.max_concurrent_open_orders = 2  # Was 3 - fewer concurrent orders for live
 
         # SESSION STATE
         self._positions_synced = False
@@ -222,6 +222,14 @@ class OpusCryptoStrategy(QCAlgorithm):
         self.kraken_status = "unknown"
         self._last_skip_reason = None
 
+        # SLIPPAGE TRACKING & LIVE SAFETY
+        self._slip_abs = deque(maxlen=50)
+        self.slip_alert_threshold = 0.0015
+        self.slip_outlier_threshold = 0.004
+        self.slip_alert_duration_hours = 2
+        self._bad_symbol_counts = {}
+        self._last_live_trade_time = None
+
         # KELLY CRITERION TRACKING
         self._rolling_wins = deque(maxlen=50)
         self._rolling_win_sizes = deque(maxlen=50)
@@ -235,6 +243,20 @@ class OpusCryptoStrategy(QCAlgorithm):
             self.btc_symbol = btc.Symbol
         except:
             self.Debug("Warning: Could not add BTC")
+
+        # Override key parameters with runtime values if provided
+        self.threshold_bull = self._get_param("threshold_bull", 0.42)
+        self.threshold_bear = self._get_param("threshold_bear", 0.58)
+        self.threshold_sideways = self._get_param("threshold_sideways", 0.48)
+        self.threshold_high_vol = self._get_param("threshold_high_vol", 0.52)
+        self.base_stop_loss = self._get_param("base_stop_loss", 0.055)
+        self.base_take_profit = self._get_param("base_take_profit", 0.12)
+        self.trailing_activation = self._get_param("trailing_activation", 0.06)
+        self.trailing_stop_pct = self._get_param("trailing_stop_pct", 0.035)
+        self.max_drawdown_limit = self._get_param("max_drawdown_limit", 0.30)
+        self.position_size_pct = self._get_param("position_size_pct", 0.55)
+        self.cash_reserve_pct = self._get_param("cash_reserve_pct", 0.12)
+        self.max_daily_trades = int(self._get_param("max_daily_trades", 6))
 
         # Rebalance every hour for maximum trade frequency
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(hours=1)), self.Rebalance)
@@ -262,6 +284,16 @@ class OpusCryptoStrategy(QCAlgorithm):
             self.Debug(f"Position size: {self.position_size_pct:.0%}")
             self.Debug("=" * 50)
 
+    def _get_param(self, name, default):
+        """Get algorithm parameter with fallback to default."""
+        try:
+            val = self.GetParameter(name)
+            if val is not None and val != '':
+                return float(val)
+        except:
+            pass
+        return default
+
     def _persist_state(self):
         if not self.LiveMode:
             return
@@ -273,6 +305,8 @@ class OpusCryptoStrategy(QCAlgorithm):
                 "total_pnl": self.total_pnl,
                 "consecutive_losses": self.consecutive_losses,
                 "daily_trade_count": self.daily_trade_count,
+                "trade_count": self.trade_count,
+                "peak_value": self.peak_value if self.peak_value is not None else 0,
             }
             self.ObjectStore.Save("opus_live_state", json.dumps(state))
         except Exception as e:
@@ -289,6 +323,10 @@ class OpusCryptoStrategy(QCAlgorithm):
                 self.total_pnl = data.get("total_pnl", 0.0)
                 self.consecutive_losses = data.get("consecutive_losses", 0)
                 self.daily_trade_count = data.get("daily_trade_count", 0)
+                self.trade_count = data.get("trade_count", 0)
+                peak = data.get("peak_value", 0)
+                if peak > 0:
+                    self.peak_value = peak
         except Exception as e:
             self.Debug(f"Load persist error: {e}")
 
@@ -804,6 +842,9 @@ class OpusCryptoStrategy(QCAlgorithm):
             side = 1 if direction == OrderDirection.Buy else -1
             slip = side * (fill_price - mid) / mid
             self._slip_abs.append(abs(slip))
+            # Live slippage alert for unusually high slippage
+            if self.LiveMode and abs(slip) > self.slip_outlier_threshold:
+                self.Debug(f"⚠️ HIGH SLIPPAGE: {symbol.Value} | {abs(slip):.4%} | dir={direction}")
         except:
             pass
 
@@ -815,10 +856,35 @@ class OpusCryptoStrategy(QCAlgorithm):
     def _is_ready(self, c):
         return len(c['prices']) >= self.medium_period and c['rsi'].IsReady
 
+    def _live_safety_checks(self):
+        """Extra safety checks for live trading."""
+        if not self.LiveMode:
+            return True
+        
+        # Check if we have minimum viable cash
+        try:
+            cash = self.Portfolio.CashBook["USD"].Amount
+        except:
+            cash = self.Portfolio.Cash
+        
+        if cash < 2.0:
+            self._debug_limited("LIVE SAFETY: Cash below $2, pausing new entries")
+            return False
+        
+        # Rate limit: don't trade more than once per 5 minutes in live
+        if hasattr(self, '_last_live_trade_time') and self._last_live_trade_time is not None:
+            seconds_since = (self.Time - self._last_live_trade_time).total_seconds()
+            if seconds_since < 300:
+                return False
+        
+        return True
+
     # TRADE EXECUTION
 
     def Rebalance(self):
         if self.IsWarmingUp:
+            return
+        if self.LiveMode and not self._live_safety_checks():
             return
         if self.LiveMode and self.kraken_status in ("maintenance", "cancel_only"):
             self._log_skip("kraken not online")
@@ -1060,6 +1126,8 @@ class OpusCryptoStrategy(QCAlgorithm):
                 if ticket is not None:
                     self._recent_tickets.append(ticket)
                     self.Debug(f"ORDER: {sym.Value} | ${val:.2f} | id={ticket.OrderId}")
+                    if self.LiveMode:
+                        self._last_live_trade_time = self.Time
                 self.trade_count += 1
                 self._debug_limited(f"ORDER: {sym.Value} | ${val:.2f}")
             except Exception as e:
@@ -1306,6 +1374,11 @@ class OpusCryptoStrategy(QCAlgorithm):
                 else:
                     self.kraken_status = "unknown"
                 self.Debug(f"Kraken status update: {self.kraken_status}")
+            
+            # Handle rate limit messages
+            if "rate limit" in txt or "too many" in txt:
+                self.Debug(f"⚠️ RATE LIMIT HIT - pausing trades for 5 minutes")
+                self._last_live_trade_time = self.Time  # This forces the 5-min cooldown
         except Exception as e:
             self.Debug(f"BrokerageMessage parse error: {e}")
 
@@ -1353,3 +1426,11 @@ class OpusCryptoStrategy(QCAlgorithm):
             self.log_budget -= 1
         elif self.LiveMode:
             self.Debug(msg)
+
+    def EmitInsights(self, *insights):
+        """Prevent QuantConnect from auto-generating insights."""
+        return []
+
+    def EmitInsight(self, insight):
+        """Prevent QuantConnect from auto-generating insights."""
+        return []
