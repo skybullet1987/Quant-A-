@@ -276,6 +276,7 @@ class OpusCryptoStrategy(QCAlgorithm):
         self.scoring_engine = OpusScoringEngine(self)
 
         if self.LiveMode:
+            self._cleanup_object_store()
             self._load_persisted_state()
             self.Debug("=" * 50)
             self.Debug("=== OPUS ULTRA-AGGRESSIVE v1.0 ===")
@@ -329,6 +330,17 @@ class OpusCryptoStrategy(QCAlgorithm):
                     self.peak_value = peak
         except Exception as e:
             self.Debug(f"Load persist error: {e}")
+
+    def _cleanup_object_store(self):
+        try:
+            n=0
+            for i in self.ObjectStore.GetEnumerator():
+                k=i.Key if hasattr(i,'Key') else str(i)
+                if k!="opus_live_state":
+                    try:self.ObjectStore.Delete(k);n+=1
+                    except:pass
+            if n:self.Debug(f"Cleaned {n} keys")
+        except Exception as e:self.Debug(f"Cleanup err: {e}")
 
     def _is_invested_not_dust(self, symbol):
         if symbol not in self.Portfolio:
