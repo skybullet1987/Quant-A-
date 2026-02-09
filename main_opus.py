@@ -59,8 +59,8 @@ class OpusCryptoStrategy(QCAlgorithm):
     SYMBOL_BLACKLIST = {
         "BTCUSD", "ETHUSD", "USDTUSD", "USDCUSD", "PYUSDUSD", "EURCUSD", "USTUSD", "DAIUSD",
         "TUSDUSD", "WETHUSD", "WBTCUSD", "WAXLUSD", "XMRUSD", "ZECUSD", "DASHUSD",
-        "BDXNUSD", "RAIINUSD", "LUNAUSD", "LUNCUSD", "USTCUSD", "ABORDUSD", "BONDUSD", "KEEPUSD", "PARTIUSD",
-        "ORNUSD", "MUSD", "ICNTUSD", "EPTUSD", "LMWRUSD", "CPOOLUSD", "ARCUSD", "PAXGUSD", "XNYUSD",
+        "BDXNUSD", "RAIINUSD", "LUNAUSD", "LUNCUSD", "USTCUSD", "ABORDUSD", "BONDUSD", "KEEPUSD",
+        "ORNUSD", "MUSD", "ICNTUSD", "EPTUSD", "LMWRUSD", "CPOOLUSD", "ARCUSD", "PAXGUSD", "XNYUSD","PARTIUSD"
     }
 
     KRAKEN_MIN_QTY_FALLBACK = {
@@ -84,16 +84,16 @@ class OpusCryptoStrategy(QCAlgorithm):
         self.SetBrokerageModel(BrokerageName.Kraken, AccountType.Cash)
 
         # AGGRESSIVE SIGNAL THRESHOLDS
-        self.threshold_bull = 0.50
-        self.threshold_bear = 0.62
-        self.threshold_sideways = 0.55
-        self.threshold_high_vol = 0.58
+        self.threshold_bull = 0.42
+        self.threshold_bear = 0.58
+        self.threshold_sideways = 0.48
+        self.threshold_high_vol = 0.52
 
         # EXIT PARAMETERS
         self.trailing_activation = 0.06
         self.trailing_stop_pct = 0.035
         self.base_stop_loss = 0.055
-        self.base_take_profit = 0.09
+        self.base_take_profit = 0.12
         self.atr_sl_mult = 1.4
         self.atr_tp_mult = 2.8
 
@@ -145,12 +145,14 @@ class OpusCryptoStrategy(QCAlgorithm):
 
         # 8-FACTOR SCORING WEIGHTS
         self.weights = {
-            'trend_strength': 0.25,
-            'risk_adjusted_momentum': 0.20,
-            'volume_momentum': 0.20,
-            'multi_timeframe': 0.15,
+            'relative_strength': 0.18,
+            'volume_momentum': 0.18,
+            'trend_strength': 0.15,
+            'mean_reversion': 0.12,
+            'liquidity': 0.07,
+            'risk_adjusted_momentum': 0.12,
             'breakout_score': 0.10,
-            'relative_strength': 0.10,
+            'multi_timeframe': 0.08,
         }
 
         # DRAWDOWN MANAGEMENT
@@ -205,7 +207,7 @@ class OpusCryptoStrategy(QCAlgorithm):
 
         # UNIVERSE
         self.min_volume_usd = 500
-        self.max_universe_size = 1000
+        self.max_universe_size = 300
         self.base_min_volume_usd = 500
 
         self.liquidity_tiers = [
@@ -243,12 +245,12 @@ class OpusCryptoStrategy(QCAlgorithm):
             self.Debug("Warning: Could not add BTC")
 
         # Override key parameters with runtime values if provided
-        self.threshold_bull = self._get_param("threshold_bull", 0.50)
-        self.threshold_bear = self._get_param("threshold_bear", 0.62)
-        self.threshold_sideways = self._get_param("threshold_sideways", 0.55)
-        self.threshold_high_vol = self._get_param("threshold_high_vol", 0.58)
+        self.threshold_bull = self._get_param("threshold_bull", 0.42)
+        self.threshold_bear = self._get_param("threshold_bear", 0.58)
+        self.threshold_sideways = self._get_param("threshold_sideways", 0.48)
+        self.threshold_high_vol = self._get_param("threshold_high_vol", 0.52)
         self.base_stop_loss = self._get_param("base_stop_loss", 0.055)
-        self.base_take_profit = self._get_param("base_take_profit", 0.09)
+        self.base_take_profit = self._get_param("base_take_profit", 0.12)
         self.trailing_activation = self._get_param("trailing_activation", 0.06)
         self.trailing_stop_pct = self._get_param("trailing_stop_pct", 0.035)
         self.max_drawdown_limit = self._get_param("max_drawdown_limit", 0.30)
@@ -361,7 +363,7 @@ class OpusCryptoStrategy(QCAlgorithm):
         return 2
 
     def _kelly_fraction(self):
-        if len(self._rolling_wins) < 40:
+        if len(self._rolling_wins) < 10:
             return 1.0
         win_rate = sum(self._rolling_wins) / len(self._rolling_wins)
         if win_rate <= 0 or win_rate >= 1:
@@ -373,7 +375,7 @@ class OpusCryptoStrategy(QCAlgorithm):
         b = avg_win / avg_loss
         kelly = (win_rate * b - (1 - win_rate)) / b
         half_kelly = kelly * 0.5
-        return max(0.6, min(1.2, half_kelly / 0.5))
+        return max(0.5, min(1.5, half_kelly / 0.5))
 
     def _get_position_sectors(self):
         sectors = set()
@@ -638,7 +640,7 @@ class OpusCryptoStrategy(QCAlgorithm):
             'rs_vs_btc': deque(maxlen=self.medium_period),
             'zscore': deque(maxlen=self.short_period),
             'last_price': 0,
-            'recent_net_scores': deque(maxlen=4),
+            'recent_net_scores': deque(maxlen=2),
             'spreads': deque(maxlen=self.spread_median_window),
             'trail_stop': None,
             'bb_upper': deque(maxlen=self.short_period),
@@ -1051,17 +1053,27 @@ class OpusCryptoStrategy(QCAlgorithm):
                 ema_short = crypto['ema_short'].Current.Value
                 ema_medium = crypto['ema_medium'].Current.Value
                 
-                if ema_short < ema_medium * 0.995:
-                    continue
-                if len(crypto['returns']) >= 3:
-                    recent_return = np.mean(list(crypto['returns'])[-3:])
-                    if recent_return <= 0:
+                is_mean_reversion = False
+                if len(crypto['zscore']) >= 1 and crypto['rsi'].IsReady:
+                    z = crypto['zscore'][-1]
+                    rsi = crypto['rsi'].Current.Value
+                    # Deep oversold: allow entry even against trend
+                    if z < -1.5 and rsi < 35:
+                        is_mean_reversion = True
+                
+                if not is_mean_reversion:
+                    # Normal trend-following gate
+                    if ema_short < ema_medium * 0.995:
                         continue
+                    if len(crypto['returns']) >= 3:
+                        recent_return = np.mean(list(crypto['returns'])[-3:])
+                        if recent_return <= 0:
+                            continue
             
             crypto['recent_net_scores'].append(net_score)
             if len(crypto['recent_net_scores']) >= 3:
                 above_threshold_count = sum(1 for score in crypto['recent_net_scores'] if score > threshold_now)
-                if above_threshold_count < 3:
+                if above_threshold_count < 2:
                     continue
             
             # Position sizing with Kelly fraction (Opus)
@@ -1217,21 +1229,9 @@ class OpusCryptoStrategy(QCAlgorithm):
         # Bear regime quick exit
         elif self.market_regime == "bear" and pnl > 0.03:
             tag = "Bear Exit"
-        # Phase 5: Time pressure (72h+, must show >1% or exit, and signal must have decayed)
-        elif hours > 72 and pnl < 0.01:
-            # Only time-exit if signal has also decayed
-            try:
-                if crypto and self._is_ready(crypto):
-                    factors = self.scoring_engine.calculate_factor_scores(symbol, crypto)
-                    if factors:
-                        comp = self.scoring_engine.calculate_composite_score(factors)
-                        net = self.scoring_engine.apply_fee_adjustment(comp)
-                        if net < self._get_threshold():
-                            tag = "Time Exit"
-                else:
-                    tag = "Time Exit"
-            except:
-                tag = "Time Exit"
+        # Phase 5: Time pressure (36h+, must show >1% or exit)
+        elif hours > 36 and pnl < 0.01:
+            tag = "Time Exit"
         
         # ATR trailing stop (Opus feature)
         if not tag and trailing_allowed and atr and entry > 0 and holding.Quantity != 0:
