@@ -520,7 +520,10 @@ class OpusCryptoStrategy(QCAlgorithm):
             return
         if self.LiveMode and holding_qty > 0:
             estimated_fee = price * abs(holding_qty) * 0.006
-            available_usd = self.Portfolio.CashBook.get("USD", self.Portfolio).Amount if hasattr(self.Portfolio, 'CashBook') else self.Portfolio.Cash
+            try:
+                available_usd = self.Portfolio.CashBook["USD"].Amount
+            except (KeyError, AttributeError):
+                available_usd = self.Portfolio.Cash
             if available_usd < estimated_fee:
                 self.Debug(f"⚠️ SKIP SELL {symbol.Value}: fee reserve too low")
                 if symbol not in self.entry_prices:
