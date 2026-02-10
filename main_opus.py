@@ -117,7 +117,7 @@ class OpusCryptoStrategy(QCAlgorithm):
         # POSITION MANAGEMENT
         self.base_max_positions = 3
         self.max_positions = self.base_max_positions
-        self.position_size_pct = 0.55
+        self.position_size_pct = 0.8
         self.min_notional = 5.0
         self.min_price_usd = 0.001
 
@@ -211,12 +211,12 @@ class OpusCryptoStrategy(QCAlgorithm):
         self.base_min_volume_usd = 500
 
         self.liquidity_tiers = [
-            (50000, 50000, 0.15),
-            (10000, 20000, 0.20),
-            (2000,  5000,  0.25),
-            (500,   2000,  0.35),
-            (100,   1000,  0.45),
-            (0,     500,   0.55),
+            (50000, 50000, 0.35),
+            (10000, 20000, 0.45),
+            (2000,  5000,  0.55),
+            (500,   2000,  0.65),
+            (100,   1000,  0.75),
+            (0,     500,   0.8),
         ]
 
         self.kraken_status = "unknown"
@@ -254,7 +254,7 @@ class OpusCryptoStrategy(QCAlgorithm):
         self.trailing_activation = self._get_param("trailing_activation", 0.06)
         self.trailing_stop_pct = self._get_param("trailing_stop_pct", 0.035)
         self.max_drawdown_limit = self._get_param("max_drawdown_limit", 0.30)
-        self.position_size_pct = self._get_param("position_size_pct", 0.55)
+        self.position_size_pct = self._get_param("position_size_pct", 0.8)
         self.cash_reserve_pct = self._get_param("cash_reserve_pct", 0.12)
         self.max_daily_trades = int(self._get_param("max_daily_trades", 6))
 
