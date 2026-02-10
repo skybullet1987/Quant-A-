@@ -84,7 +84,7 @@ class OpusCryptoStrategy(QCAlgorithm):
         # AGGRESSIVE SIGNAL THRESHOLDS
         self.threshold_bull = 0.42
         self.threshold_bear = 0.58
-        self.threshold_sideways = 0.48
+        self.threshold_sideways = 0.52
         self.threshold_high_vol = 0.52
         # EXIT PARAMETERS
         self.trailing_activation = 0.06
@@ -160,7 +160,7 @@ class OpusCryptoStrategy(QCAlgorithm):
         self._pending_orders = {}
         self._cancel_cooldowns = {}
         self._exit_cooldowns = {}
-        self.exit_cooldown_hours = 1
+        self.exit_cooldown_hours = 6
         self.cancel_cooldown_minutes = 1
         self.trailing_grace_hours = 1.5
         self.atr_trail_mult = 1.3
@@ -192,7 +192,7 @@ class OpusCryptoStrategy(QCAlgorithm):
         # UNIVERSE
         self.min_volume_usd = 500
         self.max_universe_size = 300
-        self.base_min_volume_usd = 500
+        self.base_min_volume_usd = 2000
 
         self.liquidity_tiers = [
             (50000, 50000, 0.35),
@@ -231,7 +231,7 @@ class OpusCryptoStrategy(QCAlgorithm):
         # Override key parameters with runtime values if provided
         self.threshold_bull = self._get_param("threshold_bull", 0.42)
         self.threshold_bear = self._get_param("threshold_bear", 0.58)
-        self.threshold_sideways = self._get_param("threshold_sideways", 0.48)
+        self.threshold_sideways = self._get_param("threshold_sideways", 0.52)
         self.threshold_high_vol = self._get_param("threshold_high_vol", 0.52)
         self.base_stop_loss = self._get_param("base_stop_loss", 0.055)
         self.base_take_profit = self._get_param("base_take_profit", 0.12)
@@ -629,7 +629,7 @@ class OpusCryptoStrategy(QCAlgorithm):
             'rs_vs_btc': deque(maxlen=self.medium_period),
             'zscore': deque(maxlen=self.short_period),
             'last_price': 0,
-            'recent_net_scores': deque(maxlen=2),
+            'recent_net_scores': deque(maxlen=3),
             'spreads': deque(maxlen=self.spread_median_window),
             'trail_stop': None,
             'bb_upper': deque(maxlen=self.short_period),
@@ -1054,8 +1054,8 @@ class OpusCryptoStrategy(QCAlgorithm):
                     # Normal trend-following gate
                     if ema_short < ema_medium * 0.995:
                         continue
-                    if len(crypto['returns']) >= 3:
-                        recent_return = np.mean(list(crypto['returns'])[-3:])
+                    if len(crypto['returns']) >= 6:
+                        recent_return = np.mean(list(crypto['returns'])[-6:])
                         if recent_return <= 0:
                             continue
             
