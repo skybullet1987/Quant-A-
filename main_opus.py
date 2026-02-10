@@ -9,7 +9,6 @@ from scipy import stats as scipy_stats
 from scoring import OpusScoringEngine
 # endregion
 
-
 class RealisticCryptoSlippage:
     """Volume-aware slippage model for crypto."""
     
@@ -45,7 +44,6 @@ class RealisticCryptoSlippage:
         
         return price * slippage_pct
 
-
 class OpusCryptoStrategy(QCAlgorithm):
     """
     OPUS - Ultra-Aggressive Crypto Strategy v1.0
@@ -60,7 +58,8 @@ class OpusCryptoStrategy(QCAlgorithm):
         "BTCUSD", "ETHUSD", "USDTUSD", "USDCUSD", "PYUSDUSD", "EURCUSD", "USTUSD", "DAIUSD",
         "TUSDUSD", "WETHUSD", "WBTCUSD", "WAXLUSD", "XMRUSD", "ZECUSD", "DASHUSD",
         "BDXNUSD", "RAIINUSD", "LUNAUSD", "LUNCUSD", "USTCUSD", "ABORDUSD", "BONDUSD", "KEEPUSD",
-        "ORNUSD", "MUSD", "ICNTUSD", "EPTUSD", "LMWRUSD", "CPOOLUSD", "ARCUSD", "PAXGUSD", "XNYUSD","PARTIUSD"
+        "ORNUSD", "MUSD", "ICNTUSD", "EPTUSD", "LMWRUSD", "CPOOLUSD", "ARCUSD", "PAXGUSD", "XNYUSD","PARTIUSD",
+        "RAREUSD", "BANANAS31USD"
     }
 
     KRAKEN_MIN_QTY_FALLBACK = {
@@ -82,13 +81,11 @@ class OpusCryptoStrategy(QCAlgorithm):
         self.SetStartDate(2025, 1, 1)
         self.SetCash(20)
         self.SetBrokerageModel(BrokerageName.Kraken, AccountType.Cash)
-
         # AGGRESSIVE SIGNAL THRESHOLDS
         self.threshold_bull = 0.42
         self.threshold_bear = 0.58
         self.threshold_sideways = 0.48
         self.threshold_high_vol = 0.52
-
         # EXIT PARAMETERS
         self.trailing_activation = 0.06
         self.trailing_stop_pct = 0.035
@@ -96,14 +93,12 @@ class OpusCryptoStrategy(QCAlgorithm):
         self.base_take_profit = 0.12
         self.atr_sl_mult = 1.4
         self.atr_tp_mult = 2.8
-
         # RISK PARAMETERS
         self.target_position_ann_vol = 0.30
         self.portfolio_vol_cap = 0.50
         self.signal_decay_buffer = 0.06
         self.min_signal_age_hours = 6
-        self.cash_reserve_pct = 0.12  # Was 0.08 - more reserve for live fees
-
+        self.cash_reserve_pct = 0.12
         # TIMEFRAME PERIODS
         self.ultra_short_period = 3
         self.short_period = 6
@@ -113,36 +108,31 @@ class OpusCryptoStrategy(QCAlgorithm):
         self.lookback = 72
         self.sqrt_annualization = np.sqrt(24 * 365)
         self.min_asset_vol_floor = 0.05
-
         # POSITION MANAGEMENT
         self.base_max_positions = 3
         self.max_positions = self.base_max_positions
         self.position_size_pct = 0.8
         self.min_notional = 5.0
         self.min_price_usd = 0.001
-
         # FEE ACCOUNTING
         self.expected_round_trip_fees = 0.0052
-        self.fee_slippage_buffer = 0.005  # Was 0.004 - increased for live-safety
-
+        self.fee_slippage_buffer = 0.005
         # SPREAD & LIQUIDITY
-        self.max_spread_pct = 0.02  # Was 0.03 - tighter spread for live
+        self.max_spread_pct = 0.02
         self.spread_median_window = 12
         self.spread_widen_mult = 2.0
         self.skip_hours_utc = []
-        self.max_daily_trades = 6  # Was 10 - reduce overtrading for live
+        self.max_daily_trades = 6
         self.daily_trade_count = 0
         self.last_trade_date = None
         self.stale_order_timeout_seconds = 300
         self.live_stale_order_timeout_seconds = 900
-        self.max_concurrent_open_orders = 2  # Was 3 - fewer concurrent orders for live
-
+        self.max_concurrent_open_orders = 2
         # SESSION STATE
         self._positions_synced = False
         self._session_blacklist = set()
         self._max_session_blacklist_size = 100
         self._first_post_warmup = True
-
         # 8-FACTOR SCORING WEIGHTS
         self.weights = {
             'relative_strength': 0.18,
@@ -154,7 +144,6 @@ class OpusCryptoStrategy(QCAlgorithm):
             'breakout_score': 0.10,
             'multi_timeframe': 0.08,
         }
-
         # DRAWDOWN MANAGEMENT
         self.peak_value = None
         self.max_drawdown_limit = 0.30
@@ -162,25 +151,20 @@ class OpusCryptoStrategy(QCAlgorithm):
         self.cooldown_hours = 12
         self.consecutive_losses = 0
         self.max_consecutive_losses = 8
-
         # DATA STRUCTURES
         self.crypto_data = {}
         self.entry_prices = {}
         self.highest_prices = {}
         self.entry_times = {}
         self.trade_count = 0
-
         self._pending_orders = {}
         self._cancel_cooldowns = {}
         self._exit_cooldowns = {}
         self.exit_cooldown_hours = 1
         self.cancel_cooldown_minutes = 1
-
         self.trailing_grace_hours = 1.5
         self.atr_trail_mult = 1.3
-
         self._recent_tickets = deque(maxlen=25)
-
         self.btc_symbol = None
         self.btc_returns = deque(maxlen=self.trend_period)
         self.btc_prices = deque(maxlen=self.trend_period)
@@ -474,7 +458,6 @@ class OpusCryptoStrategy(QCAlgorithm):
             self.max_positions = self._get_regime_max_positions()
             if old_max != self.max_positions:
                 self.Debug(f"PERFORMANCE RECOVERY: max_pos={self.max_positions}")
-
     def _get_min_quantity(self, symbol):
         ticker = symbol.Value if hasattr(symbol, 'Value') else str(symbol)
         try:
@@ -488,7 +471,6 @@ class OpusCryptoStrategy(QCAlgorithm):
         if ticker in self.KRAKEN_MIN_QTY_FALLBACK:
             return self.KRAKEN_MIN_QTY_FALLBACK[ticker]
         return self._estimate_min_qty(symbol)
-
     def _estimate_min_qty(self, symbol):
         try:
             price = self.Securities[symbol].Price if symbol in self.Securities else 0
@@ -497,7 +479,6 @@ class OpusCryptoStrategy(QCAlgorithm):
         for threshold, qty in [(0.001, 1000.0), (0.01, 500.0), (0.1, 50.0), (1.0, 10.0), (10.0, 5.0), (100.0, 1.0), (1000.0, 0.1)]:
             if price < threshold: return qty
         return 0.01
-
     def _get_min_notional_usd(self, symbol):
         ticker = symbol.Value if hasattr(symbol, 'Value') else str(symbol)
         fallback = self.MIN_NOTIONAL_FALLBACK.get(ticker, self.min_notional)
@@ -508,7 +489,6 @@ class OpusCryptoStrategy(QCAlgorithm):
             return max(fallback, implied, self.min_notional)
         except:
             return max(fallback, self.min_notional)
-
     def _round_quantity(self, symbol, quantity):
         try:
             lot_size = self.Securities[symbol].SymbolProperties.LotSize
@@ -519,17 +499,17 @@ class OpusCryptoStrategy(QCAlgorithm):
 
     def _smart_liquidate(self, symbol, tag="Liquidate"):
         if len(self.Transactions.GetOpenOrders(symbol)) > 0:
-            return
+            self.Debug(symbol.Value+"o");return
         if symbol in self._cancel_cooldowns and self.Time < self._cancel_cooldowns[symbol]:
-            return
+            self.Debug(symbol.Value+"c");return
         if symbol not in self.Portfolio or self.Portfolio[symbol].Quantity == 0:
-            return
+            self.Debug(symbol.Value+"p");return
         holding_qty = self.Portfolio[symbol].Quantity
         min_qty = self._get_min_quantity(symbol)
         min_notional = self._get_min_notional_usd(symbol)
         price = self.Securities[symbol].Price if symbol in self.Securities else 0
         if price * abs(holding_qty) < min_notional * 0.9:
-            return
+            self.Debug(symbol.Value+"n");return
         if self.LiveMode and holding_qty > 0:
             estimated_fee = price * abs(holding_qty) * 0.006
             try:
@@ -537,7 +517,7 @@ class OpusCryptoStrategy(QCAlgorithm):
             except (KeyError, AttributeError):
                 available_usd = self.Portfolio.Cash
             if available_usd < estimated_fee:
-                self.Debug(f"⚠️ SKIP SELL {symbol.Value}: fee reserve too low")
+                self.Debug(symbol.Value+"f")
                 if symbol not in self.entry_prices:
                     self.entry_prices[symbol] = self.Portfolio[symbol].AveragePrice
                     self.highest_prices[symbol] = self.Portfolio[symbol].AveragePrice
@@ -545,14 +525,13 @@ class OpusCryptoStrategy(QCAlgorithm):
                 return
         self.Transactions.CancelOpenOrders(symbol)
         if abs(holding_qty) < min_qty:
-            return
+            self.Debug(symbol.Value+"q");return
         safe_qty = self._round_quantity(symbol, abs(holding_qty))
         if safe_qty < min_qty:
-            return
+            self.Debug(symbol.Value+"r");return
         if safe_qty > 0:
             direction_mult = -1 if holding_qty > 0 else 1
             self.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
-
     def _cancel_stale_orders(self):
         try:
             open_orders = self.Transactions.GetOpenOrders()
@@ -561,10 +540,8 @@ class OpusCryptoStrategy(QCAlgorithm):
                     self.Transactions.CancelOrder(order.Id)
         except Exception as e:
             self.Debug(f"Error canceling stale orders: {e}")
-
     def _effective_stale_timeout(self):
         return self.live_stale_order_timeout_seconds if self.LiveMode else self.stale_order_timeout_seconds
-
     def _cancel_stale_new_orders(self):
         try:
             open_orders = self.Transactions.GetOpenOrders()
@@ -583,7 +560,6 @@ class OpusCryptoStrategy(QCAlgorithm):
                     self._session_blacklist.add(sym_val)
         except Exception as e:
             self.Debug(f"Error in _cancel_stale_new_orders: {e}")
-
     def _sync_existing_positions(self):
         self.Debug("=" * 50)
         self.Debug("=== SYNCING EXISTING POSITIONS ===")
@@ -617,7 +593,6 @@ class OpusCryptoStrategy(QCAlgorithm):
         self.Debug("=" * 50)
         for symbol, ticker, pnl_pct, reason in positions_to_close:
             self._smart_liquidate(symbol, reason)
-
     def UniverseFilter(self, universe):
         dynamic_min_vol, _ = self._get_dynamic_liquidity_params()
         effective_min_vol = max(self.base_min_volume_usd, dynamic_min_vol)
@@ -636,7 +611,6 @@ class OpusCryptoStrategy(QCAlgorithm):
                 selected.append(crypto)
         selected.sort(key=lambda x: x.VolumeInUsd, reverse=True)
         return [c.Symbol for c in selected[:self.max_universe_size]]
-
     def _initialize_symbol(self, symbol):
         self.crypto_data[symbol] = {
             'prices': deque(maxlen=self.lookback),
