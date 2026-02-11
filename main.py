@@ -1296,18 +1296,23 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
 
     def _kelly_fraction(self):
-        """Calculate Kelly fraction for performance monitoring. Not used for position sizing."""
+        """Calculate Kelly fraction for performance monitoring. Not used for position sizing.
+        
+        Returns a bounded Kelly criterion multiplier (0.5x to 1.5x) for tracking strategy
+        efficiency. Bounds prevent extreme values from distorting monitoring metrics.
+        """
         KELLY_MIN_SAMPLES = 10
         KELLY_HALF_FRACTION = 0.5
         KELLY_SCALE_DIVISOR = 0.5
+        FALLBACK_AVG_RETURN = 0.02  # 2% fallback for avg win/loss when no data
         
         if len(self._rolling_wins) < KELLY_MIN_SAMPLES:
             return 1.0
         win_rate = sum(self._rolling_wins) / len(self._rolling_wins)
         if win_rate <= 0 or win_rate >= 1:
             return 1.0
-        avg_win = np.mean(list(self._rolling_win_sizes)) if len(self._rolling_win_sizes) > 0 else 0.02
-        avg_loss = np.mean(list(self._rolling_loss_sizes)) if len(self._rolling_loss_sizes) > 0 else 0.02
+        avg_win = np.mean(list(self._rolling_win_sizes)) if len(self._rolling_win_sizes) > 0 else FALLBACK_AVG_RETURN
+        avg_loss = np.mean(list(self._rolling_loss_sizes)) if len(self._rolling_loss_sizes) > 0 else FALLBACK_AVG_RETURN
         if avg_loss <= 0:
             return 1.0
         b = avg_win / avg_loss
