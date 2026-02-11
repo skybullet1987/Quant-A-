@@ -130,12 +130,12 @@ class OpusCryptoStrategy(QCAlgorithm):
         self.weights = {
             'relative_strength': 0.18,
             'volume_momentum': 0.18,
-            'trend_strength': 0.15,
-            'mean_reversion': 0.12,
+            'trend_strength': 0.20,
+            'mean_reversion': 0.08,
             'liquidity': 0.07,
-            'risk_adjusted_momentum': 0.12,
+            'risk_adjusted_momentum': 0.14,
             'breakout_score': 0.10,
-            'multi_timeframe': 0.08,
+            'multi_timeframe': 0.05,
         }
         # DRAWDOWN MANAGEMENT
         self.peak_value = None
@@ -1212,8 +1212,8 @@ class OpusCryptoStrategy(QCAlgorithm):
         # Bear regime quick exit
         elif self.market_regime == "bear" and pnl > 0.03:
             tag = "Bear Exit"
-        # Phase 5: Time pressure (36h+, must show >1% or exit)
-        elif hours > 36 and pnl < 0.01:
+        # Phase 5: Time pressure
+        elif hours > 24 and pnl < 0.02:
             tag = "Time Exit"
         
         # ATR trailing stop (Opus feature)

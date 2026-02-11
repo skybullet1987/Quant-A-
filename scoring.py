@@ -83,118 +83,103 @@ class OpusScoringEngine:
             else:
                 scores['relative_strength'] = 0.5
 
-            # 2. VOLUME MOMENTUM (enhanced)
+            # 2. VOLUME MOMENTUM (smoothed)
             if len(crypto['volume_ma']) >= 2 and len(crypto['returns']) >= 3:
                 vol_ma_prev = crypto['volume_ma'][-2]
                 vol_trend = (crypto['volume_ma'][-1] / (vol_ma_prev + 1e-8)) - 1
                 price_trend = np.mean(list(crypto['returns'])[-3:])
-                # Volume spike detection
+                
+                # Continuous base score from price trend
+                base = 0.5 + price_trend * 20  # scale price trend to [0,1] range
+                base = max(0.1, min(0.9, base))
+                
+                # Volume trend bonus (continuous)
+                if vol_trend > 0:
+                    vol_bonus = min(0.15, vol_trend * 3)
+                    base += vol_bonus
+                
+                # Volume spike bonus (continuous, not binary)
                 if len(crypto['volume']) >= 12:
                     median_vol = np.median(list(crypto['volume'])[-12:])
                     current_vol = crypto['volume'][-1]
-                    vol_spike = current_vol / (median_vol + 1e-8)
-                else:
-                    vol_spike = 1.0
-                if vol_trend > 0 and price_trend > 0:
-                    base = min(0.5 + vol_trend * 5 + price_trend * 25, 1.0)
-                    if vol_spike > 2.0:
-                        base = min(base + 0.15, 1.0)  # Volume spike bonus
-                    scores['volume_momentum'] = base
-                elif price_trend > 0:
-                    scores['volume_momentum'] = 0.55
-                else:
-                    scores['volume_momentum'] = 0.3
+                    if median_vol > 0:
+                        vol_ratio = current_vol / median_vol
+                        spike_bonus = min(0.1, max(0, (vol_ratio - 1.5) * 0.1))
+                        base += spike_bonus
+                
+                scores['volume_momentum'] = max(0.05, min(0.95, base))
             else:
                 scores['volume_momentum'] = 0.5
 
-            # 3. TREND STRENGTH (KAMA-enhanced)
-            if crypto.get('kama') and crypto['kama'].IsReady and crypto['ema_medium'].IsReady:
-                kama_val = crypto['kama'].Current.Value
-                price = crypto['last_price']
-                ema_m = crypto['ema_medium'].Current.Value
-                
-                # KAMA slope: positive = trending up, negative = trending down
-                # Use price vs KAMA and KAMA vs EMA_medium for trend confirmation
-                if price > kama_val and kama_val > ema_m:
-                    # Strong uptrend: price above KAMA above EMA
-                    kama_strength = (price - kama_val) / kama_val if kama_val > 0 else 0
-                    scores['trend_strength'] = min(0.75 + kama_strength * 15, 1.0)  # scales to near-max
-                elif price > kama_val:
-                    # Moderate uptrend: price above KAMA
-                    scores['trend_strength'] = 0.65
-                elif price > ema_m:
-                    # Weak uptrend: price above EMA but below KAMA (KAMA adapting slowly)
-                    scores['trend_strength'] = 0.50
-                elif price < kama_val and kama_val < ema_m:
-                    # Strong downtrend
-                    scores['trend_strength'] = 0.15
-                else:
-                    scores['trend_strength'] = 0.35
-            # Keep existing EMA fallback for when KAMA isn't ready
-            elif crypto['ema_short'].IsReady and crypto['ema_trend'].IsReady:
+            # 3. TREND STRENGTH (smoothed + incorporates multi-timeframe)
+            if crypto['ema_short'].IsReady and crypto['ema_trend'].IsReady:
                 us = crypto['ema_ultra_short'].Current.Value
                 s = crypto['ema_short'].Current.Value
                 m = crypto['ema_medium'].Current.Value
                 l = crypto['ema_long'].Current.Value
                 t = crypto['ema_trend'].Current.Value
-                aligned = sum([us > s, s > m, m > l, l > t])
-                if aligned >= 4:
-                    scores['trend_strength'] = min(0.7 + ((s - t) / t) * 8, 1.0)
-                elif aligned >= 3:
-                    scores['trend_strength'] = 0.7
-                elif aligned >= 2:
-                    scores['trend_strength'] = 0.55
-                elif us < s < m < l:
-                    scores['trend_strength'] = 0.15
+                
+                # Continuous alignment score: each pair contributes proportionally
+                pairs = [(us, s), (s, m), (m, l), (l, t)]
+                alignment_score = 0.0
+                for fast, slow in pairs:
+                    if slow > 0:
+                        diff_pct = (fast - slow) / slow
+                        # Sigmoid-like: maps diff_pct to [0, 1] smoothly
+                        pair_score = 1.0 / (1.0 + np.exp(-diff_pct * 200))
+                        alignment_score += pair_score * 0.25  # each pair = 25%
+                
+                # Blend with multi-timeframe momentum for richer signal
+                if len(crypto['returns']) >= 24:
+                    returns = list(crypto['returns'])
+                    tf_scores = []
+                    for period in [3, 6, 12, 24]:
+                        if len(returns) >= period:
+                            tf_ret = np.mean(returns[-period:])
+                            tf_scores.append(1.0 / (1.0 + np.exp(-tf_ret * 300)))
+                    if tf_scores:
+                        multi_tf = np.mean(tf_scores)
+                        # 70% EMA alignment + 30% multi-TF momentum
+                        scores['trend_strength'] = max(0.05, min(0.95, alignment_score * 0.7 + multi_tf * 0.3))
+                    else:
+                        scores['trend_strength'] = max(0.05, min(0.95, alignment_score))
                 else:
-                    scores['trend_strength'] = 0.35
+                    scores['trend_strength'] = max(0.05, min(0.95, alignment_score))
             elif crypto['ema_short'].IsReady:
                 s = crypto['ema_short'].Current.Value
                 m = crypto['ema_medium'].Current.Value
                 l = crypto['ema_long'].Current.Value
-                if s > m > l:
-                    scores['trend_strength'] = min(0.6 + ((s - l) / l) * 10, 1.0)
-                elif s > m:
-                    scores['trend_strength'] = 0.6
+                if l > 0:
+                    diff = (s - l) / l
+                    scores['trend_strength'] = max(0.1, min(0.9, 0.5 + diff * 10))
                 else:
-                    scores['trend_strength'] = 0.3
+                    scores['trend_strength'] = 0.5
             else:
                 scores['trend_strength'] = 0.5
 
-            # 4. MEAN REVERSION (Fisher Transform enhanced)
+            # 4. MEAN REVERSION (smoothed continuous)
             if len(crypto['zscore']) >= 1:
                 z = crypto['zscore'][-1]
                 rsi = crypto['rsi'].Current.Value
-                fisher = self._fisher_transform(crypto['prices'], 10) if len(crypto['prices']) >= 10 else 0.0
                 
-                if z < -2.0 and rsi < 25 and fisher < -1.0:
-                    scores['mean_reversion'] = 1.0      # Extreme oversold, Fisher confirms
-                elif z < -1.5 and rsi < 35 and fisher < -0.5:
-                    scores['mean_reversion'] = 0.9       # Strong oversold with Fisher confirmation
-                elif z < -1.5 and rsi < 35:
-                    scores['mean_reversion'] = 0.75      # Oversold but no Fisher confirmation - lower score
-                elif z < -1.0 and rsi < 40:
-                    scores['mean_reversion'] = 0.65
-                elif z > 2.5 or rsi > 80:
-                    scores['mean_reversion'] = 0.05
-                elif z > 2.0 or rsi > 75:
-                    scores['mean_reversion'] = 0.1
-                else:
-                    scores['mean_reversion'] = 0.5
+                # Sigmoid mapping: very negative z + low RSI = high score (oversold bounce opportunity)
+                # very positive z + high RSI = low score (overbought, avoid)
+                z_component = 1.0 / (1.0 + np.exp(z * 1.5))  # z=-2 → 0.95, z=0 → 0.5, z=2 → 0.05
+                rsi_component = 1.0 / (1.0 + np.exp((rsi - 50) * 0.08))  # rsi=20 → 0.92, rsi=50 → 0.5, rsi=80 → 0.08
+                
+                # Weighted blend: z-score is more reliable than RSI for mean reversion
+                scores['mean_reversion'] = max(0.05, min(0.95, z_component * 0.6 + rsi_component * 0.4))
             else:
                 scores['mean_reversion'] = 0.5
 
-            # 5. LIQUIDITY
+            # 5. LIQUIDITY (smoothed)
             if len(crypto['dollar_volume']) >= 12:
                 avg = np.mean(list(crypto['dollar_volume'])[-12:])
-                if avg > 10000:
-                    scores['liquidity'] = 0.9
-                elif avg > 5000:
-                    scores['liquidity'] = 0.7
-                elif avg > 1000:
-                    scores['liquidity'] = 0.5
+                # Log-scale continuous scoring
+                if avg > 0:
+                    scores['liquidity'] = max(0.1, min(0.95, 0.2 + 0.15 * np.log10(max(avg, 1))))
                 else:
-                    scores['liquidity'] = 0.25
+                    scores['liquidity'] = 0.1
             else:
                 scores['liquidity'] = 0.5
 
@@ -270,58 +255,15 @@ class OpusScoringEngine:
 
     def calculate_multi_tf_score(self, crypto):
         """
-        Score based on multi-timeframe momentum alignment.
-        
-        Checks 3h/6h/12h/24h momentum and rewards strong alignment.
+        Now returns neutral since multi-TF is merged into trend_strength.
         
         Args:
             crypto: Crypto data dictionary with returns history
             
         Returns:
-            Multi-timeframe alignment score between 0 and 1
+            Neutral score of 0.5
         """
-        if len(crypto['returns']) < self.algo.long_period:
-            return 0.5
-
-        returns = list(crypto['returns'])
-        agreements = 0
-        total_checks = 0
-
-        # 3h momentum
-        if len(returns) >= 3:
-            total_checks += 1
-            if np.mean(returns[-3:]) > 0:
-                agreements += 1
-
-        # 6h momentum
-        if len(returns) >= 6:
-            total_checks += 1
-            if np.mean(returns[-6:]) > 0:
-                agreements += 1
-
-        # 12h momentum
-        if len(returns) >= 12:
-            total_checks += 1
-            if np.mean(returns[-12:]) > 0:
-                agreements += 1
-
-        # 24h momentum
-        if len(returns) >= 24:
-            total_checks += 1
-            if np.mean(returns[-24:]) > 0:
-                agreements += 1
-
-        if total_checks == 0:
-            return 0.5
-
-        alignment = agreements / total_checks
-        if alignment >= 0.75:
-            return 0.85
-        elif alignment >= 0.5:
-            return 0.65
-        elif alignment <= 0.25:
-            return 0.15
-        return 0.4
+        return 0.5
 
     def calculate_composite_score(self, factors, crypto=None):
         """
@@ -329,7 +271,7 @@ class OpusScoringEngine:
         
         Args:
             factors: Dictionary of individual factor scores
-            crypto: Optional crypto data dictionary for dynamic weight adjustment
+            crypto: Optional crypto data dictionary for overextension penalty
             
         Returns:
             Composite score adjusted for market regime and breadth
@@ -354,6 +296,7 @@ class OpusScoringEngine:
             weights = {k: v / total_w for k, v in weights.items()}
         
         score = sum(factors.get(f, 0.5) * w for f, w in weights.items())
+        
         # Regime adjustments
         if self.algo.market_regime == "bear":
             score *= 0.78
@@ -363,9 +306,23 @@ class OpusScoringEngine:
             score *= 1.08
         elif self.algo.market_breadth < 0.3:
             score *= 0.80
-        # Bonus for very strong breakout + multi-TF alignment
-        if factors.get('breakout_score', 0) > 0.8 and factors.get('multi_timeframe', 0) > 0.7:
-            score *= 1.10
+        
+        # Bonus for strong breakout
+        if factors.get('breakout_score', 0) > 0.8:
+            score *= 1.05
+        
+        # NEW: Overextension penalty
+        # Penalize entries where price is far above EMA-medium (buying the top)
+        if crypto and crypto.get('ema_medium') and crypto['ema_medium'].IsReady:
+            price = crypto.get('last_price', 0)
+            ema_m = crypto['ema_medium'].Current.Value
+            if ema_m > 0 and price > 0:
+                extension_pct = (price - ema_m) / ema_m
+                if extension_pct > 0.08:  # >8% above EMA-medium
+                    # Continuous penalty: 8% over = small penalty, 15%+ = heavy penalty
+                    penalty = min(0.25, (extension_pct - 0.08) * 2.5)
+                    score *= (1.0 - penalty)
+        
         return min(score, 1.0)
 
     def apply_fee_adjustment(self, score):
