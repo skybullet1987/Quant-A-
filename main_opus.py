@@ -919,7 +919,6 @@ class OpusCryptoStrategy(QCAlgorithm):
         # Candidate scoring (adaptive percentile threshold)
         all_net_scores = []
         all_candidates = []
-        
         for symbol in list(self.crypto_data.keys()):
             if symbol.Value in self.SYMBOL_BLACKLIST or symbol.Value in self._session_blacklist:
                 continue
@@ -941,7 +940,7 @@ class OpusCryptoStrategy(QCAlgorithm):
                 'dollar_volume': list(crypto['dollar_volume'])[-6:] if len(crypto['dollar_volume']) >= 6 else [],
             })
         
-        # Adaptive 80th percentile threshold bounded by regime limits
+        # Adaptive 80th %ile (top 20%, min 10)
         threshold_now = (max(self.threshold_bull, min(self.threshold_bear, np.percentile(all_net_scores, 80)))
                         if len(all_net_scores) >= 10 else self._get_threshold())
         
@@ -1050,7 +1049,7 @@ class OpusCryptoStrategy(QCAlgorithm):
                     if ema_short < ema_medium * 0.995:
                         continue
                     if len(crypto['returns']) >= 3:
-                        recent_return = np.mean(list(crypto['returns'])[-3:])
+                        recent_return = np.mean(list(crypto['returns'])[-3:])  # 3h more responsive
                         if recent_return <= 0:
                             continue
             

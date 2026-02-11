@@ -57,7 +57,7 @@ class OpusScoringEngine:
             if rng <= 0:
                 return 0.0
             mid = (high + low) / 2
-            value = 0.66 * ((price_list[-1] - mid) / (rng / 2 + 1e-8))
+            value = 0.66 * ((price_list[-1] - mid) / (rng / 2 + 1e-8))  # 0.66 smooths extreme oscillations
             value = max(-0.999, min(0.999, value))
             return 0.5 * np.log((1 + value) / (1 - value))
         except:
@@ -118,7 +118,7 @@ class OpusScoringEngine:
                 if price > kama_val and kama_val > ema_m:
                     # Strong uptrend: price above KAMA above EMA
                     kama_strength = (price - kama_val) / kama_val if kama_val > 0 else 0
-                    scores['trend_strength'] = min(0.75 + kama_strength * 15, 1.0)
+                    scores['trend_strength'] = min(0.75 + kama_strength * 15, 1.0)  # scales 1-3% gaps
                 elif price > kama_val:
                     # Moderate uptrend: price above KAMA
                     scores['trend_strength'] = 0.65
@@ -172,7 +172,7 @@ class OpusScoringEngine:
                 elif z < -1.5 and rsi < 35 and fisher < -0.5:
                     scores['mean_reversion'] = 0.9       # Strong oversold with Fisher confirmation
                 elif z < -1.5 and rsi < 35:
-                    scores['mean_reversion'] = 0.75      # Oversold but no Fisher confirmation — lower score
+                    scores['mean_reversion'] = 0.75      # Oversold but no Fisher confirmation - lower score
                 elif z < -1.0 and rsi < 40:
                     scores['mean_reversion'] = 0.65
                 elif z > 2.5 or rsi > 80:
