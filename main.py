@@ -140,7 +140,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
         self.expected_round_trip_fees = 0.0026
         self.fee_slippage_buffer = 0.003
-        self.min_recent_dollar_vol_live = 5000
+        self.min_6bar_dollar_vol_live = 5000  # Minimum 6-bar average dollar volume for live trading
 
         self.max_spread_pct = 0.02
         self.spread_median_window = 12
@@ -1037,7 +1037,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
             if self.LiveMode and len(crypto['dollar_volume']) >= 6:
                 recent_dollar_vol6 = np.mean(list(crypto['dollar_volume'])[-6:])
-                if recent_dollar_vol6 < self.min_recent_dollar_vol_live:
+                if recent_dollar_vol6 < self.min_6bar_dollar_vol_live:
                     continue
             recent_dollar_vol3 = np.mean(list(crypto['dollar_volume'])[-3:]) if len(crypto['dollar_volume']) >= 3 else 0
 
@@ -1311,8 +1311,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         win_rate = sum(self._rolling_wins) / len(self._rolling_wins)
         if win_rate <= 0 or win_rate >= 1:
             return 1.0
-        avg_win = np.mean(list(self._rolling_win_sizes)) if len(self._rolling_win_sizes) > 0 else FALLBACK_AVG_RETURN
-        avg_loss = np.mean(list(self._rolling_loss_sizes)) if len(self._rolling_loss_sizes) > 0 else FALLBACK_AVG_RETURN
+        avg_win = np.mean(self._rolling_win_sizes) if len(self._rolling_win_sizes) > 0 else FALLBACK_AVG_RETURN
+        avg_loss = np.mean(self._rolling_loss_sizes) if len(self._rolling_loss_sizes) > 0 else FALLBACK_AVG_RETURN
         if avg_loss <= 0:
             return 1.0
         b = avg_win / avg_loss
