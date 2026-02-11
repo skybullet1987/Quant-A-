@@ -101,9 +101,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         'UNIUSD': 0.5, 'LSKUSD': 3.0, 'BCHUSD': 1.0,
     }
 
+    LIVE_STATE_KEY = "opus_live_state"
+
     def Initialize(self):
         self.SetStartDate(2025, 1, 1)
-        self.SetCash(20)
+        self.SetCash(20)  # Minimal starting capital for testing; will grow with profits
         self.SetBrokerageModel(BrokerageName.Kraken, AccountType.Cash)
 
         self.threshold_bull = self._get_param("threshold_bull", 0.50)
@@ -276,7 +278,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             n = 0
             for i in self.ObjectStore.GetEnumerator():
                 k = i.Key if hasattr(i, 'Key') else str(i)
-                if k != "opus_live_state":
+                if k != self.LIVE_STATE_KEY:
                     try:
                         self.ObjectStore.Delete(k)
                         n += 1
@@ -332,14 +334,14 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 "trade_count": self.trade_count,
                 "peak_value": self.peak_value if self.peak_value is not None else 0,
             }
-            self.ObjectStore.Save("opus_live_state", json.dumps(state))
+            self.ObjectStore.Save(self.LIVE_STATE_KEY, json.dumps(state))
         except Exception as e:
             self.Debug(f"Persist error: {e}")
 
     def _load_persisted_state(self):
         try:
-            if self.LiveMode and self.ObjectStore.ContainsKey("opus_live_state"):
-                raw = self.ObjectStore.Read("opus_live_state")
+            if self.LiveMode and self.ObjectStore.ContainsKey(self.LIVE_STATE_KEY):
+                raw = self.ObjectStore.Read(self.LIVE_STATE_KEY)
                 data = json.loads(raw)
                 self._session_blacklist = set(data.get("session_blacklist", []))
                 self.winning_trades = data.get("winning_trades", 0)
@@ -1295,7 +1297,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
     def _kelly_fraction(self):
         """Calculate Kelly fraction for performance monitoring. Not used for position sizing."""
-        if len(self._rolling_wins) < 10:
+        KELLY_MIN_SAMPLES = 10
+        KELLY_HALF_FRACTION = 0.5
+        KELLY_SCALE_DIVISOR = 0.5
+        
+        if len(self._rolling_wins) < KELLY_MIN_SAMPLES:
             return 1.0
         win_rate = sum(self._rolling_wins) / len(self._rolling_wins)
         if win_rate <= 0 or win_rate >= 1:
@@ -1305,9 +1311,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if avg_loss <= 0:
             return 1.0
         b = avg_win / avg_loss
+        if b <= 0:
+            return 1.0
         kelly = (win_rate * b - (1 - win_rate)) / b
-        half_kelly = kelly * 0.5
-        return max(0.5, min(1.5, half_kelly / 0.5))
+        half_kelly = kelly * KELLY_HALF_FRACTION
+        return max(KELLY_HALF_FRACTION, min(1.5, half_kelly / KELLY_SCALE_DIVISOR))
 
 
     def OnOrderEvent(self, event):
