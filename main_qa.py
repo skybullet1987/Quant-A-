@@ -30,6 +30,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
     SYMBOL_BLACKLIST = {
         "BTCUSD", "ETHUSD", "USDTUSD", "USDCUSD", "PYUSDUSD", "EURCUSD", "USTUSD",
+        "DAIUSD", "TUSDUSD", "WETHUSD", "WBTCUSD", "WAXLUSD",
         "SHIBUSD", "XMRUSD", "ZECUSD", "DASHUSD",
         "XNYUSD",
         "BDXNUSD", "RAIINUSD", "LUNAUSD", "LUNCUSD", "USTCUSD", "ABORDUSD",
@@ -38,6 +39,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         "EPTUSD", "LMWRUSD",
         "CPOOLUSD",
         "ARCUSD", "PAXGUSD",
+        "PARTIUSD", "RAREUSD", "BANANAS31USD",
+        # Forex pairs
+        "GBPUSD", "AUDUSD", "NZDUSD", "JPYUSD", "CADUSD", "CHFUSD", "CNYUSD", "HKDUSD", "SGDUSD",
+        "SEKUSD", "NOKUSD", "DKKUSD", "KRWUSD", "TRYUSD", "ZARUSD", "MXNUSD", "INRUSD", "BRLUSD",
+        "PLNUSD", "THBUSD",
     }
 
     KRAKEN_MIN_QTY_FALLBACK = {
@@ -52,6 +58,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         'LDOUSD': 5.0, 'ARBUSD': 5.0, 'LPTUSD': 5.0, 'KTAUSD': 10.0,
         'GUNUSD': 50.0, 'BANANAS31USD': 500.0, 'CHILLHOUSEUSD': 500.0,
         'PHAUSD': 50.0, 'MUSD': 50.0, 'ICNTUSD': 50.0,
+        'SHIBUSD': 50000.0, 'XRPUSD': 2.0,
     }
 
     MIN_NOTIONAL_FALLBACK = {
@@ -180,6 +187,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.kraken_status = "unknown"
 
         self._last_skip_reason = None
+        self._last_live_trade_time = None
 
         self.UniverseSettings.Resolution = Resolution.Hour
         self.AddUniverse(CryptoUniverse.Kraken(self.UniverseFilter))
@@ -205,6 +213,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.Settings.InsightScore = False
 
         if self.LiveMode:
+            self._cleanup_object_store()
             self._load_persisted_state()
             self.Debug("=" * 50)
             self.Debug("=== LIVE TRADING (SAFE) v2.8.1 minimal ===")
@@ -221,6 +230,41 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             return default
         except:
             return default
+
+    def _cleanup_object_store(self):
+        """Clean up stale ObjectStore keys on startup."""
+        try:
+            n=0
+            for i in self.ObjectStore.GetEnumerator():
+                k=i.Key if hasattr(i,'Key') else str(i)
+                if k!="live_state":
+                    try:self.ObjectStore.Delete(k);n+=1
+                    except:pass
+            if n:self.Debug(f"Cleaned {n} keys")
+        except Exception as e:self.Debug(f"Cleanup err: {e}")
+
+    def _live_safety_checks(self):
+        """Extra safety checks for live trading."""
+        if not self.LiveMode:
+            return True
+        
+        # Check if we have minimum viable cash
+        try:
+            cash = self.Portfolio.CashBook["USD"].Amount
+        except:
+            cash = self.Portfolio.Cash
+        
+        if cash < 2.0:
+            self._debug_limited("LIVE SAFETY: Cash below $2, pausing new entries")
+            return False
+        
+        # Rate limit: don't trade more than once per 5 minutes in live
+        if hasattr(self, '_last_live_trade_time') and self._last_live_trade_time is not None:
+            seconds_since = (self.Time - self._last_live_trade_time).total_seconds()
+            if seconds_since < 300:
+                return False
+        
+        return True
 
     def EmitInsights(self, *insights):
         return []
@@ -239,6 +283,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 "total_pnl": self.total_pnl,
                 "consecutive_losses": self.consecutive_losses,
                 "daily_trade_count": self.daily_trade_count,
+                "trade_count": self.trade_count,
+                "peak_value": self.peak_value if self.peak_value is not None else 0,
             }
             self.ObjectStore.Save("live_state", json.dumps(state))
         except Exception as e:
@@ -255,6 +301,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 self.total_pnl = data.get("total_pnl", 0.0)
                 self.consecutive_losses = data.get("consecutive_losses", 0)
                 self.daily_trade_count = data.get("daily_trade_count", 0)
+                self.trade_count = data.get("trade_count", 0)
+                peak = data.get("peak_value", 0)
+                if peak > 0:
+                    self.peak_value = peak
                 self.Debug(f"Loaded persisted state: blacklist {len(self._session_blacklist)}, "
                            f"trades W:{self.winning_trades}/L:{self.losing_trades}")
         except Exception as e:
@@ -533,6 +583,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 continue
             if not ticker.endswith("USD"):
                 continue
+            # Additional forex filter
+            if any(ticker.endswith(suffix) for suffix in ["PYUSD", "EURUSD", "GBPUSD", "AUDUSD", "NZDUSD", 
+                "JPYUSD", "CADUSD", "CHFUSD", "CNYUSD", "HKDUSD", "SGDUSD", "SEKUSD", "NOKUSD", "DKKUSD", 
+                "KRWUSD", "TRYUSD", "ZARUSD", "MXNUSD", "INRUSD", "BRLUSD", "PLNUSD", "THBUSD"]):
+                continue
             if crypto.VolumeInUsd is None or crypto.VolumeInUsd == 0:
                 continue
             if crypto.VolumeInUsd > self.min_volume_usd:
@@ -745,6 +800,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             slip = side * (fill_price - mid) / mid
             abs_slip = abs(slip)
             self._slip_abs.append(abs_slip)
+            # Live slippage alert for unusually high slippage
+            if self.LiveMode and abs(slip) > self.slip_outlier_threshold:
+                self.Debug(f"⚠️ HIGH SLIPPAGE: {symbol.Value} | {abs(slip):.4%} | dir={direction}")
         except:
             pass
 
@@ -755,6 +813,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
     def Rebalance(self):
         if self.IsWarmingUp:
+            return
+        # Live safety checks
+        if self.LiveMode and not self._live_safety_checks():
             return
         # Only block on explicit bad states; unknown is allowed (and will have fallback after warmup)
         if self.LiveMode and self.kraken_status in ("maintenance", "cancel_only"):
@@ -936,9 +997,13 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 order_value_estimate = reserved_cash * size
                 if recent_dollar_vol3 > 0:
                     impact_ratio = order_value_estimate / recent_dollar_vol3
-                    if impact_ratio > 0.05:
+                    # Dynamic impact caps based on portfolio size
+                    portfolio_value = self.Portfolio.TotalPortfolioValue
+                    impact_hard_cap = 0.05 if portfolio_value < 500 else (0.03 if portfolio_value < 5000 else 0.02)
+                    impact_soft_cap = impact_hard_cap * 0.6
+                    if impact_ratio > impact_hard_cap:
                         continue
-                    if impact_ratio > 0.03:
+                    if impact_ratio > impact_soft_cap:
                         size *= max(0.3, 1.0 - impact_ratio)
                     max_child = 0.15 * recent_dollar_vol3
                     if order_value_estimate > max_child:
@@ -962,6 +1027,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     self.Debug(f"ORDER: {sym.Value} | ${val:.2f} | id={ticket.OrderId}")
                 self.trade_count += 1
                 self._debug_limited(f"ORDER: {sym.Value} | ${val:.2f}")
+                # Update last trade time for rate limiting
+                if self.LiveMode:
+                    self._last_live_trade_time = self.Time
             except Exception as e:
                 self.Debug(f"ORDER FAILED: {sym.Value} - {e}")
                 self._session_blacklist.add(sym.Value)
@@ -1096,6 +1164,19 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if price > highest:
             self.highest_prices[symbol] = price
         pnl = (price - entry) / entry if entry > 0 else 0
+        
+        # Exit slippage penalty for micro-caps
+        exit_slip_estimate = 0.0
+        crypto = self.crypto_data.get(symbol)
+        if crypto and len(crypto.get('dollar_volume', [])) >= 6:
+            dv_list = list(crypto['dollar_volume'])[-6:]
+            avg_dv = np.mean(dv_list)
+            exit_value = abs(holding.Quantity) * price
+            # Apply penalty if exit > 2% of volume
+            if avg_dv > 0 and exit_value / avg_dv > 0.02:
+                exit_slip_estimate = min(0.02, exit_value / avg_dv * 0.1)
+                pnl -= exit_slip_estimate
+        
         dd = (highest - price) / highest if highest > 0 else 0
         hours = (self.Time - self.entry_times.get(symbol, self.Time)).total_seconds() / 3600
         sl, tp = self.base_stop_loss, self.base_take_profit
@@ -1103,7 +1184,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             sl *= 1.2; tp *= 1.3
         elif self.market_regime == "bear":
             sl *= 0.8; tp *= 0.7
-        crypto = self.crypto_data.get(symbol)
         atr = crypto['atr'].Current.Value if crypto and crypto['atr'].IsReady else None
         if atr and entry > 0:
             atr_sl = (atr * self.atr_sl_mult) / entry
@@ -1257,6 +1337,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 else:
                     self.kraken_status = "unknown"
                 self.Debug(f"Kraken status update: {self.kraken_status}")
+            
+            # Handle rate limit messages
+            if "rate limit" in txt or "too many" in txt:
+                self.Debug(f"⚠️ RATE LIMIT HIT - pausing trades for 5 minutes")
+                self._last_live_trade_time = self.Time
         except Exception as e:
             self.Debug(f"BrokerageMessage parse error: {e}")
 
