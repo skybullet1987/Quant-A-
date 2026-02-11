@@ -118,7 +118,7 @@ class OpusScoringEngine:
                 if price > kama_val and kama_val > ema_m:
                     # Strong uptrend: price above KAMA above EMA
                     kama_strength = (price - kama_val) / kama_val if kama_val > 0 else 0
-                    scores['trend_strength'] = min(0.75 + kama_strength * 15, 1.0)  # scales 1-3% gaps
+                    scores['trend_strength'] = min(0.75 + kama_strength * 15, 1.0)  # scales to near-max
                 elif price > kama_val:
                     # Moderate uptrend: price above KAMA
                     scores['trend_strength'] = 0.65
