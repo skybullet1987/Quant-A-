@@ -138,6 +138,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
         self.expected_round_trip_fees = 0.0026
         self.fee_slippage_buffer = 0.003
+        self.min_recent_dollar_vol_live = 5000
 
         self.max_spread_pct = 0.02
         self.spread_median_window = 12
@@ -254,7 +255,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             self._cleanup_object_store()
             self._load_persisted_state()
             self.Debug("=" * 50)
-            self.Debug("=== LIVE TRADING (SAFE) v2.8.1 minimal ===")
+            self.Debug("=== LIVE TRADING v3.0.0 (qa-logic + opus-execution) ===")
             self.Debug(f"Capital: ${self.Portfolio.Cash:.2f}")
             self.Debug(f"Max positions: {self.max_positions}")
             self.Debug(f"Position size: {self.position_size_pct:.0%}")
@@ -272,14 +273,19 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
     def _cleanup_object_store(self):
         try:
-            n=0
+            n = 0
             for i in self.ObjectStore.GetEnumerator():
-                k=i.Key if hasattr(i,'Key') else str(i)
-                if k!="opus_live_state":
-                    try:self.ObjectStore.Delete(k);n+=1
-                    except:pass
-            if n:self.Debug(f"Cleaned {n} keys")
-        except Exception as e:self.Debug(f"Cleanup err: {e}")
+                k = i.Key if hasattr(i, 'Key') else str(i)
+                if k != "opus_live_state":
+                    try:
+                        self.ObjectStore.Delete(k)
+                        n += 1
+                    except Exception:
+                        pass
+            if n:
+                self.Debug(f"Cleaned {n} keys")
+        except Exception as e:
+            self.Debug(f"Cleanup err: {e}")
 
     def _live_safety_checks(self):
         """Extra safety checks for live trading."""
@@ -842,10 +848,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             # Live slippage alert for unusually high slippage
             if self.LiveMode and abs(slip) > self.slip_outlier_threshold:
                 self.Debug(f"⚠️ HIGH SLIPPAGE: {symbol.Value} | {abs(slip):.4%} | dir={direction}")
-        except:
+        except Exception:
             pass
 
-
+    def _log_skip(self, reason):
         if reason != self._last_skip_reason:
             self._debug_limited(f"Rebalance skip: {reason}")
             self._last_skip_reason = reason
@@ -972,6 +978,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 continue
 
             effective_size_cap = self.position_size_pct
+            # In live mode, cap size at 25% in high-vol or sideways regimes for safety
             if self.LiveMode and (self.volatility_regime == "high" or self.market_regime == "sideways"):
                 effective_size_cap = min(effective_size_cap, 0.25)
 
@@ -1028,7 +1035,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
             if self.LiveMode and len(crypto['dollar_volume']) >= 6:
                 recent_dollar_vol6 = np.mean(list(crypto['dollar_volume'])[-6:])
-                if recent_dollar_vol6 < 5000:
+                if recent_dollar_vol6 < self.min_recent_dollar_vol_live:
                     continue
             recent_dollar_vol3 = np.mean(list(crypto['dollar_volume'])[-3:]) if len(crypto['dollar_volume']) >= 3 else 0
 
@@ -1287,6 +1294,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
 
     def _kelly_fraction(self):
+        """Calculate Kelly fraction for performance monitoring. Not used for position sizing."""
         if len(self._rolling_wins) < 10:
             return 1.0
         win_rate = sum(self._rolling_wins) / len(self._rolling_wins)
