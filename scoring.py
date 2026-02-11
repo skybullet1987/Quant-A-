@@ -26,6 +26,43 @@ class OpusScoringEngine:
         """Normalize value to [0, 1] range."""
         return max(0, min(1, (v - mn) / (mx - mn)))
     
+    def _hurst_exponent(self, prices, max_lag=20):
+        """Estimate Hurst exponent to detect trending vs mean-reverting behavior."""
+        if len(prices) < max_lag + 5:
+            return 0.5  # Not enough data, assume random walk
+        try:
+            price_arr = np.array(list(prices))
+            lags = range(2, min(max_lag, len(price_arr) // 2))
+            if len(list(lags)) < 3:
+                return 0.5
+            tau = [np.std(price_arr[lag:] - price_arr[:-lag]) for lag in lags]
+            if any(t <= 0 for t in tau):
+                return 0.5
+            log_lags = np.log(list(lags))
+            log_tau = np.log(tau)
+            poly = np.polyfit(log_lags, log_tau, 1)
+            return max(0.0, min(1.0, poly[0]))
+        except:
+            return 0.5
+    
+    def _fisher_transform(self, prices, period=10):
+        """Compute Fisher Transform for sharper turning point detection."""
+        if len(prices) < period:
+            return 0.0
+        try:
+            price_list = list(prices)[-period:]
+            high = max(price_list)
+            low = min(price_list)
+            rng = high - low
+            if rng <= 0:
+                return 0.0
+            mid = (high + low) / 2
+            value = 0.66 * ((price_list[-1] - mid) / (rng / 2 + 1e-8))  # 0.66 smooths extreme oscillations
+            value = max(-0.999, min(0.999, value))
+            return 0.5 * np.log((1 + value) / (1 - value))
+        except:
+            return 0.0
+    
     def calculate_factor_scores(self, symbol, crypto):
         """
         Calculate all 8 factor scores for a given crypto.
@@ -70,8 +107,31 @@ class OpusScoringEngine:
             else:
                 scores['volume_momentum'] = 0.5
 
-            # 3. TREND STRENGTH (enhanced with more EMAs)
-            if crypto['ema_short'].IsReady and crypto['ema_trend'].IsReady:
+            # 3. TREND STRENGTH (KAMA-enhanced)
+            if crypto.get('kama') and crypto['kama'].IsReady and crypto['ema_medium'].IsReady:
+                kama_val = crypto['kama'].Current.Value
+                price = crypto['last_price']
+                ema_m = crypto['ema_medium'].Current.Value
+                
+                # KAMA slope: positive = trending up, negative = trending down
+                # Use price vs KAMA and KAMA vs EMA_medium for trend confirmation
+                if price > kama_val and kama_val > ema_m:
+                    # Strong uptrend: price above KAMA above EMA
+                    kama_strength = (price - kama_val) / kama_val if kama_val > 0 else 0
+                    scores['trend_strength'] = min(0.75 + kama_strength * 15, 1.0)  # scales to near-max
+                elif price > kama_val:
+                    # Moderate uptrend: price above KAMA
+                    scores['trend_strength'] = 0.65
+                elif price > ema_m:
+                    # Weak uptrend: price above EMA but below KAMA (KAMA adapting slowly)
+                    scores['trend_strength'] = 0.50
+                elif price < kama_val and kama_val < ema_m:
+                    # Strong downtrend
+                    scores['trend_strength'] = 0.15
+                else:
+                    scores['trend_strength'] = 0.35
+            # Keep existing EMA fallback for when KAMA isn't ready
+            elif crypto['ema_short'].IsReady and crypto['ema_trend'].IsReady:
                 us = crypto['ema_ultra_short'].Current.Value
                 s = crypto['ema_short'].Current.Value
                 m = crypto['ema_medium'].Current.Value
@@ -101,18 +161,22 @@ class OpusScoringEngine:
             else:
                 scores['trend_strength'] = 0.5
 
-            # 4. MEAN REVERSION (enhanced)
+            # 4. MEAN REVERSION (Fisher Transform enhanced)
             if len(crypto['zscore']) >= 1:
                 z = crypto['zscore'][-1]
                 rsi = crypto['rsi'].Current.Value
-                if z < -2.0 and rsi < 25:
-                    scores['mean_reversion'] = 1.0     # Extreme oversold
+                fisher = self._fisher_transform(crypto['prices'], 10) if len(crypto['prices']) >= 10 else 0.0
+                
+                if z < -2.0 and rsi < 25 and fisher < -1.0:
+                    scores['mean_reversion'] = 1.0      # Extreme oversold, Fisher confirms
+                elif z < -1.5 and rsi < 35 and fisher < -0.5:
+                    scores['mean_reversion'] = 0.9       # Strong oversold with Fisher confirmation
                 elif z < -1.5 and rsi < 35:
-                    scores['mean_reversion'] = 0.9
+                    scores['mean_reversion'] = 0.75      # Oversold but no Fisher confirmation - lower score
                 elif z < -1.0 and rsi < 40:
-                    scores['mean_reversion'] = 0.75
+                    scores['mean_reversion'] = 0.65
                 elif z > 2.5 or rsi > 80:
-                    scores['mean_reversion'] = 0.05    # Extremely overbought — avoid
+                    scores['mean_reversion'] = 0.05
                 elif z > 2.0 or rsi > 75:
                     scores['mean_reversion'] = 0.1
                 else:
@@ -259,17 +323,37 @@ class OpusScoringEngine:
             return 0.15
         return 0.4
 
-    def calculate_composite_score(self, factors):
+    def calculate_composite_score(self, factors, crypto=None):
         """
         Calculate weighted composite score with regime adjustments.
         
         Args:
             factors: Dictionary of individual factor scores
+            crypto: Optional crypto data dictionary for dynamic weight adjustment
             
         Returns:
             Composite score adjusted for market regime and breadth
         """
-        score = sum(factors.get(f, 0.5) * w for f, w in self.algo.weights.items())
+        # Dynamic weight adjustment based on Hurst exponent
+        weights = dict(self.algo.weights)  # copy base weights
+        
+        if crypto and len(crypto.get('prices', [])) >= 30:
+            hurst = self._hurst_exponent(crypto['prices'])
+            if hurst > 0.55:
+                # Trending regime: boost trend, reduce mean reversion
+                weights['trend_strength'] = weights.get('trend_strength', 0.15) + 0.05
+                weights['mean_reversion'] = max(0.02, weights.get('mean_reversion', 0.12) - 0.05)
+            elif hurst < 0.45:
+                # Mean-reverting regime: boost mean reversion, reduce trend
+                weights['mean_reversion'] = weights.get('mean_reversion', 0.12) + 0.05
+                weights['trend_strength'] = max(0.02, weights.get('trend_strength', 0.15) - 0.05)
+        
+        # Normalize weights to sum to 1.0
+        total_w = sum(weights.values())
+        if total_w > 0:
+            weights = {k: v / total_w for k, v in weights.items()}
+        
+        score = sum(factors.get(f, 0.5) * w for f, w in weights.items())
         # Regime adjustments
         if self.algo.market_regime == "bear":
             score *= 0.78

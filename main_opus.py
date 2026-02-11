@@ -45,14 +45,7 @@ class RealisticCryptoSlippage:
         return price * slippage_pct
 
 class OpusCryptoStrategy(QCAlgorithm):
-    """
-    OPUS - Ultra-Aggressive Crypto Strategy v1.0
-    Goal: $20 → $10,000 in 1 year on Kraken Cash
-    
-    Features: 8-factor scoring (multi-timeframe, breakout detection), 
-    regime-adaptive sizing, Kelly criterion, ATR-based exits, sector rotation.
-    Scoring logic in scoring.py to stay under 64K character limit.
-    """
+    """OPUS - Ultra-Aggressive Crypto Strategy v1.0. 8-factor scoring with adaptive indicators."""
 
     SYMBOL_BLACKLIST = {
         "BTCUSD", "ETHUSD", "USDTUSD", "USDCUSD", "PYUSDUSD", "EURCUSD", "USTUSD", "DAIUSD",
@@ -84,7 +77,7 @@ class OpusCryptoStrategy(QCAlgorithm):
         # AGGRESSIVE SIGNAL THRESHOLDS
         self.threshold_bull = 0.42
         self.threshold_bear = 0.58
-        self.threshold_sideways = 0.52
+        self.threshold_sideways = 0.48
         self.threshold_high_vol = 0.52
         # EXIT PARAMETERS
         self.trailing_activation = 0.06
@@ -160,7 +153,7 @@ class OpusCryptoStrategy(QCAlgorithm):
         self._pending_orders = {}
         self._cancel_cooldowns = {}
         self._exit_cooldowns = {}
-        self.exit_cooldown_hours = 6
+        self.exit_cooldown_hours = 2
         self.cancel_cooldown_minutes = 1
         self.trailing_grace_hours = 1.5
         self.atr_trail_mult = 1.3
@@ -192,7 +185,7 @@ class OpusCryptoStrategy(QCAlgorithm):
         # UNIVERSE
         self.min_volume_usd = 500
         self.max_universe_size = 300
-        self.base_min_volume_usd = 2000
+        self.base_min_volume_usd = 1000
 
         self.liquidity_tiers = [
             (50000, 50000, 0.35),
@@ -231,7 +224,7 @@ class OpusCryptoStrategy(QCAlgorithm):
         # Override key parameters with runtime values if provided
         self.threshold_bull = self._get_param("threshold_bull", 0.42)
         self.threshold_bear = self._get_param("threshold_bear", 0.58)
-        self.threshold_sideways = self._get_param("threshold_sideways", 0.52)
+        self.threshold_sideways = self._get_param("threshold_sideways", 0.48)
         self.threshold_high_vol = self._get_param("threshold_high_vol", 0.52)
         self.base_stop_loss = self._get_param("base_stop_loss", 0.055)
         self.base_take_profit = self._get_param("base_take_profit", 0.12)
@@ -623,6 +616,7 @@ class OpusCryptoStrategy(QCAlgorithm):
             'ema_medium': ExponentialMovingAverage(self.medium_period),
             'ema_long': ExponentialMovingAverage(self.long_period),
             'ema_trend': ExponentialMovingAverage(self.trend_period),
+            'kama': KaufmanAdaptiveMovingAverage(10, 2, 30),
             'atr': AverageTrueRange(14),
             'volatility': deque(maxlen=self.medium_period),
             'rsi': RelativeStrengthIndex(14),
@@ -719,6 +713,7 @@ class OpusCryptoStrategy(QCAlgorithm):
         crypto['ema_medium'].Update(bar.EndTime, price)
         crypto['ema_long'].Update(bar.EndTime, price)
         crypto['ema_trend'].Update(bar.EndTime, price)
+        crypto['kama'].Update(bar.EndTime, price)
         crypto['atr'].Update(bar)
         if len(crypto['returns']) >= 10:
             crypto['volatility'].append(np.std(list(crypto['returns'])[-10:]))
@@ -921,15 +916,13 @@ class OpusCryptoStrategy(QCAlgorithm):
             self._log_skip("risk cap")
             return
         
-        # Candidate scoring with 8 factors (Opus)
-        scores = []
-        threshold_now = self._get_threshold()
+        # Candidate scoring (adaptive percentile threshold)
+        all_net_scores = []
+        all_candidates = []
         for symbol in list(self.crypto_data.keys()):
             if symbol.Value in self.SYMBOL_BLACKLIST or symbol.Value in self._session_blacklist:
                 continue
-            if self._has_open_orders(symbol):
-                continue
-            if not self._spread_ok(symbol):
+            if self._has_open_orders(symbol) or not self._spread_ok(symbol):
                 continue
             crypto = self.crypto_data[symbol]
             if not self._is_ready(crypto):
@@ -937,23 +930,24 @@ class OpusCryptoStrategy(QCAlgorithm):
             factor_scores = self.scoring_engine.calculate_factor_scores(symbol, crypto)
             if not factor_scores:
                 continue
-            composite_score = self.scoring_engine.calculate_composite_score(factor_scores)
+            composite_score = self.scoring_engine.calculate_composite_score(factor_scores, crypto)
             net_score = self.scoring_engine.apply_fee_adjustment(composite_score)
-            if net_score > threshold_now:
-                scores.append({
-                    'symbol': symbol,
-                    'composite_score': composite_score,
-                    'net_score': net_score,
-                    'factors': factor_scores,
-                    'volatility': crypto['volatility'][-1] if len(crypto['volatility']) > 0 else 0.05,
-                    'dollar_volume': list(crypto['dollar_volume'])[-6:] if len(crypto['dollar_volume']) >= 6 else [],
-                })
+            all_net_scores.append(net_score)
+            all_candidates.append({
+                'symbol': symbol, 'composite_score': composite_score, 'net_score': net_score,
+                'factors': factor_scores,
+                'volatility': crypto['volatility'][-1] if crypto['volatility'] else 0.05,
+                'dollar_volume': list(crypto['dollar_volume'])[-6:] if len(crypto['dollar_volume']) >= 6 else [],
+            })
         
-        if len(scores) == 0:
+        # Adaptive 80th %ile (top 20%, min 10)
+        threshold_now = (max(self.threshold_bull, min(self.threshold_bear, np.percentile(all_net_scores, 80)))
+                        if len(all_net_scores) >= 10 else self._get_threshold())
+        
+        scores = [c for c in all_candidates if c['net_score'] > threshold_now]
+        if not scores:
             self._log_skip("no candidates passed filters")
             return
-        
-        # Sort by net score (fee-adjusted)
         scores.sort(key=lambda x: x['net_score'], reverse=True)
         self._last_skip_reason = None
         self._execute_trades(scores, threshold_now, dynamic_max_pos)
@@ -1054,8 +1048,8 @@ class OpusCryptoStrategy(QCAlgorithm):
                     # Normal trend-following gate
                     if ema_short < ema_medium * 0.995:
                         continue
-                    if len(crypto['returns']) >= 6:
-                        recent_return = np.mean(list(crypto['returns'])[-6:])
+                    if len(crypto['returns']) >= 3:
+                        recent_return = np.mean(list(crypto['returns'])[-3:])  # 3h more responsive
                         if recent_return <= 0:
                             continue
             
@@ -1240,7 +1234,7 @@ class OpusCryptoStrategy(QCAlgorithm):
                 if crypto and self._is_ready(crypto):
                     factors = self.scoring_engine.calculate_factor_scores(symbol, crypto)
                     if factors:
-                        comp = self.scoring_engine.calculate_composite_score(factors)
+                        comp = self.scoring_engine.calculate_composite_score(factors, crypto)
                         net = self.scoring_engine.apply_fee_adjustment(comp)
                         if net < self._get_threshold() - self.signal_decay_buffer:
                             tag = "Signal Decay"
