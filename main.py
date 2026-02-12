@@ -491,13 +491,22 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         return risk
 
     def _log_skip(self, reason):
-        if reason != self._last_skip_reason:
+        # In live mode, always log to ensure visibility
+        if self.LiveMode:
+            debug_limited(self, f"Rebalance skip: {reason}")
+            self._last_skip_reason = reason
+        # In backtest, deduplicate to reduce noise
+        elif reason != self._last_skip_reason:
             debug_limited(self, f"Rebalance skip: {reason}")
             self._last_skip_reason = reason
 
     def Rebalance(self):
         if self.IsWarmingUp:
             return
+        
+        # Reset log budget at each rebalance call for consistent logging
+        self.log_budget = 20
+        
         # Live safety checks
         if self.LiveMode and not live_safety_checks(self):
             return
@@ -506,9 +515,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             self._log_skip("kraken not online")
             return
         cancel_stale_new_orders(self)
-        if self.Time != self.last_log_time:
-            self.log_budget = 20
-            self.last_log_time = self.Time
         if self.LiveMode and self.Time.hour in self.skip_hours_utc:
             self._log_skip("skip hour")
             return
@@ -548,24 +554,45 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if self._compute_portfolio_risk_estimate() > self.portfolio_vol_cap:
             self._log_skip("risk cap")
             return
+        
+        # Diagnostic counters for filter funnel
+        total_symbols = len(self.crypto_data)
+        count_not_blacklisted = 0
+        count_no_open_orders = 0
+        count_spread_ok = 0
+        count_ready = 0
+        count_scored = 0
+        count_above_thresh = 0
+        
         scores = []
         threshold_now = self._get_threshold()
         for symbol in list(self.crypto_data.keys()):
             if symbol.Value in SYMBOL_BLACKLIST or symbol.Value in self._session_blacklist:
                 continue
+            count_not_blacklisted += 1
+            
             if has_open_orders(self, symbol):
                 continue
+            count_no_open_orders += 1
+            
             if not spread_ok(self, symbol):
                 continue
+            count_spread_ok += 1
+            
             crypto = self.crypto_data[symbol]
             if not self._is_ready(crypto):
                 continue
+            count_ready += 1
+            
             factor_scores = self._calculate_factor_scores(symbol, crypto)
             if not factor_scores:
                 continue
+            count_scored += 1
+            
             composite_score = self._calculate_composite_score(factor_scores)
             net_score = self._apply_fee_adjustment(composite_score)
             if net_score > threshold_now:
+                count_above_thresh += 1
                 scores.append({
                     'symbol': symbol,
                     'composite_score': composite_score,
@@ -574,6 +601,18 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     'volatility': crypto['volatility'][-1] if len(crypto['volatility']) > 0 else 0.05,
                     'dollar_volume': list(crypto['dollar_volume'])[-6:] if len(crypto['dollar_volume']) >= 6 else [],
                 })
+        
+        # Log diagnostic summary
+        try:
+            cash = self.Portfolio.CashBook["USD"].Amount
+        except:
+            cash = self.Portfolio.Cash
+        
+        debug_limited(self, f"REBALANCE: total={total_symbols} not_blacklist={count_not_blacklisted} "
+                           f"no_orders={count_no_open_orders} spread_ok={count_spread_ok} "
+                           f"ready={count_ready} scored={count_scored} above_thresh={count_above_thresh} "
+                           f"| cash=${cash:.2f} thresh={threshold_now:.3f}")
+        
         if len(scores) == 0:
             self._log_skip("no candidates passed filters")
             return
@@ -591,6 +630,24 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             return
         if self._compute_portfolio_risk_estimate() > self.portfolio_vol_cap:
             return
+        
+        # Diagnostic counters for rejection reasons
+        reject_pending_orders = 0
+        reject_open_orders = 0
+        reject_already_invested = 0
+        reject_spread = 0
+        reject_exit_cooldown = 0
+        reject_price_invalid = 0
+        reject_price_too_low = 0
+        reject_cash_reserve = 0
+        reject_min_qty_too_large = 0
+        reject_ema_gate = 0
+        reject_recent_net_scores = 0
+        reject_dollar_volume = 0
+        reject_impact_ratio = 0
+        reject_notional = 0
+        success_count = 0
+        
         for cand in candidates:
             if self.daily_trade_count >= self.max_daily_trades:
                 break
@@ -600,20 +657,27 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             comp_score = cand.get('composite_score', 0.5)
             net_score = cand.get('net_score', 0.5)
             if sym in self._pending_orders and self._pending_orders[sym] > 0:
+                reject_pending_orders += 1
                 continue
             if has_open_orders(self, sym):
+                reject_open_orders += 1
                 continue
             if is_invested_not_dust(self, sym):
+                reject_already_invested += 1
                 continue
             if not spread_ok(self, sym):
+                reject_spread += 1
                 continue
             if sym in self._exit_cooldowns and self.Time < self._exit_cooldowns[sym]:
+                reject_exit_cooldown += 1
                 continue
             sec = self.Securities[sym]
             price = sec.Price
             if price is None or price <= 0:
+                reject_price_invalid += 1
                 continue
             if price < self.min_price_usd:
+                reject_price_too_low += 1
                 continue
 
             effective_size_cap = self.position_size_pct
@@ -631,10 +695,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             effective_reserve = max(portfolio_reserve, fee_reserve)
             reserved_cash = available_cash - effective_reserve
             if reserved_cash <= 0:
+                reject_cash_reserve += 1
                 continue
             min_qty = get_min_quantity(self, sym)
             min_notional_usd = get_min_notional_usd(self, sym)
             if min_qty * price > reserved_cash * 0.6:
+                reject_min_qty_too_large += 1
                 continue
             crypto = self.crypto_data.get(sym)
             if not crypto:
@@ -655,16 +721,24 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 if not is_mean_reversion:
                     # Normal trend-following gate
                     if ema_short <= ema_medium:
+                        reject_ema_gate += 1
                         continue
                     if len(crypto['returns']) >= 3:
                         recent_return = np.mean(list(crypto['returns'])[-3:])
                         if recent_return <= 0:
+                            reject_ema_gate += 1
                             continue
+            
+            # RELAXED: recent_net_scores confirmation gate
+            # Changed from 2-of-3 to 1-of-2 confirmation for live hourly data
             crypto['recent_net_scores'].append(net_score)
-            if len(crypto['recent_net_scores']) >= 3:
-                above_threshold_count = sum(1 for score in crypto['recent_net_scores'] if score > threshold_now)
-                if above_threshold_count < 2:
+            if len(crypto['recent_net_scores']) >= 2:
+                # Only need 1 out of last 2 scores above threshold (was 2 out of 3)
+                above_threshold_count = sum(1 for score in list(crypto['recent_net_scores'])[-2:] if score > threshold_now)
+                if above_threshold_count < 1:
+                    reject_recent_net_scores += 1
                     continue
+            
             vol = self._annualized_vol(crypto)
             size = self._calculate_position_size(comp_score, threshold_now, vol)
             size = min(size, effective_size_cap)
@@ -674,6 +748,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if self.LiveMode and len(crypto['dollar_volume']) >= 6:
                 recent_dollar_vol6 = np.mean(list(crypto['dollar_volume'])[-6:])
                 if recent_dollar_vol6 < 5000:
+                    reject_dollar_volume += 1
                     continue
             recent_dollar_vol3 = np.mean(list(crypto['dollar_volume'])[-3:]) if len(crypto['dollar_volume']) >= 3 else 0
 
@@ -686,6 +761,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     impact_hard_cap = 0.05 if portfolio_value < 500 else (0.03 if portfolio_value < 5000 else 0.02)
                     impact_soft_cap = impact_hard_cap * 0.6
                     if impact_ratio > impact_hard_cap:
+                        reject_impact_ratio += 1
                         continue
                     if impact_ratio > impact_soft_cap:
                         size *= max(0.3, 1.0 - impact_ratio)
@@ -701,14 +777,17 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             # Verify total cost with fees doesn't breach reserve
             total_cost_with_fee = val * 1.006  # Include 0.6% fee in total cost
             if total_cost_with_fee > available_cash - fee_reserve:
+                reject_cash_reserve += 1
                 continue
             if val < min_notional_usd or val < self.min_notional or val > reserved_cash:
+                reject_notional += 1
                 continue
             try:
                 ticket = self.MarketOrder(sym, qty)
                 if ticket is not None:
                     self._recent_tickets.append(ticket)
                     self.Debug(f"ORDER: {sym.Value} | ${val:.2f} | id={ticket.OrderId}")
+                success_count += 1
                 self.trade_count += 1
                 debug_limited(self, f"ORDER: {sym.Value} | ${val:.2f}")
                 # Update last trade time for rate limiting
@@ -720,6 +799,17 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 continue
             if self.LiveMode:
                 break
+        
+        # Log diagnostic summary of rejections
+        if reject_pending_orders + reject_open_orders + reject_already_invested + reject_spread + \
+           reject_exit_cooldown + reject_price_invalid + reject_price_too_low + reject_cash_reserve + \
+           reject_min_qty_too_large + reject_ema_gate + reject_recent_net_scores + reject_dollar_volume + \
+           reject_impact_ratio + reject_notional > 0:
+            debug_limited(self, f"EXECUTE_TRADES: candidates={len(candidates)} success={success_count} | "
+                               f"rejects: spread={reject_spread} ema={reject_ema_gate} "
+                               f"recent_scores={reject_recent_net_scores} cash={reject_cash_reserve} "
+                               f"impact={reject_impact_ratio} dollar_vol={reject_dollar_volume} "
+                               f"notional={reject_notional} invested={reject_already_invested}")
 
     def _get_threshold(self):
         if self.market_regime == "bull" and self.market_breadth > 0.6:
