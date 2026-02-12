@@ -856,7 +856,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             dv_list = list(crypto['dollar_volume'])[-6:]
             avg_dv = np.mean(dv_list)
             exit_value = abs(holding.Quantity) * price
-            # Apply penalty if exit > 2% of volume
+            # Apply penalty if exit > 2% of average 6-bar volume
             if avg_dv > 0 and exit_value / avg_dv > 0.02:
                 exit_slip_estimate = min(0.02, exit_value / avg_dv * 0.1)
                 pnl -= exit_slip_estimate
@@ -1007,7 +1007,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     def OnBrokerageMessage(self, message):
         try:
             txt = message.Message.lower()
-            # self.Debug(f"BRKR MSG: {message.Message}")  # uncomment for diagnostics
             if "system status:" in txt:
                 if "online" in txt:
                     self.kraken_status = "online"
