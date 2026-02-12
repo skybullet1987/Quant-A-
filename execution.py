@@ -432,14 +432,19 @@ def load_persisted_state(algo):
 def cleanup_object_store(algo):
     """From main_opus._cleanup_object_store."""
     try:
-        n=0
+        n = 0
         for i in algo.ObjectStore.GetEnumerator():
-            k=i.Key if hasattr(i,'Key') else str(i)
-            if k!="opus_live_state":
-                try:algo.ObjectStore.Delete(k);n+=1
-                except:pass
-        if n:algo.Debug(f"Cleaned {n} keys")
-    except Exception as e:algo.Debug(f"Cleanup err: {e}")
+            k = i.Key if hasattr(i, 'Key') else str(i)
+            if k != "live_state":
+                try:
+                    algo.ObjectStore.Delete(k)
+                    n += 1
+                except:
+                    pass
+        if n:
+            algo.Debug(f"Cleaned {n} keys")
+    except Exception as e:
+        algo.Debug(f"Cleanup err: {e}")
 
 
 def live_safety_checks(algo):

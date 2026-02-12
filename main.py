@@ -180,7 +180,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             cleanup_object_store(self)
             load_persisted_state(self)
             self.Debug("=" * 50)
-            self.Debug("=== LIVE TRADING (SAFE) v2.8.1 minimal ===")
+            self.Debug("=== LIVE TRADING (SAFE) v3.0.0 (qa-logic + opus-execution) ===")
             self.Debug(f"Capital: ${self.Portfolio.Cash:.2f}")
             self.Debug(f"Max positions: {self.max_positions}")
             self.Debug(f"Position size: {self.position_size_pct:.0%}")
@@ -1007,9 +1007,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     def OnBrokerageMessage(self, message):
         try:
             txt = message.Message.lower()
-            if "rate limit" in txt or "too many" in txt:
-                self._last_live_trade_time = self.Time
-                self.Debug("Rate limit detected, pausing 5 min")
             # self.Debug(f"BRKR MSG: {message.Message}")  # uncomment for diagnostics
             if "system status:" in txt:
                 if "online" in txt:
