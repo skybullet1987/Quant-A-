@@ -196,7 +196,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm, ExecutionMixin):
             self._cleanup_object_store()
             self._load_persisted_state()
             self.Debug("=" * 50)
-            self.Debug("=== LIVE TRADING (SAFE) v2.8.1 minimal ===")
+            self.Debug("=== LIVE TRADING (SAFE) v3.0.0 (qa-logic + opus-execution) ===")
             self.Debug(f"Capital: ${self.Portfolio.Cash:.2f}")
             self.Debug(f"Max positions: {self.max_positions}")
             self.Debug(f"Position size: {self.position_size_pct:.0%}")
@@ -266,14 +266,14 @@ class SimplifiedCryptoStrategy(QCAlgorithm, ExecutionMixin):
                 "trade_count": self.trade_count,
                 "peak_value": self.peak_value if self.peak_value is not None else 0,
             }
-            self.ObjectStore.Save("live_state", json.dumps(state))
+            self.ObjectStore.Save("opus_live_state", json.dumps(state))
         except Exception as e:
             self.Debug(f"Persist error: {e}")
 
     def _load_persisted_state(self):
         try:
-            if self.LiveMode and self.ObjectStore.ContainsKey("live_state"):
-                raw = self.ObjectStore.Read("live_state")
+            if self.LiveMode and self.ObjectStore.ContainsKey("opus_live_state"):
+                raw = self.ObjectStore.Read("opus_live_state")
                 data = json.loads(raw)
                 self._session_blacklist = set(data.get("session_blacklist", []))
                 self.winning_trades = data.get("winning_trades", 0)
@@ -1151,11 +1151,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm, ExecutionMixin):
         crypto = self.crypto_data.get(symbol)
         if crypto and len(crypto.get('dollar_volume', [])) >= 6:
             dv_list = list(crypto['dollar_volume'])[-6:]
-            avg_dv = statistics.mean(dv_list)
+            avg_dollar_volume = statistics.mean(dv_list)
             exit_value = abs(holding.Quantity) * price
             # Apply penalty if exit > 2% of volume
-            if avg_dv > 0 and exit_value / avg_dv > 0.02:
-                exit_slip_estimate = min(0.02, exit_value / avg_dv * 0.1)
+            if avg_dollar_volume > 0 and exit_value / avg_dollar_volume > 0.02:
+                exit_slip_estimate = min(0.02, exit_value / avg_dollar_volume * 0.1)
                 pnl -= exit_slip_estimate
         
         dd = (highest - price) / highest if highest > 0 else 0
