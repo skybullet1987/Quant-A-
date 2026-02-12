@@ -1,48 +1,14 @@
 # region imports
 from AlgorithmImports import *
 
-import json
-import numpy as np
+from execution import ExecutionMixin, RealisticCryptoSlippage, SYMBOL_BLACKLIST
 from collections import deque
+import statistics
 from datetime import timedelta
 # endregion
 
-class RealisticCryptoSlippage:
-    """Volume-aware slippage model for crypto."""
 
-    def __init__(self):
-        self.base_slippage_pct = 0.001
-        self.volume_impact_factor = 0.10
-        self.max_slippage_pct = 0.02
-
-    def get_slippage_approximation(self, asset, order):
-        price = asset.Price
-        if price <= 0:
-            return 0
-
-        slippage_pct = self.base_slippage_pct
-
-        volume = asset.Volume
-        if volume > 0:
-            order_value = abs(order.Quantity) * price
-            volume_value = volume * price
-            if volume_value > 0:
-                participation_rate = order_value / volume_value
-                volume_impact = self.volume_impact_factor * (participation_rate ** 1.5)
-                slippage_pct += volume_impact
-
-        if price < 0.01:
-            slippage_pct *= 3.0
-        elif price < 0.10:
-            slippage_pct *= 2.0
-        elif price < 1.0:
-            slippage_pct *= 1.5
-
-        slippage_pct = min(slippage_pct, self.max_slippage_pct)
-
-        return price * slippage_pct
-
-class SimplifiedCryptoStrategy(QCAlgorithm):
+class SimplifiedCryptoStrategy(QCAlgorithm, ExecutionMixin):
     """
     Simplified 5-Factor Strategy - LIVE READY v3.0.0 (qa-logic + opus-execution)
     Key protections (as requested):
@@ -61,24 +27,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     - Zombie auto-blacklist; ARCUSD, PAXGUSD added to blacklist.
     - Insights suppressed; ObjectStore writes disabled.
     """
-
-    SYMBOL_BLACKLIST = {
-        "BTCUSD", "ETHUSD", "USDTUSD", "USDCUSD", "PYUSDUSD", "EURCUSD", "USTUSD",
-        "DAIUSD", "TUSDUSD", "WETHUSD", "WBTCUSD", "WAXLUSD",
-        "SHIBUSD", "XMRUSD", "ZECUSD", "DASHUSD",
-        "XNYUSD",
-        "BDXNUSD", "RAIINUSD", "LUNAUSD", "LUNCUSD", "USTCUSD", "ABORDUSD",
-        "BONDUSD", "KEEPUSD", "ORNUSD",
-        "MUSD", "ICNTUSD",
-        "EPTUSD", "LMWRUSD",
-        "CPOOLUSD",
-        "ARCUSD", "PAXGUSD",
-        "PARTIUSD", "RAREUSD", "BANANAS31USD",
-        # Forex pairs
-        "GBPUSD", "AUDUSD", "NZDUSD", "JPYUSD", "CADUSD", "CHFUSD", "CNYUSD", "HKDUSD", "SGDUSD",
-        "SEKUSD", "NOKUSD", "DKKUSD", "KRWUSD", "TRYUSD", "ZARUSD", "MXNUSD", "INRUSD", "BRLUSD",
-        "PLNUSD", "THBUSD",
-    }
 
     KRAKEN_MIN_QTY_FALLBACK = {
         'AXSUSD': 5.0, 'SANDUSD': 10.0, 'MANAUSD': 10.0, 'ADAUSD': 10.0,
@@ -101,11 +49,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         'UNIUSD': 0.5, 'LSKUSD': 3.0, 'BCHUSD': 1.0,
     }
 
-    LIVE_STATE_KEY = "opus_live_state"
-
     def Initialize(self):
         self.SetStartDate(2025, 1, 1)
-        self.SetCash(20)  # Minimal starting capital for testing; will grow with profits
+        self.SetCash(20)
         self.SetBrokerageModel(BrokerageName.Kraken, AccountType.Cash)
 
         self.threshold_bull = self._get_param("threshold_bull", 0.50)
@@ -140,7 +86,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
         self.expected_round_trip_fees = 0.0026
         self.fee_slippage_buffer = 0.003
-        self.min_6bar_dollar_vol_live = 5000  # Minimum 6-bar average dollar volume for live trading
 
         self.max_spread_pct = 0.02
         self.spread_median_window = 12
@@ -180,10 +125,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.entry_times = {}
         self.trade_count = 0
         
-        self._rolling_wins = deque(maxlen=50)
-        self._rolling_win_sizes = deque(maxlen=50)
-        self._rolling_loss_sizes = deque(maxlen=50)
-
         self._pending_orders = {}
         self._cancel_cooldowns = {}
         self._exit_cooldowns = {}
@@ -195,12 +136,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
         self._slip_abs = deque(maxlen=50)
         self._slippage_alert_until = None
-        self.slip_alert_threshold = 0.0015
-        self.slip_outlier_threshold = 0.004
-        self.slip_alert_duration_hours = 2
-        self._bad_symbol_counts = {}
 
-        self._recent_tickets = deque(maxlen=25)
+        self._rolling_wins = deque(maxlen=50)
+        self._rolling_win_sizes = deque(maxlen=50)
+        self._rolling_loss_sizes = deque(maxlen=50)
 
         self.btc_symbol = None
         self.btc_returns = deque(maxlen=self.long_period)
@@ -257,12 +196,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             self._cleanup_object_store()
             self._load_persisted_state()
             self.Debug("=" * 50)
-            self.Debug("=== LIVE TRADING v3.0.0 (qa-logic + opus-execution) ===")
+            self.Debug("=== LIVE TRADING (SAFE) v3.0.0 (qa-logic + opus-execution) ===")
             self.Debug(f"Capital: ${self.Portfolio.Cash:.2f}")
             self.Debug(f"Max positions: {self.max_positions}")
             self.Debug(f"Position size: {self.position_size_pct:.0%}")
             self.Debug("=" * 50)
-
 
     def _get_param(self, name, default):
         try:
@@ -273,105 +211,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         except:
             return default
 
-    def _cleanup_object_store(self):
-        try:
-            n = 0
-            for i in self.ObjectStore.GetEnumerator():
-                k = i.Key if hasattr(i, 'Key') else str(i)
-                if k != self.LIVE_STATE_KEY:
-                    try:
-                        self.ObjectStore.Delete(k)
-                        n += 1
-                    except Exception:
-                        pass
-            if n:
-                self.Debug(f"Cleaned {n} keys")
-        except Exception as e:
-            self.Debug(f"Cleanup err: {e}")
-
-    def _live_safety_checks(self):
-        """Extra safety checks for live trading."""
-        if not self.LiveMode:
-            return True
-
-        # Check if we have minimum viable cash
-        try:
-            cash = self.Portfolio.CashBook["USD"].Amount
-        except:
-            cash = self.Portfolio.Cash
-
-        if cash < 2.0:
-            self._debug_limited("LIVE SAFETY: Cash below $2, pausing new entries")
-            return False
-
-        # Rate limit: don't trade more than once per 5 minutes in live
-        if hasattr(self, '_last_live_trade_time') and self._last_live_trade_time is not None:
-            seconds_since = (self.Time - self._last_live_trade_time).total_seconds()
-            if seconds_since < 300:
-                return False
-
-        return True
-
-
     def EmitInsights(self, *insights):
         return []
 
     def EmitInsight(self, insight):
         return []
-
-
-    def _persist_state(self):
-        if not self.LiveMode:
-            return
-        try:
-            state = {
-                "session_blacklist": list(self._session_blacklist),
-                "winning_trades": self.winning_trades,
-                "losing_trades": self.losing_trades,
-                "total_pnl": self.total_pnl,
-                "consecutive_losses": self.consecutive_losses,
-                "daily_trade_count": self.daily_trade_count,
-                "trade_count": self.trade_count,
-                "peak_value": self.peak_value if self.peak_value is not None else 0,
-            }
-            self.ObjectStore.Save(self.LIVE_STATE_KEY, json.dumps(state))
-        except Exception as e:
-            self.Debug(f"Persist error: {e}")
-
-    def _load_persisted_state(self):
-        try:
-            if self.LiveMode and self.ObjectStore.ContainsKey(self.LIVE_STATE_KEY):
-                raw = self.ObjectStore.Read(self.LIVE_STATE_KEY)
-                data = json.loads(raw)
-                self._session_blacklist = set(data.get("session_blacklist", []))
-                self.winning_trades = data.get("winning_trades", 0)
-                self.losing_trades = data.get("losing_trades", 0)
-                self.total_pnl = data.get("total_pnl", 0.0)
-                self.consecutive_losses = data.get("consecutive_losses", 0)
-                self.daily_trade_count = data.get("daily_trade_count", 0)
-                self.trade_count = data.get("trade_count", 0)
-                peak = data.get("peak_value", 0)
-                if peak > 0:
-                    self.peak_value = peak
-        except Exception as e:
-            self.Debug(f"Load persist error: {e}")
-
-
-    def _is_invested_not_dust(self, symbol):
-        if symbol not in self.Portfolio:
-            return False
-        h = self.Portfolio[symbol]
-        if not h.Invested or h.Quantity == 0:
-            return False
-        min_qty = self._get_min_quantity(symbol)
-        min_notional = self._get_min_notional_usd(symbol)
-        price = self.Securities[symbol].Price if symbol in self.Securities else h.Price
-        notional_ok = (price > 0) and (abs(h.Quantity) * price >= min_notional * 0.5)
-        qty_ok = abs(h.Quantity) >= min_qty * 0.5
-        return notional_ok or qty_ok
-
-    def _get_actual_position_count(self):
-        return sum(1 for kvp in self.Portfolio if self._is_invested_not_dust(kvp.Key))
 
     def ResetDailyCounters(self):
         self.daily_trade_count = 0
@@ -409,43 +253,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         else:
             self._debug_limited("Health check: OK")
 
-    def ResyncHoldings(self):
-        """
-        Live-only safety: backfills tracking for any holdings that exist in the brokerage
-        but were not registered via OnOrderEvent (e.g., missed fill events).
-        """
-        if self.IsWarmingUp: return
-        if not self.LiveMode: return
-        missing = []
-        for symbol in self.Portfolio.Keys:
-            holding = self.Portfolio[symbol]
-            if not holding.Invested or holding.Quantity == 0:
-                continue
-            if symbol in self.entry_prices:
-                continue
-            if symbol in self._exit_cooldowns and self.Time < self._exit_cooldowns[symbol]:
-                continue
-            if self._has_open_orders(symbol):
-                continue
-            missing.append(symbol)
-        if not missing:
-            return
-        self.Debug(f"RESYNC: detected {len(missing)} holdings without tracking; backfilling.")
-        for symbol in missing:
-            try:
-                if symbol not in self.Securities:
-                    self.AddCrypto(symbol.Value, Resolution.Hour, Market.Kraken)
-                holding = self.Portfolio[symbol]
-                entry = holding.AveragePrice
-                self.entry_prices[symbol] = entry
-                self.highest_prices[symbol] = entry
-                self.entry_times[symbol] = self.Time
-                current_price = self.Securities[symbol].Price if symbol in self.Securities else holding.Price
-                pnl_pct = (current_price - entry) / entry if entry > 0 else 0
-                self.Debug(f"RESYNCED: {symbol.Value} | Qty: {holding.Quantity} | Entry: ${entry:.4f} | Now: ${current_price:.4f} | PnL: {pnl_pct:+.2%}")
-            except Exception as e:
-                self.Debug(f"Resync error {symbol.Value}: {e}")
-
     def ReviewPerformance(self):
         if self.IsWarmingUp or len(self.trade_log) < 5: return
         recent_trades = self.trade_log[-10:] if len(self.trade_log) >= 10 else self.trade_log
@@ -462,166 +269,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if old_max != self.base_max_positions:
                 self.Debug(f"PERFORMANCE RECOVERY: max_pos={self.base_max_positions}")
 
-    def _get_min_quantity(self, symbol):
-        ticker = symbol.Value if hasattr(symbol, 'Value') else str(symbol)
-        try:
-            if symbol in self.Securities:
-                sec = self.Securities[symbol]
-                if hasattr(sec, 'SymbolProperties') and sec.SymbolProperties is not None:
-                    min_size = sec.SymbolProperties.MinimumOrderSize
-                    if min_size is not None and min_size > 0:
-                        return float(min_size)
-        except: pass
-        if ticker in self.KRAKEN_MIN_QTY_FALLBACK:
-            return self.KRAKEN_MIN_QTY_FALLBACK[ticker]
-        return self._estimate_min_qty(symbol)
-
-    def _estimate_min_qty(self, symbol):
-        try:
-            price = self.Securities[symbol].Price if symbol in self.Securities else 0
-        except: price = 0
-        if price <= 0: return 50.0
-        if price < 0.001: return 1000.0
-        elif price < 0.01: return 500.0
-        elif price < 0.1: return 50.0
-        elif price < 1.0: return 10.0
-        elif price < 10.0: return 5.0
-        elif price < 100.0: return 1.0
-        elif price < 1000.0: return 0.1
-        else: return 0.01
-
-    def _get_min_notional_usd(self, symbol):
-        ticker = symbol.Value if hasattr(symbol, 'Value') else str(symbol)
-        fallback = self.MIN_NOTIONAL_FALLBACK.get(ticker, self.min_notional)
-        try:
-            price = self.Securities[symbol].Price
-            min_qty = self._get_min_quantity(symbol)
-            implied = price * min_qty if price > 0 else fallback
-            return max(fallback, implied, self.min_notional)
-        except:
-            return max(fallback, self.min_notional)
-
-    def _round_quantity(self, symbol, quantity):
-        try:
-            lot_size = self.Securities[symbol].SymbolProperties.LotSize
-            if lot_size is not None and lot_size > 0:
-                return float(int(quantity / lot_size) * lot_size)
-            return quantity
-        except: return quantity
-
-    def _smart_liquidate(self, symbol, tag="Liquidate"):
-        if len(self.Transactions.GetOpenOrders(symbol)) > 0:
-            return
-        if symbol in self._cancel_cooldowns and self.Time < self._cancel_cooldowns[symbol]:
-            return
-        if symbol not in self.Portfolio or self.Portfolio[symbol].Quantity == 0:
-            return
-        holding_qty = self.Portfolio[symbol].Quantity
-        min_qty = self._get_min_quantity(symbol)
-        min_notional = self._get_min_notional_usd(symbol)
-        price = self.Securities[symbol].Price if symbol in self.Securities else 0
-        if price * abs(holding_qty) < min_notional * 0.9:
-            return
-        # Verify fee reserve before selling (Kraken cash account requirement)
-        if self.LiveMode and holding_qty > 0:
-            estimated_fee = price * abs(holding_qty) * 0.006  # 0.6% fee estimate (0.4% base + 0.2% safety buffer)
-            try:
-                available_usd = self.Portfolio.CashBook["USD"].Amount
-            except (KeyError, AttributeError):
-                available_usd = self.Portfolio.Cash
-            if available_usd < estimated_fee:
-                self.Debug(f"⚠️ SKIP SELL {symbol.Value}: fee reserve too low "
-                           f"(need ${estimated_fee:.4f}, have ${available_usd:.4f})")
-                if symbol not in self.entry_prices:
-                    self.entry_prices[symbol] = self.Portfolio[symbol].AveragePrice
-                    self.highest_prices[symbol] = self.Portfolio[symbol].AveragePrice
-                    self.entry_times[symbol] = self.Time
-                return
-        self.Transactions.CancelOpenOrders(symbol)
-        if abs(holding_qty) < min_qty:
-            return
-        safe_qty = self._round_quantity(symbol, abs(holding_qty))
-        if safe_qty < min_qty:
-            return
-        if safe_qty > 0:
-            direction_mult = -1 if holding_qty > 0 else 1
-            self.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
-        else:
-            self.Debug(f"Warning: {symbol.Value} holding {holding_qty} rounds to 0")
-
-    def _cancel_stale_orders(self):
-        try:
-            open_orders = self.Transactions.GetOpenOrders()
-            if len(open_orders) > 0:
-                self.Debug(f"Found {len(open_orders)} open orders - canceling all...")
-                for order in open_orders:
-                    self.Transactions.CancelOrder(order.Id)
-        except Exception as e:
-            self.Debug(f"Error canceling stale orders: {e}")
-
-    def _effective_stale_timeout(self):
-        return self.live_stale_order_timeout_seconds if self.LiveMode else self.stale_order_timeout_seconds
-
-    def _cancel_stale_new_orders(self):
-        # Allow cancel gate when venue is online or unknown (fallback handled elsewhere)
-        try:
-            open_orders = self.Transactions.GetOpenOrders()
-            timeout_seconds = self._effective_stale_timeout()
-            for order in open_orders:
-                sym_val = order.Symbol.Value
-                if sym_val in self._session_blacklist:
-                    continue
-                order_time = order.Time
-                if order_time.tzinfo is not None:
-                    order_time = order_time.replace(tzinfo=None)
-                order_age = (self.Time - order_time).total_seconds()
-                if order_age > timeout_seconds:
-                    self.Debug(f"Canceling stale: {sym_val} (age: {order_age/60:.1f}m, timeout {timeout_seconds/60:.1f}m)")
-                    self.Transactions.CancelOrder(order.Id)
-                    self._cancel_cooldowns[order.Symbol] = self.Time + timedelta(minutes=self.cancel_cooldown_minutes)
-                    self._session_blacklist.add(sym_val)
-                    self.Debug(f"⚠️ ZOMBIE ORDER DETECTED: {sym_val} - blacklisted for session")
-        except Exception as e:
-            self.Debug(f"Error in _cancel_stale_new_orders: {e}")
-
-    def _sync_existing_positions(self):
-        self.Debug("=" * 50)
-        self.Debug("=== SYNCING EXISTING POSITIONS ===")
-        synced_count = 0
-        positions_to_close = []
-        for symbol in self.Portfolio.Keys:
-            holding = self.Portfolio[symbol]
-            if not holding.Invested or holding.Quantity == 0:
-                continue
-            ticker = symbol.Value
-            if symbol in self.entry_prices:
-                continue
-            if symbol not in self.Securities:
-                try:
-                    self.AddCrypto(ticker, Resolution.Hour, Market.Kraken)
-                except:
-                    continue
-            self.entry_prices[symbol] = holding.AveragePrice
-            self.highest_prices[symbol] = holding.AveragePrice
-            self.entry_times[symbol] = self.Time
-            synced_count += 1
-            current_price = self.Securities[symbol].Price if symbol in self.Securities else holding.Price
-            pnl_pct = (current_price - holding.AveragePrice) / holding.AveragePrice if holding.AveragePrice > 0 else 0
-            self.Debug(f"SYNCED: {ticker} | Entry: ${holding.AveragePrice:.4f} | Now: ${current_price:.4f} | PnL: {pnl_pct:+.2%}")
-            if current_price > holding.AveragePrice:
-                self.highest_prices[symbol] = current_price
-            if pnl_pct >= self.base_take_profit:
-                positions_to_close.append((symbol, ticker, pnl_pct, "Sync TP"))
-            elif pnl_pct <= -self.base_stop_loss:
-                positions_to_close.append((symbol, ticker, pnl_pct, "Sync SL"))
-        self.Debug(f"Synced {synced_count} positions")
-        self.Debug(f"Cash: ${self.Portfolio.Cash:.2f}")
-        self.Debug("=" * 50)
-        for symbol, ticker, pnl_pct, reason in positions_to_close:
-            self.Debug(f"IMMEDIATE {reason}: {ticker} at {pnl_pct:+.2%}")
-            self._smart_liquidate(symbol, reason)
-            # Let OnOrderEvent handle cleanup and PnL tracking on fill
-
     def UniverseFilter(self, universe):
         selected = []
         for crypto in universe:
@@ -631,8 +278,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if not ticker.endswith("USD"):
                 continue
             # Additional forex filter
-            if any(ticker.endswith(suffix) for suffix in ["PYUSD", "EURUSD", "GBPUSD", "AUDUSD", "NZDUSD",
-                "JPYUSD", "CADUSD", "CHFUSD", "CNYUSD", "HKDUSD", "SGDUSD", "SEKUSD", "NOKUSD", "DKKUSD",
+            if any(ticker.endswith(suffix) for suffix in ["PYUSD", "EURUSD", "GBPUSD", "AUDUSD", "NZDUSD", 
+                "JPYUSD", "CADUSD", "CHFUSD", "CNYUSD", "HKDUSD", "SGDUSD", "SEKUSD", "NOKUSD", "DKKUSD", 
                 "KRWUSD", "TRYUSD", "ZARUSD", "MXNUSD", "INRUSD", "BRLUSD", "PLNUSD", "THBUSD"]):
                 continue
             if crypto.VolumeInUsd is None or crypto.VolumeInUsd == 0:
@@ -710,19 +357,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             ready_count = sum(1 for c in self.crypto_data.values() if self._is_ready(c))
             self.Debug(f"Post-warmup: {ready_count} symbols ready")
         self._update_market_context()
-
-    def _get_spread_pct(self, symbol):
-        try:
-            sec = self.Securities[symbol]
-            bid = sec.BidPrice
-            ask = sec.AskPrice
-            if bid > 0 and ask > 0 and ask >= bid:
-                mid = 0.5 * (bid + ask)
-                if mid > 0:
-                    return (ask - bid) / mid
-        except:
-            pass
-        return None
 
     def _update_symbol_data(self, symbol, bar):
         crypto = self.crypto_data[symbol]
@@ -810,48 +444,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             weight = abs(holding.HoldingsValue) / total_value
             risk += weight * asset_vol_ann
         return risk
-
-    def _has_open_orders(self, symbol=None):
-        if symbol is None:
-            return len(self.Transactions.GetOpenOrders()) > 0
-        return len(self.Transactions.GetOpenOrders(symbol)) > 0
-
-    def _spread_ok(self, symbol):
-        sp = self._get_spread_pct(symbol)
-        if sp is None:
-            # In live mode, fail-closed (reject if spread unknown); in backtest, allow
-            return not self.LiveMode
-        effective_spread_cap = self.max_spread_pct
-        if self.LiveMode and (self.volatility_regime == "high" or self.market_regime == "sideways"):
-            effective_spread_cap = min(effective_spread_cap, 0.015)
-        if sp > effective_spread_cap:
-            return False
-        crypto = self.crypto_data.get(symbol)
-        if crypto and len(crypto.get('spreads', [])) >= 4:
-            median_sp = np.median(list(crypto['spreads']))
-            if median_sp > 0 and sp > self.spread_widen_mult * median_sp:
-                return False
-        return True
-
-
-    def _slip_log(self, symbol, direction, fill_price):
-        try:
-            sec = self.Securities[symbol]
-            bid = sec.BidPrice
-            ask = sec.AskPrice
-            if bid <= 0 or ask <= 0:
-                return
-            mid = 0.5 * (bid + ask)
-            if mid <= 0:
-                return
-            side = 1 if direction == OrderDirection.Buy else -1
-            slip = side * (fill_price - mid) / mid
-            self._slip_abs.append(abs(slip))
-            # Live slippage alert for unusually high slippage
-            if self.LiveMode and abs(slip) > self.slip_outlier_threshold:
-                self.Debug(f"⚠️ HIGH SLIPPAGE: {symbol.Value} | {abs(slip):.4%} | dir={direction}")
-        except Exception:
-            pass
 
     def _log_skip(self, reason):
         if reason != self._last_skip_reason:
@@ -980,7 +572,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 continue
 
             effective_size_cap = self.position_size_pct
-            # In live mode, cap size at 25% in high-vol or sideways regimes for safety
             if self.LiveMode and (self.volatility_regime == "high" or self.market_regime == "sideways"):
                 effective_size_cap = min(effective_size_cap, 0.25)
 
@@ -1037,7 +628,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
             if self.LiveMode and len(crypto['dollar_volume']) >= 6:
                 recent_dollar_vol6 = np.mean(list(crypto['dollar_volume'])[-6:])
-                if recent_dollar_vol6 < self.min_6bar_dollar_vol_live:
+                if recent_dollar_vol6 < 5000:
                     continue
             recent_dollar_vol3 = np.mean(list(crypto['dollar_volume'])[-3:]) if len(crypto['dollar_volume']) >= 3 else 0
 
@@ -1212,19 +803,20 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if price > highest:
             self.highest_prices[symbol] = price
         pnl = (price - entry) / entry if entry > 0 else 0
-
+        
+        
         # Exit slippage penalty for micro-caps
         exit_slip_estimate = 0.0
         crypto = self.crypto_data.get(symbol)
         if crypto and len(crypto.get('dollar_volume', [])) >= 6:
             dv_list = list(crypto['dollar_volume'])[-6:]
-            avg_dv = np.mean(dv_list)
+            avg_dollar_volume = statistics.mean(dv_list)
             exit_value = abs(holding.Quantity) * price
             # Apply penalty if exit > 2% of volume
-            if avg_dv > 0 and exit_value / avg_dv > 0.02:
-                exit_slip_estimate = min(0.02, exit_value / avg_dv * 0.1)
+            if avg_dollar_volume > 0 and exit_value / avg_dollar_volume > 0.02:
+                exit_slip_estimate = min(0.02, exit_value / avg_dollar_volume * 0.1)
                 pnl -= exit_slip_estimate
-
+        
         dd = (highest - price) / highest if highest > 0 else 0
         hours = (self.Time - self.entry_times.get(symbol, self.Time)).total_seconds() / 3600
         sl, tp = self.base_stop_loss, self.base_take_profit
@@ -1287,41 +879,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             self._exit_cooldowns[symbol] = self.Time + timedelta(hours=self.exit_cooldown_hours)
             self.Debug(f"{tag}: {symbol.Value} | PnL:{pnl:+.2%} | Held:{hours:.0f}h")
 
-    def _cleanup_position(self, symbol):
-        self.entry_prices.pop(symbol, None)
-        self.highest_prices.pop(symbol, None)
-        self.entry_times.pop(symbol, None)
-        if symbol in self.crypto_data:
-            self.crypto_data[symbol]['trail_stop'] = None
-
-
-    def _kelly_fraction(self):
-        """Calculate Kelly fraction for performance monitoring. Not used for position sizing.
-        
-        Returns a bounded Kelly criterion multiplier (0.5x to 1.5x) for tracking strategy
-        efficiency. Bounds prevent extreme values from distorting monitoring metrics.
-        """
-        KELLY_MIN_SAMPLES = 10
-        KELLY_HALF_FRACTION = 0.5
-        KELLY_SCALE_DIVISOR = 0.5
-        FALLBACK_AVG_RETURN = 0.02  # 2% fallback for avg win/loss when no data
-        
-        if len(self._rolling_wins) < KELLY_MIN_SAMPLES:
-            return 1.0
-        win_rate = sum(self._rolling_wins) / len(self._rolling_wins)
-        if win_rate <= 0 or win_rate >= 1:
-            return 1.0
-        avg_win = np.mean(self._rolling_win_sizes) if len(self._rolling_win_sizes) > 0 else FALLBACK_AVG_RETURN
-        avg_loss = np.mean(self._rolling_loss_sizes) if len(self._rolling_loss_sizes) > 0 else FALLBACK_AVG_RETURN
-        if avg_loss <= 0:
-            return 1.0
-        b = avg_win / avg_loss
-        if b <= 0:
-            return 1.0
-        kelly = (win_rate * b - (1 - win_rate)) / b
-        half_kelly = kelly * KELLY_HALF_FRACTION
-        return max(KELLY_HALF_FRACTION, min(1.5, half_kelly / KELLY_SCALE_DIVISOR))
-
 
     def OnOrderEvent(self, event):
         try:
@@ -1331,13 +888,13 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 f"qty={event.FillQuantity or event.Quantity} | price={event.FillPrice} | id={event.OrderId}"
             )
             self.Debug(msg)
-
+            
             if event.Status == OrderStatus.Submitted:
                 if symbol not in self._pending_orders:
                     self._pending_orders[symbol] = 0
                 intended_qty = abs(event.Quantity) if event.Quantity != 0 else abs(event.FillQuantity)
                 self._pending_orders[symbol] += intended_qty
-
+            
             elif event.Status == OrderStatus.PartiallyFilled:
                 if symbol in self._pending_orders:
                     self._pending_orders[symbol] -= abs(event.FillQuantity)
@@ -1349,7 +906,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                         self.highest_prices[symbol] = event.FillPrice
                         self.entry_times[symbol] = self.Time
                 self._slip_log(symbol, event.Direction, event.FillPrice)
-
+            
             elif event.Status == OrderStatus.Filled:
                 self._pending_orders.pop(symbol, None)
                 if event.Direction == OrderDirection.Buy:
@@ -1364,7 +921,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                         entry = event.FillPrice
                         self.Debug(f"⚠️ WARNING: Missing entry price for {symbol.Value} sell, using fill price")
                     pnl = (event.FillPrice - entry) / entry if entry > 0 else 0
-
+                    
                     # Update Kelly criterion tracking (Opus feature)
                     if pnl > 0:
                         self.winning_trades += 1
@@ -1376,7 +933,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                         self.consecutive_losses += 1
                         self._rolling_wins.append(0)
                         self._rolling_loss_sizes.append(abs(pnl))
-
+                    
                     self.total_pnl += pnl
                     self.trade_log.append({
                         'time': self.Time,
@@ -1386,7 +943,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     })
                     self._cleanup_position(symbol)
                 self._slip_log(symbol, event.Direction, event.FillPrice)
-
+            
             elif event.Status == OrderStatus.Canceled:
                 self._pending_orders.pop(symbol, None)
                 if event.Direction == OrderDirection.Sell and symbol not in self.entry_prices:
@@ -1396,7 +953,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                         self.highest_prices[symbol] = holding.AveragePrice
                         self.entry_times[symbol] = self.Time
                         self.Debug(f"RE-TRACKED after cancel: {symbol.Value}")
-
+            
             elif event.Status == OrderStatus.Invalid:
                 self._pending_orders.pop(symbol, None)
                 if event.Direction == OrderDirection.Sell and symbol not in self.entry_prices:
@@ -1410,11 +967,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         except Exception as e:
             self.Debug(f"OnOrderEvent error: {e}")
 
-
     def OnBrokerageMessage(self, message):
         try:
             txt = message.Message.lower()
-            # self.Debug(f"BRKR MSG: {message.Message}")  # uncomment for diagnostics
             if "system status:" in txt:
                 if "online" in txt:
                     self.kraken_status = "online"
@@ -1427,11 +982,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 else:
                     self.kraken_status = "unknown"
                 self.Debug(f"Kraken status update: {self.kraken_status}")
-
+            
             # Handle rate limit messages
             if "rate limit" in txt or "too many" in txt:
                 self.Debug(f"⚠️ RATE LIMIT HIT - pausing trades for 5 minutes")
-                self._last_live_trade_time = self.Time
+                self._last_live_trade_time = self.Time  # This forces the 5-min cooldown
         except Exception as e:
             self.Debug(f"BrokerageMessage parse error: {e}")
 
@@ -1467,13 +1022,3 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 pnl = (cur - entry) / entry if entry > 0 else 0
                 self.Debug(f"  {s.Value}: ${entry:.4f}→${cur:.4f} ({pnl:+.2%})")
         self._persist_state()
-
-    def _debug_limited(self, msg):
-        if "CANCELED" in msg or "ZOMBIE" in msg or "INVALID" in msg:
-            self.Debug(msg)
-            return
-        if self.log_budget > 0:
-            self.Debug(msg)
-            self.log_budget -= 1
-        elif self.LiveMode:
-            self.Debug(msg)
