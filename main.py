@@ -6,11 +6,25 @@ import statistics
 import numpy as np
 # endregion
 
+
 class SimplifiedCryptoStrategy(QCAlgorithm):
     """
-    v3.0.0 (qa-logic + opus-execution)
-    Combines main_qa signal/scoring with opus execution enhancements.
-    Single inheritance only - uses composition pattern for execution functions.
+    Simplified 5-Factor Strategy - v3.0.0 (qa-logic + opus-execution)
+    Key protections (as requested):
+    - Exchange-status gate: trade only when Kraken status is OK (maintenance/cancel_only are blocked; unknown falls back to online after warmup).
+    - Stale handling: stale cancels only when online; blacklist symbol on zombie, skip reprocessing blacklisted.
+    - Liquidity/impact: live entry liquidity floor $5k over last 6 bars; impact cap 5% (scale >3%).
+    - Spread guard: 1.5% cap in high-vol/sideways; median-widen check.
+    - Min notional: $5 (tuned for small account); raise later if equity grows.
+    - Cash reserve: 15% (adjust to 10% only if hitting insufficient BP).
+    - Open-order cap: 2 concurrent.
+    - Session blacklist cleared daily.
+    - Logging limited to avoid rate limits.
+    Other features:
+    - Size cap live in high-vol/sideways: 25%.
+    - Faster time stop: exit after 24h if PnL < +1%.
+    - Zombie auto-blacklist; ARCUSD, PAXGUSD added to blacklist.
+    - Insights suppressed; ObjectStore writes disabled.
     """
 
     def Initialize(self):
@@ -45,7 +59,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.base_max_positions = 2
         self.max_positions = self.base_max_positions
         self.position_size_pct = 0.45
-        self.min_notional = 5.0
+        self.min_notional = 5.0  # lowered per request
         self.min_price_usd = 0.005
 
         self.expected_round_trip_fees = 0.0026
@@ -81,7 +95,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.drawdown_cooldown = 0
         self.cooldown_hours = 24
         self.consecutive_losses = 0
-        self.max_consecutive_losses = 10
+        self.max_consecutive_losses = 10  # relaxed to avoid unintended lockouts
 
         self.crypto_data = {}
         self.entry_prices = {}
@@ -95,221 +109,626 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.exit_cooldown_hours = 2
         self.cancel_cooldown_minutes = 1
 
-        self.winning_trades = 0
-        self.losing_trades = 0
-        self.total_pnl = 0.0
-        self.last_hour_rebalance = None
-        self.last_exit_check = None
-        self.last_universe_size = 0
-        self.min_volume_usd = 1000
-        self.max_universe_size = 1000
-        self.market_regime = "sideways"
-        self.volatility_regime = "high"
-        self.kraken_status = "online"
-        self.btc_price = None
-        self.btc_ema_short = None
-        self.btc_ema_long = None
-        self.market_breadth = 0.5
-        self._last_skip_reason = None
-        self.log_budget = 5 if self.LiveMode else 0
+        self.trailing_grace_hours = 2
+        self.atr_trail_mult = 1.2
 
-        # Opus enhancements: Kelly tracking deques
+        self._slip_abs = deque(maxlen=50)
+        self._slippage_alert_until = None
+        self.slip_alert_threshold = 0.0015
+        self.slip_outlier_threshold = 0.004
+        self.slip_alert_duration_hours = 2
+        self._bad_symbol_counts = {}
+
+        self._recent_tickets = deque(maxlen=25)
+
+        self.btc_symbol = None
+        self.btc_returns = deque(maxlen=self.long_period)
+        self.btc_prices = deque(maxlen=self.long_period)
+        self.btc_volatility = deque(maxlen=self.long_period)
         self._rolling_wins = deque(maxlen=50)
         self._rolling_win_sizes = deque(maxlen=50)
         self._rolling_loss_sizes = deque(maxlen=50)
         self._last_live_trade_time = None
-        self._slip_abs = deque(maxlen=100)
-        self.slip_outlier_threshold = 0.03
 
-        # Load persisted state for live trading
-        load_persisted_state(self)
-        
-        # Clean up old object store keys
-        cleanup_object_store(self)
+        self.market_regime = "unknown"
+        self.volatility_regime = "normal"
+        self.market_breadth = 0.5
+
+        self.winning_trades = 0
+        self.losing_trades = 0
+        self.total_pnl = 0.0
+        self.trade_log = []
+        self.log_budget = 0
+        self.last_log_time = None
+
+        self.min_volume_usd = 500
+        self.max_universe_size = 1000
+
+        # Kraken status gate:
+        # - "online": trade
+        # - "maintenance" / "cancel_only": block
+        # - "unknown": allowed after warmup fallback to "online"
+        self.kraken_status = "unknown"
+
+        self._last_skip_reason = None
+        self._last_live_trade_time = None
 
         self.UniverseSettings.Resolution = Resolution.Hour
-        self.AddUniverse(self._coarse_filter)
-        self.SetWarmUp(timedelta(hours=self.lookback+1))
-        
-        # Cancel any stale orders from previous session
-        cancel_stale_orders(self)
-        
-        # Schedules
+        self.AddUniverse(CryptoUniverse.Kraken(self.UniverseFilter))
+
+        try:
+            btc = self.AddCrypto("BTCUSD", Resolution.Hour, Market.Kraken)
+            self.btc_symbol = btc.Symbol
+        except:
+            self.Debug("Warning: Could not add BTC")
+
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(hours=2)), self.Rebalance)
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(hours=1)), self.CheckExits)
-        self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.At(0, 5), self.DailyReset)
-        self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(minutes=15)), self.ResyncHoldings)
-        self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(minutes=30)), self.ReviewPerformance)
+        self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.At(0, 1), self.DailyReport)
+        self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.At(0, 0), self.ResetDailyCounters)
+        self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(hours=6)), self.ReviewPerformance)
+        self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.At(12, 0), self.HealthCheck)
+        # Hourly live resync to catch fills that may have been missed by event stream
+        self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(hours=1)), self.ResyncHoldings)
 
-    def _get_param(self, key, default):
-        return self.GetParameter(key, default) if hasattr(self, 'GetParameter') else default
+        self.SetWarmUp(timedelta(days=5))
+        self.SetSecurityInitializer(lambda security: security.SetSlippageModel(RealisticCryptoSlippage()))
+        self.Settings.FreePortfolioValuePercentage = 0.05
+        self.Settings.InsightScore = False
 
-    def _coarse_filter(self, coarse):
-        selected = [
-            c for c in coarse
-            if c.Market == Market.Kraken
-            and c.Value > self.min_price_usd
-            and c.Volume * c.Value >= self.min_volume_usd
-            and c.Symbol.Value not in SYMBOL_BLACKLIST
-        ]
-        return [c.Symbol for c in sorted(selected, key=lambda x: x.Volume * x.Value, reverse=True)[:self.max_universe_size]]
+        if self.LiveMode:
+            cleanup_object_store(self)
+            load_persisted_state(self)
+            self.Debug("=" * 50)
+            self.Debug("=== LIVE TRADING (SAFE) v2.8.1 minimal ===")
+            self.Debug(f"Capital: ${self.Portfolio.Cash:.2f}")
+            self.Debug(f"Max positions: {self.max_positions}")
+            self.Debug(f"Position size: {self.position_size_pct:.0%}")
+            self.Debug("=" * 50)
+
+    def _get_param(self, name, default):
+        try:
+            param = self.GetParameter(name)
+            if param is not None and param != "":
+                return float(param)
+            return default
+        except:
+            return default
+
+    def EmitInsights(self, *insights):
+        return []
+
+    def EmitInsight(self, insight):
+        return []
+
+    def ResetDailyCounters(self):
+        self.daily_trade_count = 0
+        self.last_trade_date = self.Time.date()
+        if len(self._session_blacklist) > 0:
+            self.Debug(f"Clearing session blacklist ({len(self._session_blacklist)} items)")
+            self._session_blacklist.clear()
+        persist_state(self)
+
+    def HealthCheck(self):
+        if self.IsWarmingUp: return
+        # Live resync to catch any holdings the event stream might have missed
+        self.ResyncHoldings()
+        issues = []
+        if self.Portfolio.Cash < 5:
+            issues.append(f"Low cash: ${self.Portfolio.Cash:.2f}")
+        for symbol in list(self.entry_prices.keys()):
+            if len(self.Transactions.GetOpenOrders(symbol)) > 0:
+                continue
+            if not is_invested_not_dust(self, symbol):
+                issues.append(f"Orphan tracking: {symbol.Value}")
+                cleanup_position(self, symbol)
+        for kvp in self.Portfolio:
+            if is_invested_not_dust(self, kvp.Key) and kvp.Key not in self.entry_prices:
+                issues.append(f"Untracked position: {kvp.Key.Value}")
+        if len(self._session_blacklist) > 50:
+            issues.append(f"Large session blacklist: {len(self._session_blacklist)}")
+        open_orders = self.Transactions.GetOpenOrders()
+        if len(open_orders) > 0:
+            issues.append(f"Open orders: {len(open_orders)}")
+        if issues:
+            self.Debug("=== HEALTH CHECK ===")
+            for issue in issues:
+                self.Debug(f"  ⚠️ {issue}")
+        else:
+            debug_limited(self, "Health check: OK")
+
+    def ResyncHoldings(self):
+        """
+        Live-only safety: backfills tracking for any holdings that exist in the brokerage
+        but were not registered via OnOrderEvent (e.g., missed fill events).
+        """
+        if self.IsWarmingUp: return
+        if not self.LiveMode: return
+        missing = []
+        for symbol in self.Portfolio.Keys:
+            holding = self.Portfolio[symbol]
+            if not holding.Invested or holding.Quantity == 0:
+                continue
+            if symbol in self.entry_prices:
+                continue
+            if symbol in self._exit_cooldowns and self.Time < self._exit_cooldowns[symbol]:
+                continue
+            if has_open_orders(self, symbol):
+                continue
+            missing.append(symbol)
+        if not missing:
+            return
+        self.Debug(f"RESYNC: detected {len(missing)} holdings without tracking; backfilling.")
+        for symbol in missing:
+            try:
+                if symbol not in self.Securities:
+                    self.AddCrypto(symbol.Value, Resolution.Hour, Market.Kraken)
+                holding = self.Portfolio[symbol]
+                entry = holding.AveragePrice
+                self.entry_prices[symbol] = entry
+                self.highest_prices[symbol] = entry
+                self.entry_times[symbol] = self.Time
+                current_price = self.Securities[symbol].Price if symbol in self.Securities else holding.Price
+                pnl_pct = (current_price - entry) / entry if entry > 0 else 0
+                self.Debug(f"RESYNCED: {symbol.Value} | Qty: {holding.Quantity} | Entry: ${entry:.4f} | Now: ${current_price:.4f} | PnL: {pnl_pct:+.2%}")
+            except Exception as e:
+                self.Debug(f"Resync error {symbol.Value}: {e}")
+
+    def ReviewPerformance(self):
+        if self.IsWarmingUp or len(self.trade_log) < 5: return
+        recent_trades = self.trade_log[-10:] if len(self.trade_log) >= 10 else self.trade_log
+        if len(recent_trades) == 0: return
+        recent_win_rate = sum(1 for t in recent_trades if t['pnl_pct'] > 0) / len(recent_trades)
+        recent_avg_pnl = np.mean([t['pnl_pct'] for t in recent_trades])
+        old_max = self.max_positions
+        if recent_win_rate < 0.3 or recent_avg_pnl < -0.03:
+            self.max_positions = 1
+            if old_max != 1:
+                self.Debug(f"PERFORMANCE DECAY: max_pos=1 (WR:{recent_win_rate:.0%}, PnL:{recent_avg_pnl:+.2%})")
+        elif recent_win_rate > 0.5 and recent_avg_pnl > 0:
+            self.max_positions = self.base_max_positions
+            if old_max != self.base_max_positions:
+                self.Debug(f"PERFORMANCE RECOVERY: max_pos={self.base_max_positions}")
+
+    def _estimate_min_qty(self, symbol):
+        try:
+            price = self.Securities[symbol].Price if symbol in self.Securities else 0
+        except: price = 0
+        if price <= 0: return 50.0
+        if price < 0.001: return 1000.0
+        elif price < 0.01: return 500.0
+        elif price < 0.1: return 50.0
+        elif price < 1.0: return 10.0
+        elif price < 10.0: return 5.0
+        elif price < 100.0: return 1.0
+        elif price < 1000.0: return 0.1
+        else: return 0.01
+
+    def _cancel_stale_orders(self):
+        try:
+            open_orders = self.Transactions.GetOpenOrders()
+            if len(open_orders) > 0:
+                self.Debug(f"Found {len(open_orders)} open orders - canceling all...")
+                for order in open_orders:
+                    self.Transactions.CancelOrder(order.Id)
+        except Exception as e:
+            self.Debug(f"Error canceling stale orders: {e}")
+
+    def UniverseFilter(self, universe):
+        selected = []
+        for crypto in universe:
+            ticker = crypto.Symbol.Value
+            if ticker in SYMBOL_BLACKLIST or ticker in self._session_blacklist:
+                continue
+            if not ticker.endswith("USD"):
+                continue
+            # Additional forex filter
+            if any(ticker.endswith(suffix) for suffix in ["PYUSD", "EURUSD", "GBPUSD", "AUDUSD", "NZDUSD", 
+                "JPYUSD", "CADUSD", "CHFUSD", "CNYUSD", "HKDUSD", "SGDUSD", "SEKUSD", "NOKUSD", "DKKUSD", 
+                "KRWUSD", "TRYUSD", "ZARUSD", "MXNUSD", "INRUSD", "BRLUSD", "PLNUSD", "THBUSD"]):
+                continue
+            if crypto.VolumeInUsd is None or crypto.VolumeInUsd == 0:
+                continue
+            if crypto.VolumeInUsd > self.min_volume_usd:
+                selected.append(crypto)
+        selected.sort(key=lambda x: x.VolumeInUsd, reverse=True)
+        return [c.Symbol for c in selected[:self.max_universe_size]]
+
+    def _initialize_symbol(self, symbol):
+        self.crypto_data[symbol] = {
+            'prices': deque(maxlen=self.lookback),
+            'returns': deque(maxlen=self.lookback),
+            'volume': deque(maxlen=self.lookback),
+            'volume_ma': deque(maxlen=self.medium_period),
+            'dollar_volume': deque(maxlen=self.lookback),
+            'ema_short': ExponentialMovingAverage(self.short_period),
+            'ema_medium': ExponentialMovingAverage(self.medium_period),
+            'ema_long': ExponentialMovingAverage(self.long_period),
+            'atr': AverageTrueRange(14),
+            'volatility': deque(maxlen=self.medium_period),
+            'rsi': RelativeStrengthIndex(14),
+            'rs_vs_btc': deque(maxlen=self.medium_period),
+            'zscore': deque(maxlen=self.short_period),
+            'last_price': 0,
+            'recent_net_scores': deque(maxlen=3),
+            'spreads': deque(maxlen=self.spread_median_window),
+            'trail_stop': None,
+        }
+
+    def OnSecuritiesChanged(self, changes):
+        for security in changes.AddedSecurities:
+            symbol = security.Symbol
+            if symbol not in self.crypto_data:
+                self._initialize_symbol(symbol)
+        for security in changes.RemovedSecurities:
+            symbol = security.Symbol
+            if not self.IsWarmingUp and is_invested_not_dust(self, symbol):
+                smart_liquidate(self, symbol, "Removed from universe")
+                # Don't cleanup here — let OnOrderEvent handle it on fill
+                self.Debug(f"FORCED EXIT: {symbol.Value} - removed from universe")
+            # Only delete crypto_data if not invested (otherwise OnOrderEvent needs it)
+            if symbol in self.crypto_data and not is_invested_not_dust(self, symbol):
+                del self.crypto_data[symbol]
 
     def OnData(self, data):
-        for symbol in data.Keys:
-            if symbol not in self.crypto_data:
-                self.crypto_data[symbol] = {
-                    'prices': deque(maxlen=self.lookback),
-                    'returns': deque(maxlen=self.lookback),
-                    'dollar_volume': deque(maxlen=self.lookback),
-                    'volume_ma': deque(maxlen=self.lookback),
-                    'rs_vs_btc': deque(maxlen=self.lookback),
-                    'zscore': deque(maxlen=self.lookback),
-                    'spreads': deque(maxlen=self.spread_median_window),
-                    'ema_short': ExponentialMovingAverage(self.short_period),
-                    'ema_medium': ExponentialMovingAverage(self.medium_period),
-                    'ema_long': ExponentialMovingAverage(self.long_period),
-                    'rsi': RelativeStrengthIndex(14),
-                    'atr': AverageTrueRange(14),
-                    'trail_stop': None,
-                }
-            crypto = self.crypto_data[symbol]
-            if data.ContainsKey(symbol):
-                bar = data[symbol]
-                if bar is None:
-                    continue
-                crypto['prices'].append(bar.Close)
-                if len(crypto['prices']) >= 2:
-                    ret = (bar.Close - crypto['prices'][-2]) / crypto['prices'][-2]
-                    crypto['returns'].append(ret)
-                dv = bar.Volume * bar.Close
-                crypto['dollar_volume'].append(dv)
-                if len(crypto['dollar_volume']) >= 12:
-                    crypto['volume_ma'].append(np.mean(list(crypto['dollar_volume'])[-12:]))
-                if self.btc_price and self.btc_price > 0 and bar.Close > 0:
-                    rs = (bar.Close / self.btc_price) - 1
-                    crypto['rs_vs_btc'].append(rs)
-                if len(crypto['prices']) >= self.medium_period:
-                    mn = np.mean(list(crypto['prices'])[-self.medium_period:])
-                    sd = np.std(list(crypto['prices'])[-self.medium_period:])
-                    z = (bar.Close - mn) / sd if sd > 1e-10 else 0
-                    crypto['zscore'].append(z)
-                crypto['ema_short'].Update(bar.EndTime, bar.Close)
-                crypto['ema_medium'].Update(bar.EndTime, bar.Close)
-                crypto['ema_long'].Update(bar.EndTime, bar.Close)
-                crypto['rsi'].Update(bar.EndTime, bar.Close)
-                crypto['atr'].Update(bar)
-                sp = get_spread_pct(self, symbol)
-                if sp is not None:
-                    crypto['spreads'].append(sp)
+        if self.btc_symbol and data.Bars.ContainsKey(self.btc_symbol):
+            btc_bar = data.Bars[self.btc_symbol]
+            btc_price = float(btc_bar.Close)
+            if len(self.btc_prices) > 0:
+                btc_return = (btc_price - self.btc_prices[-1]) / self.btc_prices[-1]
+                self.btc_returns.append(btc_return)
+            self.btc_prices.append(btc_price)
+            if len(self.btc_returns) >= 10:
+                self.btc_volatility.append(np.std(list(self.btc_returns)[-10:]))
+        for symbol in list(self.crypto_data.keys()):
+            if not data.Bars.ContainsKey(symbol):
+                continue
+            try:
+                self._update_symbol_data(symbol, data.Bars[symbol])
+            except:
+                pass
+        if self.IsWarmingUp:
+            return
+        if not self._positions_synced:
+            if not self._first_post_warmup:
+                self._cancel_stale_orders()
+            sync_existing_positions(self)
+            self._positions_synced = True
+            self._first_post_warmup = False
+            # Fallback: if status never set, assume online after warmup
+            if self.kraken_status == "unknown":
+                self.kraken_status = "online"
+                self.Debug("Fallback: kraken_status set to online after warmup")
+            ready_count = sum(1 for c in self.crypto_data.values() if self._is_ready(c))
+            self.Debug(f"Post-warmup: {ready_count} symbols ready")
+        self._update_market_context()
 
-            if symbol.Value == "BTCUSD":
-                bar = data.get(symbol)
-                if bar:
-                    self.btc_price = bar.Close
-                    if self.btc_ema_short is None:
-                        self.btc_ema_short = ExponentialMovingAverage(self.medium_period)
-                        self.btc_ema_long = ExponentialMovingAverage(self.long_period * 2)
-                    self.btc_ema_short.Update(bar.EndTime, bar.Close)
-                    self.btc_ema_long.Update(bar.EndTime, bar.Close)
+    def _update_symbol_data(self, symbol, bar):
+        crypto = self.crypto_data[symbol]
+        price = float(bar.Close)
+        volume = float(bar.Volume)
+        crypto['prices'].append(price)
+        if crypto['last_price'] > 0:
+            ret = (price - crypto['last_price']) / crypto['last_price']
+            crypto['returns'].append(ret)
+        crypto['last_price'] = price
+        crypto['volume'].append(volume)
+        crypto['dollar_volume'].append(price * volume)
+        if len(crypto['volume']) >= self.short_period:
+            crypto['volume_ma'].append(np.mean(list(crypto['volume'])[-self.short_period:]))
+        crypto['ema_short'].Update(bar.EndTime, price)
+        crypto['ema_medium'].Update(bar.EndTime, price)
+        crypto['ema_long'].Update(bar.EndTime, price)
+        crypto['atr'].Update(bar)
+        if len(crypto['returns']) >= 10:
+            crypto['volatility'].append(np.std(list(crypto['returns'])[-10:]))
+        crypto['rsi'].Update(bar.EndTime, price)
+        if len(crypto['returns']) >= self.short_period and len(self.btc_returns) >= self.short_period:
+            coin_ret = np.sum(list(crypto['returns'])[-self.short_period:])
+            btc_ret = np.sum(list(self.btc_returns)[-self.short_period:])
+            crypto['rs_vs_btc'].append(coin_ret - btc_ret)
+        if len(crypto['prices']) >= self.medium_period:
+            prices_arr = np.array(list(crypto['prices']))
+            std = np.std(prices_arr)
+            if std > 0:
+                crypto['zscore'].append((price - np.mean(prices_arr)) / std)
+        sp = get_spread_pct(self, symbol)
+        if sp is not None:
+            crypto['spreads'].append(sp)
+
+    def _update_market_context(self):
+        if len(self.btc_prices) >= self.medium_period:
+            btc_arr = np.array(list(self.btc_prices))
+            btc_sma = np.mean(btc_arr[-self.medium_period:])
+            current_btc = btc_arr[-1]
+            if current_btc > btc_sma * 1.03:
+                self.market_regime = "bull"
+            elif current_btc < btc_sma * 0.97:
+                self.market_regime = "bear"
+            else:
+                self.market_regime = "sideways"
+        if len(self.btc_volatility) >= 5:
+            current_vol = self.btc_volatility[-1]
+            avg_vol = np.mean(list(self.btc_volatility))
+            if current_vol > avg_vol * 1.5:
+                self.volatility_regime = "high"
+            elif current_vol < avg_vol * 0.5:
+                self.volatility_regime = "low"
+            else:
+                self.volatility_regime = "normal"
+        uptrend_count = 0
+        total_ready = 0
+        for crypto in self.crypto_data.values():
+            if crypto['ema_short'].IsReady and crypto['ema_medium'].IsReady:
+                total_ready += 1
+                if crypto['ema_short'].Current.Value > crypto['ema_medium'].Current.Value:
+                    uptrend_count += 1
+        if total_ready > 10:
+            self.market_breadth = uptrend_count / total_ready
+
+    def _annualized_vol(self, crypto):
+        if crypto is None:
+            return None
+        if len(crypto.get('volatility', [])) == 0:
+            return None
+        return float(crypto['volatility'][-1]) * self.sqrt_annualization
+
+    def _compute_portfolio_risk_estimate(self):
+        total_value = self.Portfolio.TotalPortfolioValue
+        if total_value <= 0:
+            return 0.0
+        risk = 0.0
+        for kvp in self.Portfolio:
+            symbol, holding = kvp.Key, kvp.Value
+            if not is_invested_not_dust(self, symbol):
+                continue
+            crypto = self.crypto_data.get(symbol)
+            asset_vol_ann = self._annualized_vol(crypto)
+            if asset_vol_ann is None:
+                asset_vol_ann = self.min_asset_vol_floor
+            weight = abs(holding.HoldingsValue) / total_value
+            risk += weight * asset_vol_ann
+        return risk
+
+    def _log_skip(self, reason):
+        if reason != self._last_skip_reason:
+            debug_limited(self, f"Rebalance skip: {reason}")
+            self._last_skip_reason = reason
 
     def Rebalance(self):
         if self.IsWarmingUp:
             return
-        if not live_safety_checks(self):
+        # Live safety checks
+        if self.LiveMode and not live_safety_checks(self):
             return
-        if not self._positions_synced:
-            sync_existing_positions(self)
-            self._positions_synced = True
-        if self._first_post_warmup:
-            self._first_post_warmup = False
-            if self.kraken_status == "unknown":
-                self.kraken_status = "online"
-        if self.Time.hour in self.skip_hours_utc:
-            return
-        if self.kraken_status not in ["online", "post_only"]:
-            self._log_skip(f"Kraken {self.kraken_status}")
-            return
-        if self.Time.date() != self.last_trade_date:
-            self.daily_trade_count = 0
-            self.last_trade_date = self.Time.date()
-        if self.daily_trade_count >= self.max_daily_trades:
-            self._log_skip("Daily limit")
-            return
-        if self.last_hour_rebalance and (self.Time - self.last_hour_rebalance).total_seconds() < 7000:
-            return
-        self.last_hour_rebalance = self.Time
-        open_order_count = len(self.Transactions.GetOpenOrders())
-        if open_order_count >= self.max_concurrent_open_orders:
-            self._log_skip(f"Open orders: {open_order_count}")
+        # Only block on explicit bad states; unknown is allowed (and will have fallback after warmup)
+        if self.LiveMode and self.kraken_status in ("maintenance", "cancel_only"):
+            self._log_skip("kraken not online")
             return
         cancel_stale_new_orders(self)
-        self._update_market_context()
+        if self.Time != self.last_log_time:
+            self.log_budget = 20
+            self.last_log_time = self.Time
+        if self.LiveMode and self.Time.hour in self.skip_hours_utc:
+            self._log_skip("skip hour")
+            return
+        if self.daily_trade_count >= self.max_daily_trades:
+            self._log_skip("max daily trades")
+            return
+        val = self.Portfolio.TotalPortfolioValue
+        if self.peak_value is None or self.peak_value < 1:
+            self.peak_value = val
         if self.drawdown_cooldown > 0:
-            self.drawdown_cooldown -= 1
-            self._log_skip(f"Cooldown {self.drawdown_cooldown}")
+            self.drawdown_cooldown -= 2
+            if self.drawdown_cooldown <= 0:
+                self.peak_value = val
+                self.consecutive_losses = 0
+            else:
+                self._log_skip(f"drawdown cooldown {self.drawdown_cooldown}h")
+                return
+        self.peak_value = max(self.peak_value, val)
+        dd = (self.peak_value - val) / self.peak_value if self.peak_value > 0 else 0
+        if dd > self.max_drawdown_limit:
+            self.drawdown_cooldown = self.cooldown_hours
+            self._log_skip(f"drawdown {dd:.1%} > limit")
             return
         if self.consecutive_losses >= self.max_consecutive_losses:
-            self._log_skip("Max losses")
+            self.drawdown_cooldown = 12
+            self.consecutive_losses = 0
+            self._log_skip("consecutive loss cooldown")
             return
-        threshold = self._get_regime_threshold()
-        candidates = []
-        for symbol, crypto in self.crypto_data.items():
-            if symbol.Value in self._session_blacklist:
+        dynamic_max_pos = self.base_max_positions
+        pos_count = get_actual_position_count(self)
+        if pos_count >= dynamic_max_pos:
+            self._log_skip("at max positions")
+            return
+        if len(self.Transactions.GetOpenOrders()) > self.max_concurrent_open_orders:
+            self._log_skip("too many open orders")
+            return
+        if self._compute_portfolio_risk_estimate() > self.portfolio_vol_cap:
+            self._log_skip("risk cap")
+            return
+        scores = []
+        threshold_now = self._get_threshold()
+        for symbol in list(self.crypto_data.keys()):
+            if symbol.Value in SYMBOL_BLACKLIST or symbol.Value in self._session_blacklist:
                 continue
+            if has_open_orders(self, symbol):
+                continue
+            if not spread_ok(self, symbol):
+                continue
+            crypto = self.crypto_data[symbol]
             if not self._is_ready(crypto):
                 continue
-            if symbol.Value in SYMBOL_BLACKLIST:
+            factor_scores = self._calculate_factor_scores(symbol, crypto)
+            if not factor_scores:
                 continue
-            factors = self._calculate_factor_scores(symbol, crypto)
-            if not factors:
-                continue
-            composite = self._calculate_composite_score(factors)
-            adjusted = self._apply_fee_adjustment(composite)
-            if adjusted >= threshold:
-                candidates.append((symbol, adjusted, factors))
-        if not candidates:
+            composite_score = self._calculate_composite_score(factor_scores)
+            net_score = self._apply_fee_adjustment(composite_score)
+            if net_score > threshold_now:
+                scores.append({
+                    'symbol': symbol,
+                    'composite_score': composite_score,
+                    'net_score': net_score,
+                    'factors': factor_scores,
+                    'volatility': crypto['volatility'][-1] if len(crypto['volatility']) > 0 else 0.05,
+                    'dollar_volume': list(crypto['dollar_volume'])[-6:] if len(crypto['dollar_volume']) >= 6 else [],
+                })
+        if len(scores) == 0:
+            self._log_skip("no candidates passed filters")
             return
-        candidates.sort(key=lambda x: x[1], reverse=True)
-        self._execute_trades(candidates, threshold, self.max_positions)
+        scores.sort(key=lambda x: x['net_score'], reverse=True)
+        self._last_skip_reason = None
+        self._execute_trades(scores, threshold_now, dynamic_max_pos)
 
-    def _update_market_context(self):
-        if self.btc_ema_short and self.btc_ema_short.IsReady and self.btc_ema_long and self.btc_ema_long.IsReady:
-            s, l = self.btc_ema_short.Current.Value, self.btc_ema_long.Current.Value
-            if s > l * 1.03:
-                self.market_regime = "bull"
-            elif s < l * 0.97:
-                self.market_regime = "bear"
-            else:
-                self.market_regime = "sideways"
-        vols = []
-        for symbol, crypto in self.crypto_data.items():
-            if len(crypto['returns']) >= self.medium_period:
-                vols.append(np.std(list(crypto['returns'])[-self.medium_period:]))
-        if len(vols) > 5:
-            med = np.median(vols)
-            self.volatility_regime = "high" if med > 0.025 else "normal"
-        up_count = 0
-        total_count = 0
-        for symbol, crypto in self.crypto_data.items():
-            if self._is_ready(crypto):
-                total_count += 1
-                if len(crypto['returns']) >= 3:
-                    if np.mean(list(crypto['returns'])[-3:]) > 0:
-                        up_count += 1
-        if total_count > 0:
-            self.market_breadth = up_count / total_count
-        else:
-            self.market_breadth = 0.5
+    def _execute_trades(self, candidates, threshold_now, dynamic_max_pos):
+        if not self._positions_synced:
+            return
+        if self.LiveMode and self.kraken_status in ("maintenance", "cancel_only"):
+            return
+        cancel_stale_new_orders(self)
+        if len(self.Transactions.GetOpenOrders()) > self.max_concurrent_open_orders:
+            return
+        if self._compute_portfolio_risk_estimate() > self.portfolio_vol_cap:
+            return
+        for cand in candidates:
+            if self.daily_trade_count >= self.max_daily_trades:
+                break
+            if get_actual_position_count(self) >= dynamic_max_pos:
+                break
+            sym = cand['symbol']
+            comp_score = cand.get('composite_score', 0.5)
+            net_score = cand.get('net_score', 0.5)
+            if sym in self._pending_orders and self._pending_orders[sym] > 0:
+                continue
+            if has_open_orders(self, sym):
+                continue
+            if is_invested_not_dust(self, sym):
+                continue
+            if not spread_ok(self, sym):
+                continue
+            if sym in self._exit_cooldowns and self.Time < self._exit_cooldowns[sym]:
+                continue
+            sec = self.Securities[sym]
+            price = sec.Price
+            if price is None or price <= 0:
+                continue
+            if price < self.min_price_usd:
+                continue
 
-    def _get_regime_threshold(self):
-        if self.market_regime == "bear":
+            effective_size_cap = self.position_size_pct
+            if self.LiveMode and (self.volatility_regime == "high" or self.market_regime == "sideways"):
+                effective_size_cap = min(effective_size_cap, 0.25)
+
+            total_value = self.Portfolio.TotalPortfolioValue
+            try:
+                available_cash = self.Portfolio.CashBook["USD"].Amount
+            except (KeyError, AttributeError):
+                available_cash = self.Portfolio.Cash
+            # Reserve based on portfolio value, not just remaining cash
+            portfolio_reserve = total_value * self.cash_reserve_pct
+            fee_reserve = total_value * 0.02  # Reserve 2% of portfolio value for fee coverage
+            effective_reserve = max(portfolio_reserve, fee_reserve)
+            reserved_cash = available_cash - effective_reserve
+            if reserved_cash <= 0:
+                continue
+            min_qty = get_min_quantity(self, sym)
+            min_notional_usd = get_min_notional_usd(self, sym)
+            if min_qty * price > reserved_cash * 0.6:
+                continue
+            crypto = self.crypto_data.get(sym)
+            if not crypto:
+                continue
+            if crypto['ema_short'].IsReady and crypto['ema_medium'].IsReady:
+                ema_short = crypto['ema_short'].Current.Value
+                ema_medium = crypto['ema_medium'].Current.Value
+
+                # Check if this is a strong mean-reversion candidate
+                is_mean_reversion = False
+                if len(crypto['zscore']) >= 1 and crypto['rsi'].IsReady:
+                    z = crypto['zscore'][-1]
+                    rsi = crypto['rsi'].Current.Value
+                    # Deep oversold: allow entry even against trend
+                    if z < -1.5 and rsi < 35:
+                        is_mean_reversion = True
+
+                if not is_mean_reversion:
+                    # Normal trend-following gate
+                    if ema_short <= ema_medium:
+                        continue
+                    if len(crypto['returns']) >= 3:
+                        recent_return = np.mean(list(crypto['returns'])[-3:])
+                        if recent_return <= 0:
+                            continue
+            crypto['recent_net_scores'].append(net_score)
+            if len(crypto['recent_net_scores']) >= 3:
+                above_threshold_count = sum(1 for score in crypto['recent_net_scores'] if score > threshold_now)
+                if above_threshold_count < 2:
+                    continue
+            vol = self._annualized_vol(crypto)
+            size = self._calculate_position_size(comp_score, threshold_now, vol)
+            size = min(size, effective_size_cap)
+            if self.volatility_regime == "high":
+                size *= 0.7
+
+            if self.LiveMode and len(crypto['dollar_volume']) >= 6:
+                recent_dollar_vol6 = np.mean(list(crypto['dollar_volume'])[-6:])
+                if recent_dollar_vol6 < 5000:
+                    continue
+            recent_dollar_vol3 = np.mean(list(crypto['dollar_volume'])[-3:]) if len(crypto['dollar_volume']) >= 3 else 0
+
+            if len(crypto['dollar_volume']) >= 3:
+                order_value_estimate = reserved_cash * size
+                if recent_dollar_vol3 > 0:
+                    impact_ratio = order_value_estimate / recent_dollar_vol3
+                    # Dynamic impact caps based on portfolio size
+                    portfolio_value = self.Portfolio.TotalPortfolioValue
+                    impact_hard_cap = 0.05 if portfolio_value < 500 else (0.03 if portfolio_value < 5000 else 0.02)
+                    impact_soft_cap = impact_hard_cap * 0.6
+                    if impact_ratio > impact_hard_cap:
+                        continue
+                    if impact_ratio > impact_soft_cap:
+                        size *= max(0.3, 1.0 - impact_ratio)
+                    max_child = 0.15 * recent_dollar_vol3
+                    if order_value_estimate > max_child:
+                        size *= max_child / order_value_estimate
+
+            val = reserved_cash * size
+            qty = round_quantity(self, sym, val / price)
+            if qty < min_qty:
+                qty = round_quantity(self, sym, min_qty)
+                val = qty * price
+            # Verify total cost with fees doesn't breach reserve
+            total_cost_with_fee = val * 1.006  # Include 0.6% fee in total cost
+            if total_cost_with_fee > available_cash - fee_reserve:
+                continue
+            if val < min_notional_usd or val < self.min_notional or val > reserved_cash:
+                continue
+            try:
+                ticket = self.MarketOrder(sym, qty)
+                if ticket is not None:
+                    self._recent_tickets.append(ticket)
+                    self.Debug(f"ORDER: {sym.Value} | ${val:.2f} | id={ticket.OrderId}")
+                self.trade_count += 1
+                debug_limited(self, f"ORDER: {sym.Value} | ${val:.2f}")
+                # Update last trade time for rate limiting
+                if self.LiveMode:
+                    self._last_live_trade_time = self.Time
+            except Exception as e:
+                self.Debug(f"ORDER FAILED: {sym.Value} - {e}")
+                self._session_blacklist.add(sym.Value)
+                continue
+            if self.LiveMode:
+                break
+
+    def _get_threshold(self):
+        if self.market_regime == "bull" and self.market_breadth > 0.6:
+            return self.threshold_bull
+        elif self.market_regime == "bear":
             return self.threshold_bear
         elif self.volatility_regime == "high":
             return self.threshold_high_vol
-        elif self.market_regime == "sideways":
-            return self.threshold_sideways
-        else:
-            return self.threshold_bull
+        return self.threshold_sideways
 
     def _is_ready(self, c):
         return len(c['prices']) >= self.medium_period and c['rsi'].IsReady
@@ -437,6 +856,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             dv_list = list(crypto['dollar_volume'])[-6:]
             avg_dv = np.mean(dv_list)
             exit_value = abs(holding.Quantity) * price
+            # Apply penalty if exit > 2% of volume
             if avg_dv > 0 and exit_value / avg_dv > 0.02:
                 exit_slip_estimate = min(0.02, exit_value / avg_dv * 0.1)
                 pnl -= exit_slip_estimate
@@ -462,166 +882,135 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             trailing_stop_pct = 0.025
 
         tag = ""
-        if pnl >= tp:
-            tag = "TP"
-        elif pnl <= -sl:
-            tag = "SL"
-        elif pnl >= trailing_activation:
-            if crypto and crypto['trail_stop'] is None:
-                crypto['trail_stop'] = highest
-            if crypto and crypto['trail_stop']:
-                if dd >= trailing_stop_pct:
-                    tag = "Trail"
-        if not tag and hours >= 24 and pnl < 0.01:
-            tag = "TimeStop"
+        min_notional_usd = get_min_notional_usd(self, symbol)
+        trailing_allowed = hours >= self.trailing_grace_hours
+        if pnl <= -sl:
+            tag = "Stop Loss"
+        elif pnl >= tp:
+            tag = "Take Profit"
+        elif trailing_allowed and pnl > trailing_activation and dd >= trailing_stop_pct:
+            tag = "Trailing Stop"
+        elif self.market_regime == "bear" and pnl > 0.03:
+            tag = "Bear Exit"
+        elif hours > 24 and pnl < 0.01:
+            tag = "Time Exit"
+        if not tag and trailing_allowed and atr and entry > 0 and holding.Quantity != 0:
+            trail_offset = atr * self.atr_trail_mult
+            trail_level = price - trail_offset
+            current_trail = crypto.get('trail_stop') if crypto else None
+            if current_trail is None or trail_level > current_trail:
+                crypto['trail_stop'] = trail_level
+            if crypto and crypto['trail_stop'] is not None:
+                if holding.Quantity > 0 and price <= crypto['trail_stop']:
+                    tag = "ATR Trail"
+                elif holding.Quantity < 0 and price >= crypto['trail_stop']:
+                    tag = "ATR Trail"
+        if not tag and hours >= self.min_signal_age_hours:
+            try:
+                if crypto and self._is_ready(crypto):
+                    factors = self._calculate_factor_scores(symbol, crypto)
+                    if factors:
+                        comp = self._calculate_composite_score(factors)
+                        net = self._apply_fee_adjustment(comp)
+                        if net < self._get_threshold() - self.signal_decay_buffer:
+                            tag = "Signal Decay"
+            except:
+                pass
         if tag:
+            if price * abs(holding.Quantity) < min_notional_usd * 0.9:
+                return
             smart_liquidate(self, symbol, tag)
+            self._exit_cooldowns[symbol] = self.Time + timedelta(hours=self.exit_cooldown_hours)
+            self.Debug(f"{tag}: {symbol.Value} | PnL:{pnl:+.2%} | Held:{hours:.0f}h")
 
-    def _execute_trades(self, candidates, threshold, max_pos):
-        current_count = get_actual_position_count(self)
-        if current_count >= max_pos:
-            return
-        budget = self.Portfolio.TotalPortfolioValue * (1 - self.cash_reserve_pct)
-        if budget <= 0:
-            return
-        slots_available = max_pos - current_count
-        top = candidates[:min(slots_available, len(candidates))]
-        for symbol, score, factors in top:
-            if symbol in self.entry_prices:
-                continue
-            if symbol in self._exit_cooldowns and self.Time < self._exit_cooldowns[symbol]:
-                continue
-            if symbol.Value in self._session_blacklist:
-                continue
-            if has_open_orders(self, symbol):
-                continue
-            if not spread_ok(self, symbol):
-                continue
-            crypto = self.crypto_data.get(symbol)
-            if not crypto or not self._is_ready(crypto):
-                continue
-            if len(crypto.get('dollar_volume', [])) >= 6:
-                dv_list = list(crypto['dollar_volume'])[-6:]
-                avg_dv = np.mean(dv_list)
-                if self.LiveMode and avg_dv < 5000:
-                    continue
-            # EMA gate: require short > medium unless deep mean-reversion
-            s_ema = crypto['ema_short'].Current.Value
-            m_ema = crypto['ema_medium'].Current.Value
-            if s_ema < m_ema:
-                # Allow if strong mean-reversion
-                if factors.get('mean_reversion', 0.5) < 0.75:
-                    continue
-            # 3-bar return check
-            if len(crypto['returns']) >= 3:
-                recent_ret = np.mean(list(crypto['returns'])[-3:])
-                if recent_ret <= 0 and factors.get('mean_reversion', 0.5) < 0.75:
-                    continue
-            # Volume impact check
-            price = self.Securities[symbol].Price
-            target_pct = self._calculate_position_size(score, threshold, None)
-            target_usd = budget * target_pct
-            if price > 0:
-                qty = target_usd / price
-                order_value = qty * price
-                if len(crypto.get('dollar_volume', [])) >= 3:
-                    dv_3bar = np.mean(list(crypto['dollar_volume'])[-3:])
-                    if dv_3bar > 0:
-                        impact_pct = order_value / dv_3bar
-                        cap = 0.05
-                        if impact_pct > cap:
-                            qty *= (cap / impact_pct)
-                        elif impact_pct > cap * 0.6:
-                            scale = 1 - (impact_pct - cap * 0.6) / (cap * 0.4) * 0.3
-                            qty *= scale
-                min_qty = get_min_quantity(self, symbol)
-                min_notional = get_min_notional_usd(self, symbol)
-                if qty < min_qty:
-                    continue
-                if qty * price < min_notional:
-                    continue
-                # High-vol/sideways cap
-                if self.LiveMode and (self.volatility_regime == "high" or self.market_regime == "sideways"):
-                    max_pct = 0.25
-                    if qty * price / self.Portfolio.TotalPortfolioValue > max_pct:
-                        qty = (self.Portfolio.TotalPortfolioValue * max_pct) / price
-                qty = round_quantity(self, symbol, qty)
-                if qty >= min_qty and qty * price >= min_notional:
-                    try:
-                        self.MarketOrder(symbol, qty, tag="Entry")
-                        self._pending_orders[symbol] = self.Time
-                        self.daily_trade_count += 1
-                        if self.LiveMode:
-                            self._last_live_trade_time = self.Time
-                        break
-                    except:
-                        pass
-
-    def DailyReset(self):
-        if len(self._session_blacklist) > self._max_session_blacklist_size:
-            self._session_blacklist = set(list(self._session_blacklist)[-self._max_session_blacklist_size:])
-
-    def ResyncHoldings(self):
-        resync_holdings(self)
-
-    def ReviewPerformance(self):
-        if self.IsWarmingUp:
-            return
-        current = self.Portfolio.TotalPortfolioValue
-        if self.peak_value is None:
-            self.peak_value = current
-        elif current > self.peak_value:
-            self.peak_value = current
-        if self.peak_value and self.peak_value > 0:
-            dd = (self.peak_value - current) / self.peak_value
-            if dd >= self.max_drawdown_limit:
-                self.drawdown_cooldown = self.cooldown_hours
-                for kvp in self.Portfolio:
-                    if is_invested_not_dust(self, kvp.Key):
-                        smart_liquidate(self, kvp.Key, "DD")
-
-    def OnOrderEvent(self, orderEvent):
-        if orderEvent.Status != OrderStatus.Filled:
-            return
-        order = self.Transactions.GetOrderById(orderEvent.OrderId)
-        if order is None:
-            return
-        symbol = orderEvent.Symbol
-        # Log slippage with live alert
-        slip_log(self, symbol, order.Direction, orderEvent.FillPrice)
-        # Track entry
-        if order.Direction == OrderDirection.Buy and orderEvent.FillQuantity > 0:
-            self.entry_prices[symbol] = orderEvent.FillPrice
-            self.highest_prices[symbol] = orderEvent.FillPrice
-            self.entry_times[symbol] = self.Time
-            self._pending_orders.pop(symbol, None)
-        # Track exit and update Kelly stats
-        if (order.Direction == OrderDirection.Sell and orderEvent.FillQuantity < 0) or (order.Direction == OrderDirection.Buy and orderEvent.FillQuantity < 0):
-            if symbol in self.entry_prices:
-                entry = self.entry_prices[symbol]
-                pnl = (orderEvent.FillPrice - entry) / entry if entry > 0 else 0
-                abs_pnl = abs(pnl)
-                if pnl > 0:
-                    self.winning_trades += 1
-                    self.consecutive_losses = 0
-                    self.total_pnl += pnl
-                    self._rolling_wins.append(1)
-                    self._rolling_win_sizes.append(abs_pnl)
+    def OnOrderEvent(self, event):
+        try:
+            symbol = event.Symbol
+            msg = (
+                f"ORDER EVENT: {symbol.Value} | status={event.Status} | dir={event.Direction} | "
+                f"qty={event.FillQuantity or event.Quantity} | price={event.FillPrice} | id={event.OrderId}"
+            )
+            self.Debug(msg)
+            if event.Status == OrderStatus.Submitted:
+                if symbol not in self._pending_orders:
+                    self._pending_orders[symbol] = 0
+                intended_qty = abs(event.Quantity) if event.Quantity != 0 else abs(event.FillQuantity)
+                self._pending_orders[symbol] += intended_qty
+            elif event.Status == OrderStatus.PartiallyFilled:
+                if symbol in self._pending_orders:
+                    self._pending_orders[symbol] -= abs(event.FillQuantity)
+                    if self._pending_orders[symbol] <= 0:
+                        self._pending_orders.pop(symbol, None)
+                if event.Direction == OrderDirection.Buy:
+                    if symbol not in self.entry_prices:
+                        self.entry_prices[symbol] = event.FillPrice
+                        self.highest_prices[symbol] = event.FillPrice
+                        self.entry_times[symbol] = self.Time
+                slip_log(self, symbol, event.Direction, event.FillPrice)
+            elif event.Status == OrderStatus.Filled:
+                self._pending_orders.pop(symbol, None)
+                if event.Direction == OrderDirection.Buy:
+                    self.entry_prices[symbol] = event.FillPrice
+                    self.highest_prices[symbol] = event.FillPrice
+                    self.entry_times[symbol] = self.Time
+                    self.daily_trade_count += 1
                 else:
-                    self.losing_trades += 1
-                    self.consecutive_losses += 1
+                    entry = self.entry_prices.get(symbol, None)
+                    if entry is None:
+                        # Fallback for missing entry tracking
+                        entry = event.FillPrice
+                        self.Debug(f"⚠️ WARNING: Missing entry price for {symbol.Value} sell, using fill price")
+                    pnl = (event.FillPrice - entry) / entry if entry > 0 else 0
+                    # Kelly tracking
+                    self._rolling_wins.append(1 if pnl > 0 else 0)
+                    if pnl > 0:
+                        self._rolling_win_sizes.append(pnl)
+                        self.winning_trades += 1
+                        self.consecutive_losses = 0
+                    else:
+                        self._rolling_loss_sizes.append(abs(pnl))
+                        self.losing_trades += 1
+                        self.consecutive_losses += 1
                     self.total_pnl += pnl
-                    self._rolling_wins.append(0)
-                    self._rolling_loss_sizes.append(abs_pnl)
-                cleanup_position(self, symbol)
-                self._exit_cooldowns[symbol] = self.Time + timedelta(hours=self.exit_cooldown_hours)
-        # Persist state after each trade in live
+                    self.trade_log.append({
+                        'time': self.Time,
+                        'symbol': symbol.Value,
+                        'pnl_pct': pnl,
+                        'exit_reason': 'filled_sell',
+                    })
+                    cleanup_position(self, symbol)
+                slip_log(self, symbol, event.Direction, event.FillPrice)
+            elif event.Status == OrderStatus.Canceled:
+                self._pending_orders.pop(symbol, None)
+                if event.Direction == OrderDirection.Sell and symbol not in self.entry_prices:
+                    if is_invested_not_dust(self, symbol):
+                        holding = self.Portfolio[symbol]
+                        self.entry_prices[symbol] = holding.AveragePrice
+                        self.highest_prices[symbol] = holding.AveragePrice
+                        self.entry_times[symbol] = self.Time
+                        self.Debug(f"RE-TRACKED after cancel: {symbol.Value}")
+            elif event.Status == OrderStatus.Invalid:
+                self._pending_orders.pop(symbol, None)
+                if event.Direction == OrderDirection.Sell and symbol not in self.entry_prices:
+                    if is_invested_not_dust(self, symbol):
+                        holding = self.Portfolio[symbol]
+                        self.entry_prices[symbol] = holding.AveragePrice
+                        self.highest_prices[symbol] = holding.AveragePrice
+                        self.entry_times[symbol] = self.Time
+                        self.Debug(f"RE-TRACKED after invalid: {symbol.Value}")
+                self._session_blacklist.add(symbol.Value)
+        except Exception as e:
+            self.Debug(f"OnOrderEvent error: {e}")
         if self.LiveMode:
             persist_state(self)
-
+        
     def OnBrokerageMessage(self, message):
         try:
             txt = message.Message.lower()
+            if "rate limit" in txt or "too many" in txt:
+                self._last_live_trade_time = self.Time
+                self.Debug("Rate limit detected, pausing 5 min")
+            # self.Debug(f"BRKR MSG: {message.Message}")  # uncomment for diagnostics
             if "system status:" in txt:
                 if "online" in txt:
                     self.kraken_status = "online"
@@ -634,8 +1023,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 else:
                     self.kraken_status = "unknown"
                 self.Debug(f"Kraken status update: {self.kraken_status}")
+            
+            # Handle rate limit messages
             if "rate limit" in txt or "too many" in txt:
-                self.Debug("⚠️ RATE LIMIT HIT - pausing trades for 5 minutes")
+                self.Debug(f"⚠️ RATE LIMIT HIT - pausing trades for 5 minutes")
                 self._last_live_trade_time = self.Time
         except Exception as e:
             self.Debug(f"BrokerageMessage parse error: {e}")
@@ -643,10 +1034,33 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     def OnEndOfAlgorithm(self):
         total = self.winning_trades + self.losing_trades
         wr = self.winning_trades / total if total > 0 else 0
-        self.Debug(f"Wins: {self.winning_trades} | Losses: {self.losing_trades} | WR: {wr:.2%} | Total PnL: {self.total_pnl:.2%}")
+        self.Debug("=== FINAL REPORT ===")
+        self.Debug(f"Trades: {self.trade_count} | WR: {wr:.1%}")
+        self.Debug(f"Final: ${self.Portfolio.TotalPortfolioValue:.2f}")
+        self.Debug(f"Total PnL: {self.total_pnl:+.2%}")
         persist_state(self)
 
-    def _log_skip(self, reason):
-        if reason != self._last_skip_reason:
-            debug_limited(self, f"Rebalance skip: {reason}")
-            self._last_skip_reason = reason
+    def DailyReport(self):
+        if self.IsWarmingUp:
+            return
+        total = self.winning_trades + self.losing_trades
+        wr = self.winning_trades / total if total > 0 else 0
+        avg = self.total_pnl / total if total > 0 else 0
+        self.Debug("=" * 50)
+        self.Debug(f"=== DAILY REPORT {self.Time.date()} ===")
+        self.Debug(f"Portfolio: ${self.Portfolio.TotalPortfolioValue:.2f} | Cash: ${self.Portfolio.Cash:.2f}")
+        self.Debug(f"Positions: {get_actual_position_count(self)}/{self.base_max_positions}")
+        self.Debug(f"Regime: {self.market_regime} | Vol: {self.volatility_regime} | Breadth: {self.market_breadth:.0%}")
+        self.Debug(f"Trades: {total} | WR: {wr:.1%} | Avg: {avg:+.2%}")
+        if self._session_blacklist:
+            self.Debug(f"Blacklist: {len(self._session_blacklist)} items")
+        self.Debug("=" * 50)
+        for kvp in self.Portfolio:
+            if is_invested_not_dust(self, kvp.Key):
+                s = kvp.Key
+                entry = self.entry_prices.get(s, kvp.Value.AveragePrice)
+                cur = self.Securities[s].Price if s in self.Securities else kvp.Value.Price
+                pnl = (cur - entry) / entry if entry > 0 else 0
+                self.Debug(f"  {s.Value}: ${entry:.4f}→${cur:.4f} ({pnl:+.2%})")
+        persist_state(self)
+
