@@ -605,7 +605,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         # Log diagnostic summary
         try:
             cash = self.Portfolio.CashBook["USD"].Amount
-        except:
+        except (KeyError, AttributeError):
             cash = self.Portfolio.Cash
         
         debug_limited(self, f"REBALANCE: total={total_symbols} not_blacklist={count_not_blacklisted} "
@@ -735,7 +735,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if len(crypto['recent_net_scores']) >= 2:
                 # Only need 1 out of last 2 scores above threshold (was 2 out of 3)
                 above_threshold_count = sum(1 for score in list(crypto['recent_net_scores'])[-2:] if score > threshold_now)
-                if above_threshold_count < 1:
+                if above_threshold_count == 0:
                     reject_recent_net_scores += 1
                     continue
             
