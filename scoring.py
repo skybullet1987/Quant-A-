@@ -42,7 +42,8 @@ class OpusScoringEngine:
             log_tau = np.log(tau)
             poly = np.polyfit(log_lags, log_tau, 1)
             return max(0.0, min(1.0, poly[0]))
-        except:
+        except Exception as e:
+            self.algo.Debug(f"Error in _hurst_exponent: {e}")
             return 0.5
     
     def _fisher_transform(self, prices, period=10):
@@ -60,7 +61,8 @@ class OpusScoringEngine:
             value = 0.66 * ((price_list[-1] - mid) / (rng / 2 + 1e-8))  # 0.66 smooths extreme oscillations
             value = max(-0.999, min(0.999, value))
             return 0.5 * np.log((1 + value) / (1 - value))
-        except:
+        except Exception as e:
+            self.algo.Debug(f"Error in _fisher_transform: {e}")
             return 0.0
     
     def calculate_factor_scores(self, symbol, crypto):
@@ -202,7 +204,8 @@ class OpusScoringEngine:
             scores['multi_timeframe'] = self.calculate_multi_tf_score(crypto)
 
             return scores
-        except:
+        except Exception as e:
+            self.algo.Debug(f"Error in calculate_factor_scores for {symbol.Value}: {e}")
             return None
 
     def calculate_breakout_score(self, crypto):
