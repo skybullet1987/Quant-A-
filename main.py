@@ -1,6 +1,7 @@
 # region imports
 from AlgorithmImports import *
 from execution import *
+from scoring import OpusScoringEngine
 from collections import deque
 import statistics
 import numpy as np
@@ -49,8 +50,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.min_signal_age_hours = self._get_param("signal_decay_min_hours", 6)
         self.cash_reserve_pct = 0.15
 
+        self.ultra_short_period = 3
         self.short_period = 6
         self.medium_period = 24
+        self.trend_period = 48
         self.long_period = 72
         self.lookback = 72
         self.sqrt_annualization = np.sqrt(24 * 365)
@@ -82,12 +85,14 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self._first_post_warmup = True
 
         self.weights = {
-            'relative_strength': 0.25,
-            'volume_momentum': 0.20,
+            'relative_strength': 0.20,
+            'volume_momentum': 0.15,
             'trend_strength': 0.20,
             'mean_reversion': 0.10,
             'liquidity': 0.10,
-            'risk_adjusted_momentum': 0.15,
+            'risk_adjusted_momentum': 0.10,
+            'breakout_score': 0.10,
+            'multi_timeframe': 0.05,
         }
 
         self.peak_value = None
@@ -98,6 +103,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.max_consecutive_losses = 10  # relaxed to avoid unintended lockouts
 
         self.crypto_data = {}
+        self.scoring_engine = OpusScoringEngine(self)
         self.entry_prices = {}
         self.highest_prices = {}
         self.entry_times = {}
@@ -343,9 +349,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             'volume': deque(maxlen=self.lookback),
             'volume_ma': deque(maxlen=self.medium_period),
             'dollar_volume': deque(maxlen=self.lookback),
+            'ema_ultra_short': ExponentialMovingAverage(self.ultra_short_period),
             'ema_short': ExponentialMovingAverage(self.short_period),
             'ema_medium': ExponentialMovingAverage(self.medium_period),
             'ema_long': ExponentialMovingAverage(self.long_period),
+            'ema_trend': ExponentialMovingAverage(self.trend_period),
+            'kama': KaufmanAdaptiveMovingAverage(10, 2, 30),
             'atr': AverageTrueRange(14),
             'volatility': deque(maxlen=self.medium_period),
             'rsi': RelativeStrengthIndex(14),
@@ -355,6 +364,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             'recent_net_scores': deque(maxlen=3),
             'spreads': deque(maxlen=self.spread_median_window),
             'trail_stop': None,
+            'highs': deque(maxlen=self.long_period),
+            'lows': deque(maxlen=self.long_period),
+            'bb_upper': deque(maxlen=self.short_period),
+            'bb_lower': deque(maxlen=self.short_period),
+            'bb_width': deque(maxlen=self.medium_period),
         }
 
     def OnSecuritiesChanged(self, changes):
@@ -408,8 +422,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     def _update_symbol_data(self, symbol, bar):
         crypto = self.crypto_data[symbol]
         price = float(bar.Close)
+        high = float(bar.High)
+        low = float(bar.Low)
         volume = float(bar.Volume)
         crypto['prices'].append(price)
+        crypto['highs'].append(high)
+        crypto['lows'].append(low)
         if crypto['last_price'] > 0:
             ret = (price - crypto['last_price']) / crypto['last_price']
             crypto['returns'].append(ret)
@@ -418,9 +436,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         crypto['dollar_volume'].append(price * volume)
         if len(crypto['volume']) >= self.short_period:
             crypto['volume_ma'].append(np.mean(list(crypto['volume'])[-self.short_period:]))
+        crypto['ema_ultra_short'].Update(bar.EndTime, price)
         crypto['ema_short'].Update(bar.EndTime, price)
         crypto['ema_medium'].Update(bar.EndTime, price)
         crypto['ema_long'].Update(bar.EndTime, price)
+        crypto['ema_trend'].Update(bar.EndTime, price)
+        crypto['kama'].Update(bar.EndTime, price)
         crypto['atr'].Update(bar)
         if len(crypto['returns']) >= 10:
             crypto['volatility'].append(np.std(list(crypto['returns'])[-10:]))
@@ -430,10 +451,14 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             btc_ret = np.sum(list(self.btc_returns)[-self.short_period:])
             crypto['rs_vs_btc'].append(coin_ret - btc_ret)
         if len(crypto['prices']) >= self.medium_period:
-            prices_arr = np.array(list(crypto['prices']))
+            prices_arr = np.array(list(crypto['prices'])[-self.medium_period:])
             std = np.std(prices_arr)
+            mean = np.mean(prices_arr)
             if std > 0:
-                crypto['zscore'].append((price - np.mean(prices_arr)) / std)
+                crypto['zscore'].append((price - mean) / std)
+                crypto['bb_upper'].append(mean + 2 * std)
+                crypto['bb_lower'].append(mean - 2 * std)
+                crypto['bb_width'].append(4 * std / mean if mean > 0 else 0)
         sp = get_spread_pct(self, symbol)
         if sp is not None:
             crypto['spreads'].append(sp)
@@ -586,13 +611,17 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 continue
             count_ready += 1
             
-            factor_scores = self._calculate_factor_scores(symbol, crypto)
+            factor_scores = self.scoring_engine.calculate_factor_scores(symbol, crypto)
             if not factor_scores:
                 continue
             count_scored += 1
             
-            composite_score = self._calculate_composite_score(factor_scores)
-            net_score = self._apply_fee_adjustment(composite_score)
+            composite_score = self.scoring_engine.calculate_composite_score(factor_scores)
+            net_score = self.scoring_engine.apply_fee_adjustment(composite_score)
+            
+            # Populate recent_net_scores for persistence filter (Fix 3)
+            crypto['recent_net_scores'].append(net_score)
+            
             if net_score > threshold_now:
                 count_above_thresh += 1
                 scores.append({
@@ -733,7 +762,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             
             # RELAXED: recent_net_scores confirmation gate
             # Changed from 2-of-3 to 1-of-2 confirmation for live hourly data
-            crypto['recent_net_scores'].append(net_score)
             if len(crypto['recent_net_scores']) >= 2:
                 # Only need 1 out of last 2 scores above threshold (was 2 out of 3)
                 above_threshold_count = sum(1 for score in list(crypto['recent_net_scores'])[-2:] if score > threshold_now)
@@ -742,7 +770,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     continue
             
             vol = self._annualized_vol(crypto)
-            size = self._calculate_position_size(comp_score, threshold_now, vol)
+            # Use scoring engine's position sizing if available, otherwise fallback to inline method
+            if hasattr(self.scoring_engine, 'calculate_position_size'):
+                size = self.scoring_engine.calculate_position_size(comp_score, threshold_now, vol)
+            else:
+                size = self._calculate_position_size(comp_score, threshold_now, vol)
             size = min(size, effective_size_cap)
             if self.volatility_regime == "high":
                 size *= 0.7
@@ -824,99 +856,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
     def _is_ready(self, c):
         return len(c['prices']) >= self.medium_period and c['rsi'].IsReady
-
-    def _calculate_factor_scores(self, symbol, crypto):
-        try:
-            scores = {}
-            if len(crypto['rs_vs_btc']) >= 3:
-                scores['relative_strength'] = self._normalize(np.mean(list(crypto['rs_vs_btc'])[-3:]), -0.05, 0.05)
-            else:
-                scores['relative_strength'] = 0.5
-            if len(crypto['volume_ma']) >= 2 and len(crypto['returns']) >= 3:
-                vol_ma_prev = crypto['volume_ma'][-2] if len(crypto['volume_ma']) >= 2 else 1
-                vol_trend = (crypto['volume_ma'][-1] / (vol_ma_prev + 1e-8)) - 1
-                price_trend = np.mean(list(crypto['returns'])[-3:])
-                if vol_trend > 0 and price_trend > 0:
-                    scores['volume_momentum'] = min(0.5 + vol_trend * 5 + price_trend * 25, 1.0)
-                elif price_trend > 0:
-                    scores['volume_momentum'] = 0.55
-                else:
-                    scores['volume_momentum'] = 0.3
-            else:
-                scores['volume_momentum'] = 0.5
-            if crypto['ema_short'].IsReady:
-                s, m, l = crypto['ema_short'].Current.Value, crypto['ema_medium'].Current.Value, crypto['ema_long'].Current.Value
-                if s > m > l:
-                    scores['trend_strength'] = min(0.6 + ((s - l) / l) * 10, 1.0)
-                elif s > m:
-                    scores['trend_strength'] = 0.6
-                elif s < m < l:
-                    scores['trend_strength'] = 0.2
-                else:
-                    scores['trend_strength'] = 0.4
-            else:
-                scores['trend_strength'] = 0.5
-            if len(crypto['zscore']) >= 1:
-                z = crypto['zscore'][-1]
-                rsi = crypto['rsi'].Current.Value
-                if z < -1.5 and rsi < 35:
-                    scores['mean_reversion'] = 0.9
-                elif z < -1.0 and rsi < 40:
-                    scores['mean_reversion'] = 0.75
-                elif z > 2.0 or rsi > 75:
-                    scores['mean_reversion'] = 0.1
-                else:
-                    scores['mean_reversion'] = 0.5
-            else:
-                scores['mean_reversion'] = 0.5
-            if len(crypto['dollar_volume']) >= 12:
-                avg = np.mean(list(crypto['dollar_volume'])[-12:])
-                if avg > 10000:
-                    scores['liquidity'] = 0.9
-                elif avg > 5000:
-                    scores['liquidity'] = 0.7
-                elif avg > 1000:
-                    scores['liquidity'] = 0.5
-                else:
-                    scores['liquidity'] = 0.2
-            else:
-                scores['liquidity'] = 0.5
-            if len(crypto['returns']) >= self.medium_period:
-                std = np.std(list(crypto['returns'])[-self.medium_period:])
-                if std > 1e-10:
-                    sharpe = np.mean(list(crypto['returns'])[-self.medium_period:]) / std
-                    scores['risk_adjusted_momentum'] = self._normalize(sharpe, -1, 1)
-                else:
-                    scores['risk_adjusted_momentum'] = 0.5
-            else:
-                scores['risk_adjusted_momentum'] = 0.5
-            return scores
-        except:
-            return None
-
-    def _normalize(self, v, mn, mx):
-        return max(0, min(1, (v - mn) / (mx - mn)))
-
-    def _calculate_composite_score(self, factors):
-        score = sum(factors.get(f, 0.5) * w for f, w in self.weights.items())
-        if self.market_regime == "bear":
-            score *= 0.75
-        if self.volatility_regime == "high":
-            score *= 0.85
-        if self.market_breadth > 0.7:
-            score *= 1.05
-        elif self.market_breadth < 0.3:
-            score *= 0.85
-        return min(score, 1.0)
-
-    def _apply_fee_adjustment(self, score):
-        return score - (self.expected_round_trip_fees * 1.1 + self.fee_slippage_buffer)
-
-    def _calculate_position_size(self, score, threshold, asset_vol_ann):
-        conviction_mult = max(0.8, min(1.2, 0.8 + (score - threshold) * 2))
-        vol_floor = max(asset_vol_ann if asset_vol_ann else 0.05, 0.05)
-        risk_mult = max(0.8, min(1.2, self.target_position_ann_vol / vol_floor))
-        return self.position_size_pct * conviction_mult * risk_mult
 
     def CheckExits(self):
         if self.IsWarmingUp:
@@ -1000,13 +939,13 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if not tag and hours >= self.min_signal_age_hours:
             try:
                 if crypto and self._is_ready(crypto):
-                    factors = self._calculate_factor_scores(symbol, crypto)
+                    factors = self.scoring_engine.calculate_factor_scores(symbol, crypto)
                     if factors:
-                        comp = self._calculate_composite_score(factors)
-                        net = self._apply_fee_adjustment(comp)
+                        comp = self.scoring_engine.calculate_composite_score(factors)
+                        net = self.scoring_engine.apply_fee_adjustment(comp)
                         if net < self._get_threshold() - self.signal_decay_buffer:
                             tag = "Signal Decay"
-            except:
+            except Exception as e:
                 pass
         if tag:
             if price * abs(holding.Quantity) < min_notional_usd * 0.9:
