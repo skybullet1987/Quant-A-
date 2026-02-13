@@ -144,7 +144,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.last_log_time = None
 
         self.min_volume_usd = 500
-        self.max_universe_size = 1000
+        self.max_universe_size = 300
 
         # Kraken status gate:
         # - "online": trade
@@ -545,14 +545,17 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 scores['volume_momentum'] = 0.5
             if crypto['ema_short'].IsReady:
                 s, m, l = crypto['ema_short'].Current.Value, crypto['ema_medium'].Current.Value, crypto['ema_long'].Current.Value
-                if s > m > l:
-                    scores['trend_strength'] = min(0.6 + ((s - l) / l) * 10, 1.0)
-                elif s > m:
-                    scores['trend_strength'] = 0.6
-                elif s < m < l:
-                    scores['trend_strength'] = 0.2
+                if l > 0:  # ← added guard
+                    if s > m > l:
+                        scores['trend_strength'] = min(0.6 + ((s - l) / l) * 10, 1.0)
+                    elif s > m:
+                        scores['trend_strength'] = 0.6
+                    elif s < m < l:
+                        scores['trend_strength'] = 0.2
+                    else:
+                        scores['trend_strength'] = 0.4
                 else:
-                    scores['trend_strength'] = 0.4
+                    scores['trend_strength'] = 0.5  # ← safe fallback when EMA-long is zero
             else:
                 scores['trend_strength'] = 0.5
             if len(crypto['zscore']) >= 1:
@@ -1189,4 +1192,3 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 pnl = (cur - entry) / entry if entry > 0 else 0
                 self.Debug(f"  {s.Value}: ${entry:.4f}→${cur:.4f} ({pnl:+.2%})")
         persist_state(self)
-
