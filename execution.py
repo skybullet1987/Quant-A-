@@ -92,7 +92,9 @@ def get_min_quantity(algo, symbol):
                 min_size = sec.SymbolProperties.MinimumOrderSize
                 if min_size is not None and min_size > 0:
                     return float(min_size)
-    except: pass
+    except Exception as e:
+        algo.Debug(f"Error getting min quantity for {ticker}: {e}")
+        pass
     if ticker in KRAKEN_MIN_QTY_FALLBACK:
         return KRAKEN_MIN_QTY_FALLBACK[ticker]
     return estimate_min_qty(algo, symbol)
@@ -101,7 +103,9 @@ def get_min_quantity(algo, symbol):
 def estimate_min_qty(algo, symbol):
     try:
         price = algo.Securities[symbol].Price if symbol in algo.Securities else 0
-    except: price = 0
+    except Exception as e:
+        algo.Debug(f"Error getting price for min qty estimate: {e}")
+        price = 0
     if price <= 0: return 50.0
     if price < 0.001: return 1000.0
     elif price < 0.01: return 500.0
@@ -121,7 +125,8 @@ def get_min_notional_usd(algo, symbol):
         min_qty = get_min_quantity(algo, symbol)
         implied = price * min_qty if price > 0 else fallback
         return max(fallback, implied, algo.min_notional)
-    except:
+    except Exception as e:
+        algo.Debug(f"Error in get_min_notional_usd for {symbol.Value}: {e}")
         return max(fallback, algo.min_notional)
 
 
@@ -131,7 +136,9 @@ def round_quantity(algo, symbol, quantity):
         if lot_size is not None and lot_size > 0:
             return float(int(quantity / lot_size) * lot_size)
         return quantity
-    except: return quantity
+    except Exception as e:
+        algo.Debug(f"Error rounding quantity for {symbol.Value}: {e}")
+        return quantity
 
 
 def smart_liquidate(algo, symbol, tag="Liquidate"):
@@ -278,7 +285,8 @@ def get_spread_pct(algo, symbol):
             mid = 0.5 * (bid + ask)
             if mid > 0:
                 return (ask - bid) / mid
-    except:
+    except Exception as e:
+        algo.Debug(f"Error getting spread for {symbol.Value}: {e}")
         pass
     return None
 
@@ -324,7 +332,8 @@ def sync_existing_positions(algo):
         if symbol not in algo.Securities:
             try:
                 algo.AddCrypto(ticker, Resolution.Hour, Market.Kraken)
-            except:
+            except Exception as e:
+                algo.Debug(f"Error adding crypto {ticker}: {e}")
                 continue
         algo.entry_prices[symbol] = holding.AveragePrice
         algo.highest_prices[symbol] = holding.AveragePrice
@@ -417,7 +426,8 @@ def slip_log(algo, symbol, direction, fill_price):
         # Live slippage alert for unusually high slippage
         if algo.LiveMode and abs(slip) > algo.slip_outlier_threshold:
             algo.Debug(f"⚠️ HIGH SLIPPAGE: {symbol.Value} | {abs(slip):.4%} | dir={direction}")
-    except:
+    except Exception as e:
+        algo.Debug(f"Error in slip_log for {symbol.Value}: {e}")
         pass
 
 
@@ -473,7 +483,8 @@ def cleanup_object_store(algo):
                 try:
                     algo.ObjectStore.Delete(k)
                     n += 1
-                except:
+                except Exception as e:
+                    algo.Debug(f"Error deleting key {k}: {e}")
                     pass
         if n:
             algo.Debug(f"Cleaned {n} keys")
@@ -489,7 +500,8 @@ def live_safety_checks(algo):
     # Check if we have minimum viable cash
     try:
         cash = algo.Portfolio.CashBook["USD"].Amount
-    except:
+    except Exception as e:
+        algo.Debug(f"Error getting cash from CashBook, using Portfolio.Cash: {e}")
         cash = algo.Portfolio.Cash
     
     if cash < 2.0:

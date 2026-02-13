@@ -165,8 +165,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         try:
             btc = self.AddCrypto("BTCUSD", Resolution.Hour, Market.Kraken)
             self.btc_symbol = btc.Symbol
-        except:
-            self.Debug("Warning: Could not add BTC")
+        except Exception as e:
+            self.Debug(f"Warning: Could not add BTC - {e}")
 
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(hours=2)), self.Rebalance)
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(hours=1)), self.CheckExits)
@@ -198,7 +198,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if param is not None and param != "":
                 return float(param)
             return default
-        except:
+        except Exception as e:
+            self.Debug(f"Error getting parameter {name}: {e}")
             return default
 
     def EmitInsights(self, *insights):
@@ -301,7 +302,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     def _estimate_min_qty(self, symbol):
         try:
             price = self.Securities[symbol].Price if symbol in self.Securities else 0
-        except: price = 0
+        except Exception as e:
+            self.Debug(f"Error getting price for {symbol.Value}: {e}")
+            price = 0
         if price <= 0: return 50.0
         if price < 0.001: return 1000.0
         elif price < 0.01: return 500.0
@@ -401,7 +404,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 continue
             try:
                 self._update_symbol_data(symbol, data.Bars[symbol])
-            except:
+            except Exception as e:
+                self.Debug(f"Error updating symbol data for {symbol.Value}: {e}")
                 pass
         if self.IsWarmingUp:
             return
