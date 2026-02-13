@@ -253,7 +253,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 continue
             if symbol in self._exit_cooldowns and self.Time < self._exit_cooldowns[symbol]:
                 continue
-            if has_open_orders(self, symbol):
+            # Check if there are non-stale open orders
+            # If all open orders are stale, we should resync anyway
+            if has_non_stale_open_orders(self, symbol):
                 continue
             missing.append(symbol)
         if not missing:

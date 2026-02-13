@@ -205,6 +205,19 @@ def cancel_stale_new_orders(algo):
             order_age = (algo.Time - order_time).total_seconds()
             if order_age > timeout_seconds:
                 algo.Debug(f"Canceling stale: {sym_val} (age: {order_age/60:.1f}m, timeout {timeout_seconds/60:.1f}m)")
+                
+                # Check if this order actually filled (fill event missed)
+                if is_invested_not_dust(algo, order.Symbol):
+                    # Position exists — order filled, we just missed the event
+                    # Re-track instead of blacklisting
+                    algo.Debug(f"STALE ORDER but position exists: {sym_val} — re-tracking")
+                    holding = algo.Portfolio[order.Symbol]
+                    algo.entry_prices[order.Symbol] = holding.AveragePrice
+                    algo.highest_prices[order.Symbol] = holding.AveragePrice
+                    algo.entry_times[order.Symbol] = algo.Time
+                    algo.Transactions.CancelOrder(order.Id)  # Clear the stale order record
+                    continue  # Don't blacklist
+                
                 algo.Transactions.CancelOrder(order.Id)
                 algo._cancel_cooldowns[order.Symbol] = algo.Time + timedelta(minutes=algo.cancel_cooldown_minutes)
                 algo._session_blacklist.add(sym_val)
@@ -235,6 +248,25 @@ def has_open_orders(algo, symbol=None):
     if symbol is None:
         return len(algo.Transactions.GetOpenOrders()) > 0
     return len(algo.Transactions.GetOpenOrders(symbol)) > 0
+
+
+def has_non_stale_open_orders(algo, symbol):
+    """Check if symbol has open orders that are NOT stale (younger than timeout)."""
+    try:
+        orders = algo.Transactions.GetOpenOrders(symbol)
+        if len(orders) == 0:
+            return False
+        timeout_seconds = effective_stale_timeout(algo)
+        for order in orders:
+            order_time = order.Time
+            if order_time.tzinfo is not None:
+                order_time = order_time.replace(tzinfo=None)
+            order_age = (algo.Time - order_time).total_seconds()
+            if order_age <= timeout_seconds:
+                return True  # At least one order is not stale
+        return False  # All orders are stale
+    except:
+        return False
 
 
 def get_spread_pct(algo, symbol):
@@ -332,7 +364,9 @@ def resync_holdings(algo):
             continue
         if symbol in algo._exit_cooldowns and algo.Time < algo._exit_cooldowns[symbol]:
             continue
-        if has_open_orders(algo, symbol):
+        # Check if there are non-stale open orders
+        # If all open orders are stale, we should resync anyway
+        if has_non_stale_open_orders(algo, symbol):
             continue
         missing.append(symbol)
     if not missing:
