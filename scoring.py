@@ -24,6 +24,8 @@ class OpusScoringEngine:
     
     def _normalize(self, v, mn, mx):
         """Normalize value to [0, 1] range."""
+        if mx == mn:
+            return 0.5
         return max(0, min(1, (v - mn) / (mx - mn)))
     
     def _hurst_exponent(self, prices, max_lag=20):
@@ -45,25 +47,6 @@ class OpusScoringEngine:
         except Exception as e:
             self.algo.Debug(f"Error in _hurst_exponent: {e}")
             return 0.5
-    
-    def _fisher_transform(self, prices, period=10):
-        """Compute Fisher Transform for sharper turning point detection."""
-        if len(prices) < period:
-            return 0.0
-        try:
-            price_list = list(prices)[-period:]
-            high = max(price_list)
-            low = min(price_list)
-            rng = high - low
-            if rng <= 0:
-                return 0.0
-            mid = (high + low) / 2
-            value = 0.66 * ((price_list[-1] - mid) / (rng / 2 + 1e-8))  # 0.66 smooths extreme oscillations
-            value = max(-0.999, min(0.999, value))
-            return 0.5 * np.log((1 + value) / (1 - value))
-        except Exception as e:
-            self.algo.Debug(f"Error in _fisher_transform: {e}")
-            return 0.0
     
     def calculate_factor_scores(self, symbol, crypto):
         """

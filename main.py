@@ -2,7 +2,6 @@
 from AlgorithmImports import *
 from execution import *
 from collections import deque
-import statistics
 import numpy as np
 # endregion
 
@@ -153,7 +152,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.kraken_status = "unknown"
 
         self._last_skip_reason = None
-        self._last_live_trade_time = None
 
         self.UniverseSettings.Resolution = Resolution.Hour
         self.AddUniverse(CryptoUniverse.Kraken(self.UniverseFilter))
@@ -294,22 +292,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             self.max_positions = self.base_max_positions
             if old_max != self.base_max_positions:
                 self.Debug(f"PERFORMANCE RECOVERY: max_pos={self.base_max_positions}")
-
-    def _estimate_min_qty(self, symbol):
-        try:
-            price = self.Securities[symbol].Price if symbol in self.Securities else 0
-        except Exception as e:
-            self.Debug(f"Error getting price for {symbol.Value}: {e}")
-            price = 0
-        if price <= 0: return 50.0
-        if price < 0.001: return 1000.0
-        elif price < 0.01: return 500.0
-        elif price < 0.1: return 50.0
-        elif price < 1.0: return 10.0
-        elif price < 10.0: return 5.0
-        elif price < 100.0: return 1.0
-        elif price < 1000.0: return 0.1
-        else: return 0.01
 
     def _cancel_stale_orders(self):
         try:
@@ -876,7 +858,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     continue
             
             vol = self._annualized_vol(crypto)
-            size = self._calculate_position_size(comp_score, threshold_now, vol)
+            size = self._calculate_position_size(net_score, threshold_now, vol)
             size = min(size, effective_size_cap)
             if self.volatility_regime == "high":
                 size *= 0.7
