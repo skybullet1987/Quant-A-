@@ -521,6 +521,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             risk += weight * asset_vol_ann
         return risk
 
+    def _kelly_fraction(self):
+        return kelly_fraction(self)
+
     def _log_skip(self, reason):
         # In live mode, always log to ensure visibility
         if self.LiveMode:
