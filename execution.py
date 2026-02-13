@@ -215,7 +215,7 @@ def cancel_stale_new_orders(algo):
                     algo.entry_prices[order.Symbol] = holding.AveragePrice
                     algo.highest_prices[order.Symbol] = holding.AveragePrice
                     algo.entry_times[order.Symbol] = algo.Time
-                    algo.Transactions.CancelOrder(order.Id)  # Clear the stale order record
+                    algo.Transactions.CancelOrder(order.Id)  # Cancel the stale order
                     continue  # Don't blacklist
                 
                 algo.Transactions.CancelOrder(order.Id)
@@ -265,7 +265,7 @@ def has_non_stale_open_orders(algo, symbol):
             if order_age <= timeout_seconds:
                 return True  # At least one order is not stale
         return False  # All orders are stale
-    except:
+    except Exception:
         return False
 
 
