@@ -519,6 +519,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
     def _normalize(self, v, mn, mx):
         """Normalize value to [0, 1] range."""
+        if mx - mn <= 0:
+            return 0.5  # Return neutral score when range is zero
         return max(0, min(1, (v - mn) / (mx - mn)))
 
     def _calculate_factor_scores(self, symbol, crypto):
@@ -611,7 +613,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     def _calculate_position_size(self, score, threshold, asset_vol_ann):
         """Calculate position size using conviction and volatility, without Kelly fraction."""
         conviction_mult = max(0.8, min(1.2, 0.8 + (score - threshold) * 2))
-        vol_floor = max(asset_vol_ann if asset_vol_ann else 0.05, 0.05)
+        vol_floor = max(asset_vol_ann or 0.05, 0.05)
         risk_mult = max(0.8, min(1.2, self.target_position_ann_vol / vol_floor))
         return self.position_size_pct * conviction_mult * risk_mult
 
