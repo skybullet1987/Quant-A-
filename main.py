@@ -620,7 +620,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 continue
             count_scored += 1
             
-            composite_score = self.scoring_engine.calculate_composite_score(factor_scores)
+            composite_score = self.scoring_engine.calculate_composite_score(factor_scores, crypto)
             net_score = self.scoring_engine.apply_fee_adjustment(composite_score)
             
             # Populate recent_net_scores for persistence filter (Fix 3)
@@ -774,11 +774,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     continue
             
             vol = self._annualized_vol(crypto)
-            # Use scoring engine's position sizing if available, otherwise fallback to inline method
-            if hasattr(self.scoring_engine, 'calculate_position_size'):
-                size = self.scoring_engine.calculate_position_size(comp_score, threshold_now, vol)
-            else:
-                size = self._calculate_position_size(comp_score, threshold_now, vol)
+            size = self.scoring_engine.calculate_position_size(comp_score, threshold_now, vol)
             size = min(size, effective_size_cap)
             if self.volatility_regime == "high":
                 size *= 0.7
@@ -945,7 +941,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 if crypto and self._is_ready(crypto):
                     factors = self.scoring_engine.calculate_factor_scores(symbol, crypto)
                     if factors:
-                        comp = self.scoring_engine.calculate_composite_score(factors)
+                        comp = self.scoring_engine.calculate_composite_score(factors, crypto)
                         net = self.scoring_engine.apply_fee_adjustment(comp)
                         if net < self._get_threshold() - self.signal_decay_buffer:
                             tag = "Signal Decay"
