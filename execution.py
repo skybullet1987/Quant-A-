@@ -269,12 +269,12 @@ def cancel_stale_new_orders(algo):
                 
                 # Only blacklist stale ENTRY orders, not EXIT orders
                 # Exit orders that are stale just get cooldown to allow retry
-                is_exit_order = order.Symbol in algo.entry_prices or (
+                has_position_or_tracked = order.Symbol in algo.entry_prices or (
                     order.Symbol in algo.Portfolio and algo.Portfolio[order.Symbol].Quantity != 0
                 )
                 
-                if is_exit_order:
-                    algo.Debug(f"STALE EXIT ORDER: {sym_val} - setting cooldown, NOT blacklisting")
+                if has_position_or_tracked:
+                    algo.Debug(f"STALE EXIT: {sym_val} - cooldown only, not blacklisted")
                 else:
                     algo._session_blacklist.add(sym_val)
                     algo.Debug(f"⚠️ ZOMBIE ORDER DETECTED: {sym_val} - blacklisted for session")

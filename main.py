@@ -8,22 +8,10 @@ import numpy as np
 
 class SimplifiedCryptoStrategy(QCAlgorithm):
     """
-    Simplified 5-Factor Strategy - v3.0.0 (qa-logic + opus-execution)
-    Key protections (as requested):
-    - Exchange-status gate: trade only when Kraken status is OK (maintenance/cancel_only are blocked; unknown falls back to online after warmup).
-    - Stale handling: stale cancels only when online; blacklist symbol on zombie, skip reprocessing blacklisted.
-    - Liquidity/impact: live entry liquidity floor $5k over last 6 bars; impact cap 5% (scale >3%).
-    - Spread guard: 1.5% cap in high-vol/sideways; median-widen check.
-    - Min notional: $5 (tuned for small account); raise later if equity grows.
-    - Cash reserve: 15% (adjust to 10% only if hitting insufficient BP).
-    - Open-order cap: 2 concurrent.
-    - Session blacklist cleared daily.
-    - Logging limited to avoid rate limits.
-    Other features:
-    - Size cap live in high-vol/sideways: 25%.
-    - Faster time stop: exit after 24h if PnL < +1%.
-    - Zombie auto-blacklist; ARCUSD, PAXGUSD added to blacklist.
-    - Insights suppressed; ObjectStore writes disabled.
+    Simplified 5-Factor Strategy - v3.0.0
+    Exchange-status gate, stale handling, liquidity/impact guards, spread cap 1.5%, min notional $5,
+    cash reserve 15%, open-order cap 2, session blacklist daily reset, size cap 25% in high-vol/sideways,
+    time stop 24h if PnL<+1%, zombie auto-blacklist, insights suppressed, ObjectStore writes disabled.
     """
 
     def Initialize(self):
@@ -79,10 +67,14 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.open_orders_cash_threshold = 0.5  # Exit early if ≥50% cash reserved for pending orders
         
         # Order fill verification settings
-        self.order_fill_check_threshold_seconds = 120  # Check after 2 minutes
-        self.order_timeout_seconds = 300  # Cancel after 5 minutes
-        self.resync_log_interval_seconds = 1800  # Log every 30 minutes
-        self.portfolio_mismatch_threshold = 0.10  # 10% tolerance
+        self.order_fill_check_threshold_seconds = 120
+        self.order_timeout_seconds = 300
+        self.resync_log_interval_seconds = 1800
+        self.portfolio_mismatch_threshold = 0.10
+        self.portfolio_mismatch_min_dollars = 1.00
+        self.portfolio_mismatch_cooldown_seconds = 3600
+        self.retry_pending_cooldown_seconds = 120
+        self.rate_limit_cooldown_minutes = 10
 
         self._positions_synced = False
         self._session_blacklist = set()
@@ -181,7 +173,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.At(0, 0), self.ResetDailyCounters)
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(hours=6)), self.ReviewPerformance)
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.At(12, 0), self.HealthCheck)
-        # Hourly live resync to catch fills that may have been missed by event stream
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(minutes=5)), self.ResyncHoldings)
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(minutes=2)), self.VerifyOrderFills)
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(minutes=15)), self.PortfolioSanityCheck)
@@ -194,12 +185,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if self.LiveMode:
             cleanup_object_store(self)
             load_persisted_state(self)
-            self.Debug("=" * 50)
-            self.Debug("=== LIVE TRADING (SAFE) v3.0.0 (qa-logic + opus-execution) ===")
-            self.Debug(f"Capital: ${self.Portfolio.Cash:.2f}")
-            self.Debug(f"Max positions: {self.max_positions}")
-            self.Debug(f"Position size: {self.position_size_pct:.0%}")
-            self.Debug("=" * 50)
+            self.Debug("=== LIVE v3.0.0 ===")
+            self.Debug(f"Capital: ${self.Portfolio.Cash:.2f} | Max pos: {self.max_positions} | Size: {self.position_size_pct:.0%}")
 
     def _get_param(self, name, default):
         try:
@@ -312,8 +299,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         # Process pending retries first
         for symbol in list(self._retry_pending.keys()):
             cancel_time = self._retry_pending[symbol]
-            # Wait at least 2 minutes after cancel before retrying
-            if (current_time - cancel_time).total_seconds() >= 120:
+            if (current_time - cancel_time).total_seconds() >= self.retry_pending_cooldown_seconds:
                 # Check if position exists now (cancel failed or order filled after cancel)
                 if symbol in self.Portfolio and self.Portfolio[symbol].Invested:
                     # Position exists, don't retry - just track it
@@ -348,6 +334,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     try:
                         order = self.Transactions.GetOrderById(order_id)
                         if order is not None and order.Status == OrderStatus.Filled:
+                            # Confirmed: order filled but event was missed
                             # Confirmed: order filled but event was missed
                             holding = self.Portfolio[symbol]
                             entry_price = holding.AveragePrice
@@ -426,11 +413,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         abs_diff = abs(total_qc - expected)
         if total_qc > 1.0:
             pct_diff = abs_diff / total_qc
-            should_warn = pct_diff > self.portfolio_mismatch_threshold and abs_diff > 1.0
-            
+            should_warn = pct_diff > self.portfolio_mismatch_threshold and abs_diff > self.portfolio_mismatch_min_dollars
             if should_warn:
-                # Check cooldown
-                if self._last_mismatch_warning is None or (self.Time - self._last_mismatch_warning).total_seconds() >= 3600:
+                if self._last_mismatch_warning is None or (self.Time - self._last_mismatch_warning).total_seconds() >= self.portfolio_mismatch_cooldown_seconds:
                     self.Debug(f"⚠️ PORTFOLIO MISMATCH: QC total=${total_qc:.2f} but cash+tracked=${expected:.2f} (diff=${abs_diff:.2f})")
                     self._last_mismatch_warning = self.Time
 
@@ -1327,10 +1312,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     self.kraken_status = "unknown"
                 self.Debug(f"Kraken status update: {self.kraken_status}")
             
-            # Handle rate limit messages - pause for 10 minutes
             if "rate limit" in txt or "too many" in txt:
-                self.Debug(f"⚠️ RATE LIMIT HIT - pausing trades for 10 minutes")
-                self._rate_limit_until = self.Time + timedelta(minutes=10)
+                self.Debug(f"⚠️ RATE LIMIT - pausing {self.rate_limit_cooldown_minutes}min")
+                self._rate_limit_until = self.Time + timedelta(minutes=self.rate_limit_cooldown_minutes)
                 self._last_live_trade_time = self.Time
         except Exception as e:
             self.Debug(f"BrokerageMessage parse error: {e}")
@@ -1338,10 +1322,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     def OnEndOfAlgorithm(self):
         total = self.winning_trades + self.losing_trades
         wr = self.winning_trades / total if total > 0 else 0
-        self.Debug("=== FINAL REPORT ===")
+        self.Debug("=== FINAL ===")
         self.Debug(f"Trades: {self.trade_count} | WR: {wr:.1%}")
         self.Debug(f"Final: ${self.Portfolio.TotalPortfolioValue:.2f}")
-        self.Debug(f"Total PnL: {self.total_pnl:+.2%}")
+        self.Debug(f"PnL: {self.total_pnl:+.2%}")
         persist_state(self)
 
     def DailyReport(self):
@@ -1350,15 +1334,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         total = self.winning_trades + self.losing_trades
         wr = self.winning_trades / total if total > 0 else 0
         avg = self.total_pnl / total if total > 0 else 0
-        self.Debug("=" * 50)
-        self.Debug(f"=== DAILY REPORT {self.Time.date()} ===")
+        self.Debug(f"=== DAILY {self.Time.date()} ===")
         self.Debug(f"Portfolio: ${self.Portfolio.TotalPortfolioValue:.2f} | Cash: ${self.Portfolio.Cash:.2f}")
-        self.Debug(f"Positions: {get_actual_position_count(self)}/{self.base_max_positions}")
-        self.Debug(f"Regime: {self.market_regime} | Vol: {self.volatility_regime} | Breadth: {self.market_breadth:.0%}")
+        self.Debug(f"Pos: {get_actual_position_count(self)}/{self.base_max_positions} | {self.market_regime} {self.volatility_regime} {self.market_breadth:.0%}")
         self.Debug(f"Trades: {total} | WR: {wr:.1%} | Avg: {avg:+.2%}")
         if self._session_blacklist:
-            self.Debug(f"Blacklist: {len(self._session_blacklist)} items")
-        self.Debug("=" * 50)
+            self.Debug(f"Blacklist: {len(self._session_blacklist)}")
         for kvp in self.Portfolio:
             if is_invested_not_dust(self, kvp.Key):
                 s = kvp.Key
