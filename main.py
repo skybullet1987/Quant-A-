@@ -8,10 +8,11 @@ import numpy as np
 
 class SimplifiedCryptoStrategy(QCAlgorithm):
     """
-    Simplified 5-Factor Strategy - v3.0.0
-    Exchange-status gate, stale handling, liquidity/impact guards, spread cap 1.5%, min notional $5,
-    cash reserve 15%, open-order cap 2, session blacklist daily reset, size cap 25% in high-vol/sideways,
-    time stop 24h if PnL<+1%, zombie auto-blacklist, insights suppressed, ObjectStore writes disabled.
+    Simplified 5-Factor Strategy - v4.0.0
+    Exchange-status gate, stale handling, liquidity/impact guards, spread cap 3%, min notional $5,
+    cash reserve 10%, open-order cap 3, session blacklist daily reset, size cap 25% in high-vol/sideways,
+    time stop 18h if PnL<+1%, zombie auto-blacklist, insights suppressed, ObjectStore writes disabled.
+    Aggressive tuning + 10 structural optimizations applied.
     """
 
     def Initialize(self):
@@ -19,22 +20,22 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.SetCash(20)
         self.SetBrokerageModel(BrokerageName.Kraken, AccountType.Cash)
 
-        self.threshold_bull = self._get_param("threshold_bull", 0.50)
-        self.threshold_bear = self._get_param("threshold_bear", 0.62)
-        self.threshold_sideways = self._get_param("threshold_sideways", 0.55)
-        self.threshold_high_vol = self._get_param("threshold_high_vol", 0.58)
-        self.trailing_activation = self._get_param("trailing_activation", 0.05)
-        self.trailing_stop_pct = self._get_param("trailing_stop_pct", 0.03)
-        self.base_stop_loss = self._get_param("base_stop_loss", 0.05)
-        self.base_take_profit = self._get_param("base_take_profit", 0.12)
-        self.atr_sl_mult = self._get_param("atr_sl_mult", 1.6)
-        self.atr_tp_mult = self._get_param("atr_tp_mult", 3.0)
+        self.threshold_bull = self._get_param("threshold_bull", 0.42)
+        self.threshold_bear = self._get_param("threshold_bear", 0.52)
+        self.threshold_sideways = self._get_param("threshold_sideways", 0.47)
+        self.threshold_high_vol = self._get_param("threshold_high_vol", 0.50)
+        self.trailing_activation = self._get_param("trailing_activation", 0.035)
+        self.trailing_stop_pct = self._get_param("trailing_stop_pct", 0.02)
+        self.base_stop_loss = self._get_param("base_stop_loss", 0.04)
+        self.base_take_profit = self._get_param("base_take_profit", 0.08)
+        self.atr_sl_mult = self._get_param("atr_sl_mult", 1.3)
+        self.atr_tp_mult = self._get_param("atr_tp_mult", 2.2)
 
-        self.target_position_ann_vol = self._get_param("target_position_ann_vol", 0.25)
-        self.portfolio_vol_cap = self._get_param("portfolio_vol_cap", 0.35)
-        self.signal_decay_buffer = self._get_param("signal_decay_buffer", 0.05)
-        self.min_signal_age_hours = self._get_param("signal_decay_min_hours", 6)
-        self.cash_reserve_pct = 0.15
+        self.target_position_ann_vol = self._get_param("target_position_ann_vol", 0.35)
+        self.portfolio_vol_cap = self._get_param("portfolio_vol_cap", 0.45)
+        self.signal_decay_buffer = self._get_param("signal_decay_buffer", 0.03)
+        self.min_signal_age_hours = self._get_param("signal_decay_min_hours", 4)
+        self.cash_reserve_pct = 0.10
 
         self.ultra_short_period = 3
         self.short_period = 6
@@ -45,25 +46,25 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.sqrt_annualization = np.sqrt(24 * 365)
         self.min_asset_vol_floor = 0.05
 
-        self.base_max_positions = 2
+        self.base_max_positions = 3
         self.max_positions = self.base_max_positions
-        self.position_size_pct = 0.45
+        self.position_size_pct = 0.55
         self.min_notional = 5.0  # lowered per request
         self.min_price_usd = 0.005
 
-        self.expected_round_trip_fees = 0.0026
-        self.fee_slippage_buffer = 0.003
+        self.expected_round_trip_fees = 0.0020
+        self.fee_slippage_buffer = 0.002
 
-        self.max_spread_pct = 0.02
+        self.max_spread_pct = 0.03
         self.spread_median_window = 12
-        self.spread_widen_mult = 1.5
-        self.skip_hours_utc = [2, 3, 4, 5]
-        self.max_daily_trades = 6
+        self.spread_widen_mult = 2.5
+        self.skip_hours_utc = [3, 4]
+        self.max_daily_trades = 10
         self.daily_trade_count = 0
         self.last_trade_date = None
         self.stale_order_timeout_seconds = 300
         self.live_stale_order_timeout_seconds = 900
-        self.max_concurrent_open_orders = 2
+        self.max_concurrent_open_orders = 3
         self.open_orders_cash_threshold = 0.5  # Exit early if ≥50% cash reserved for pending orders
         
         # Order fill verification settings
@@ -97,11 +98,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         }
 
         self.peak_value = None
-        self.max_drawdown_limit = 0.25
+        self.max_drawdown_limit = 0.30
         self.drawdown_cooldown = 0
-        self.cooldown_hours = 24
+        self.cooldown_hours = 12
         self.consecutive_losses = 0
-        self.max_consecutive_losses = 10  # relaxed to avoid unintended lockouts
+        self.max_consecutive_losses = 15  # relaxed to avoid unintended lockouts
 
         self.crypto_data = {}
         self.entry_prices = {}
@@ -112,7 +113,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self._pending_orders = {}
         self._cancel_cooldowns = {}
         self._exit_cooldowns = {}
-        self.exit_cooldown_hours = 2
+        self.exit_cooldown_hours = 1
         self.cancel_cooldown_minutes = 1
 
         self.trailing_grace_hours = 2
@@ -167,7 +168,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         except Exception as e:
             self.Debug(f"Warning: Could not add BTC - {e}")
 
-        self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(hours=2)), self.Rebalance)
+        self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(hours=1)), self.Rebalance)
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(hours=1)), self.CheckExits)
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.At(0, 1), self.DailyReport)
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.At(0, 0), self.ResetDailyCounters)
@@ -185,7 +186,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if self.LiveMode:
             cleanup_object_store(self)
             load_persisted_state(self)
-            self.Debug("=== LIVE v3.0.0 ===")
+            self.Debug("=== LIVE TRADING (SAFE) v4.0.0 (aggressive + structural) ===")
             self.Debug(f"Capital: ${self.Portfolio.Cash:.2f} | Max pos: {self.max_positions} | Size: {self.position_size_pct:.0%}")
 
     def _get_param(self, name, default):
@@ -426,17 +427,17 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     self._last_mismatch_warning = self.Time
 
     def ReviewPerformance(self):
-        if self.IsWarmingUp or len(self.trade_log) < 5: return
-        recent_trades = self.trade_log[-10:] if len(self.trade_log) >= 10 else self.trade_log
+        if self.IsWarmingUp or len(self.trade_log) < 10: return
+        recent_trades = self.trade_log[-15:] if len(self.trade_log) >= 15 else self.trade_log
         if len(recent_trades) == 0: return
         recent_win_rate = sum(1 for t in recent_trades if t['pnl_pct'] > 0) / len(recent_trades)
         recent_avg_pnl = np.mean([t['pnl_pct'] for t in recent_trades])
         old_max = self.max_positions
-        if recent_win_rate < 0.3 or recent_avg_pnl < -0.03:
+        if recent_win_rate < 0.2 and recent_avg_pnl < -0.05:
             self.max_positions = 1
             if old_max != 1:
                 self.Debug(f"PERFORMANCE DECAY: max_pos=1 (WR:{recent_win_rate:.0%}, PnL:{recent_avg_pnl:+.2%})")
-        elif recent_win_rate > 0.5 and recent_avg_pnl > 0:
+        elif recent_win_rate > 0.35 and recent_avg_pnl > -0.01:
             self.max_positions = self.base_max_positions
             if old_max != self.base_max_positions:
                 self.Debug(f"PERFORMANCE RECOVERY: max_pos={self.base_max_positions}")
@@ -721,14 +722,22 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
     def _calculate_composite_score(self, factors):
         score = sum(factors.get(f, 0.5) * w for f, w in self.weights.items())
-        if self.market_regime == "bear":
-            score *= 0.75
-        if self.volatility_regime == "high":
-            score *= 0.85
-        if self.market_breadth > 0.7:
+        
+        # Momentum acceleration bonus
+        strong_factors = sum(1 for v in factors.values() if v >= 0.7)
+        if strong_factors >= 4:
+            score *= 1.10
+        elif strong_factors >= 3:
             score *= 1.05
-        elif self.market_breadth < 0.3:
+        
+        if self.market_regime == "bear":
             score *= 0.85
+        if self.volatility_regime == "high":
+            score *= 0.90
+        if self.market_breadth > 0.7:
+            score *= 1.08
+        elif self.market_breadth < 0.3:
+            score *= 0.90
         return min(score, 1.0)
 
     def _apply_fee_adjustment(self, score):
@@ -989,7 +998,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 continue
             min_qty = get_min_quantity(self, sym)
             min_notional_usd = get_min_notional_usd(self, sym)
-            if min_qty * price > reserved_cash * 0.6:
+            if min_qty * price > reserved_cash * 0.85:
                 reject_min_qty_too_large += 1
                 continue
             crypto = self.crypto_data.get(sym)
@@ -1085,7 +1094,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 self.Debug(f"ORDER FAILED: {sym.Value} - {e}")
                 self._session_blacklist.add(sym.Value)
                 continue
-            if self.LiveMode:
+            if self.LiveMode and success_count >= 2:
                 break
         
         if success_count > 0 or reject_ema_gate + reject_recent_net_scores + reject_impact_ratio > 5:
@@ -1101,7 +1110,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         return self.threshold_sideways
 
     def _is_ready(self, c):
-        return len(c['prices']) >= self.medium_period and c['rsi'].IsReady
+        return len(c['prices']) >= 14 and c['rsi'].IsReady
 
     def CheckExits(self):
         if self.IsWarmingUp:
@@ -1156,8 +1165,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         trailing_activation = self.trailing_activation
         trailing_stop_pct = self.trailing_stop_pct
         if self.volatility_regime == "high" or self.market_regime == "sideways":
-            trailing_activation = 0.04
-            trailing_stop_pct = 0.025
+            trailing_activation = 0.03
+            trailing_stop_pct = 0.02
 
         tag = ""
         min_notional_usd = get_min_notional_usd(self, symbol)
@@ -1170,7 +1179,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             tag = "Trailing Stop"
         elif self.market_regime == "bear" and pnl > 0.03:
             tag = "Bear Exit"
-        elif hours > 24 and pnl < 0.01:
+        elif hours > 18 and pnl < 0.01:
             tag = "Time Exit"
         if not tag and trailing_allowed and atr and entry > 0 and holding.Quantity != 0:
             trail_offset = atr * self.atr_trail_mult

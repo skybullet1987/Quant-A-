@@ -8,7 +8,7 @@ from datetime import timedelta
 
 # Constants from main_qa.py lines 31-68
 SYMBOL_BLACKLIST = {
-    "BTCUSD", "ETHUSD", "USDTUSD", "USDCUSD", "PYUSDUSD", "EURCUSD", "USTUSD",
+    "USDTUSD", "USDCUSD", "PYUSDUSD", "EURCUSD", "USTUSD",
     "DAIUSD", "TUSDUSD", "WETHUSD", "WBTCUSD", "WAXLUSD",
     "SHIBUSD", "XMRUSD", "ZECUSD", "DASHUSD",
     "XNYUSD",
@@ -161,7 +161,8 @@ def smart_liquidate(algo, symbol, tag="Liquidate"):
             available_usd = algo.Portfolio.CashBook["USD"].Amount
         except (KeyError, AttributeError):
             available_usd = algo.Portfolio.Cash
-        if available_usd < estimated_fee:
+        is_stop_loss = "Stop Loss" in tag or "Stop" in tag
+        if available_usd < estimated_fee and not is_stop_loss:
             algo.Debug(f"⚠️ SKIP SELL {symbol.Value}: fee reserve too low "
                        f"(need ${estimated_fee:.4f}, have ${available_usd:.4f})")
             if symbol not in algo.entry_prices:
@@ -343,11 +344,17 @@ def get_spread_pct(algo, symbol):
 def spread_ok(algo, symbol):
     sp = get_spread_pct(algo, symbol)
     if sp is None:
-        # In live mode, fail-closed (reject if spread unknown); in backtest, allow
-        return not algo.LiveMode
+        # In live mode with small accounts (< $100), allow unknown spreads
+        # Otherwise in live mode, fail-closed (reject if spread unknown); in backtest, allow
+        if algo.LiveMode:
+            portfolio_value = algo.Portfolio.TotalPortfolioValue
+            if portfolio_value < 100:
+                return True
+            return False
+        return True
     effective_spread_cap = algo.max_spread_pct
     if algo.LiveMode and (algo.volatility_regime == "high" or algo.market_regime == "sideways"):
-        effective_spread_cap = min(effective_spread_cap, 0.015)
+        effective_spread_cap = min(effective_spread_cap, 0.025)
     if sp > effective_spread_cap:
         return False
     crypto = algo.crypto_data.get(symbol)
