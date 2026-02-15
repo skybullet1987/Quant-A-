@@ -886,6 +886,16 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self._last_skip_reason = None
         self._execute_trades(scores, threshold_now, dynamic_max_pos)
 
+    def _get_open_buy_orders_value(self):
+        """Calculate total value reserved by open buy orders."""
+        total_reserved = 0
+        for o in self.Transactions.GetOpenOrders():
+            if o.Direction == OrderDirection.Buy:
+                # Use the limit price if available, otherwise current market price
+                order_price = o.Price if o.Price > 0 else self.Securities[o.Symbol].Price
+                total_reserved += abs(o.Quantity) * order_price
+        return total_reserved
+
     def _execute_trades(self, candidates, threshold_now, dynamic_max_pos):
         if not self._positions_synced:
             return
@@ -903,16 +913,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         except (KeyError, AttributeError):
             available_cash = self.Portfolio.Cash
         
-        open_orders = self.Transactions.GetOpenOrders()
-        if len(open_orders) > 0:
-            total_reserved = 0
-            for o in open_orders:
-                if o.Direction == OrderDirection.Buy:
-                    order_price = o.Price if o.Price > 0 else self.Securities[o.Symbol].Price
-                    total_reserved += abs(o.Quantity) * order_price
-            
-            if total_reserved > available_cash * 0.5:
-                return  # Too much cash locked in pending orders
+        total_reserved = self._get_open_buy_orders_value()
+        if total_reserved > available_cash * 0.5:
+            return  # Too much cash locked in pending orders
         
         # Diagnostic counters for rejection reasons
         reject_pending_orders = 0
@@ -974,12 +977,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 available_cash = self.Portfolio.Cash
             
             # Subtract open order reservations from available cash
-            total_open_order_value = 0
-            for open_order in self.Transactions.GetOpenOrders():
-                if open_order.Direction == OrderDirection.Buy:
-                    order_price = open_order.Price if open_order.Price > 0 else self.Securities[open_order.Symbol].Price
-                    total_open_order_value += abs(open_order.Quantity) * order_price
-            available_cash = available_cash - total_open_order_value
+            available_cash = available_cash - self._get_open_buy_orders_value()
             
             # Reserve based on portfolio value, not just remaining cash
             portfolio_reserve = total_value * self.cash_reserve_pct
