@@ -810,7 +810,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if pos_count >= dynamic_max_pos:
             self._log_skip("at max positions")
             return
-        if len(self.Transactions.GetOpenOrders()) > self.max_concurrent_open_orders:
+        if len(self.Transactions.GetOpenOrders()) >= self.max_concurrent_open_orders:
             self._log_skip("too many open orders")
             return
         if self._compute_portfolio_risk_estimate() > self.portfolio_vol_cap:
@@ -892,10 +892,27 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if self.LiveMode and self.kraken_status in ("maintenance", "cancel_only"):
             return
         cancel_stale_new_orders(self)
-        if len(self.Transactions.GetOpenOrders()) > self.max_concurrent_open_orders:
+        if len(self.Transactions.GetOpenOrders()) >= self.max_concurrent_open_orders:
             return
         if self._compute_portfolio_risk_estimate() > self.portfolio_vol_cap:
             return
+        
+        # Early exit if most cash is reserved for open orders
+        try:
+            available_cash = self.Portfolio.CashBook["USD"].Amount
+        except (KeyError, AttributeError):
+            available_cash = self.Portfolio.Cash
+        
+        open_orders = self.Transactions.GetOpenOrders()
+        if len(open_orders) > 0:
+            total_reserved = 0
+            for o in open_orders:
+                if o.Direction == OrderDirection.Buy:
+                    order_price = o.Price if o.Price > 0 else self.Securities[o.Symbol].Price
+                    total_reserved += abs(o.Quantity) * order_price
+            
+            if total_reserved > available_cash * 0.5:
+                return  # Too much cash locked in pending orders
         
         # Diagnostic counters for rejection reasons
         reject_pending_orders = 0
@@ -955,6 +972,15 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 available_cash = self.Portfolio.CashBook["USD"].Amount
             except (KeyError, AttributeError):
                 available_cash = self.Portfolio.Cash
+            
+            # Subtract open order reservations from available cash
+            total_open_order_value = 0
+            for open_order in self.Transactions.GetOpenOrders():
+                if open_order.Direction == OrderDirection.Buy:
+                    order_price = open_order.Price if open_order.Price > 0 else self.Securities[open_order.Symbol].Price
+                    total_open_order_value += abs(open_order.Quantity) * order_price
+            available_cash = available_cash - total_open_order_value
+            
             # Reserve based on portfolio value, not just remaining cash
             portfolio_reserve = total_value * self.cash_reserve_pct
             fee_reserve = total_value * 0.02  # Reserve 2% of portfolio value for fee coverage
@@ -1053,8 +1079,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 reject_notional += 1
                 continue
             try:
-                # Use limit-then-market entry order
-                ticket = place_limit_or_market(self, sym, qty, timeout_seconds=60, tag="Entry")
+                # Use limit orders only in live mode
+                if self.LiveMode:
+                    ticket = place_limit_or_market(self, sym, qty, timeout_seconds=60, tag="Entry")
+                else:
+                    ticket = self.MarketOrder(sym, qty, tag="Entry")
                 if ticket is not None:
                     self._recent_tickets.append(ticket)
                     self.Debug(f"ORDER: {sym.Value} | ${val:.2f} | id={ticket.OrderId}")

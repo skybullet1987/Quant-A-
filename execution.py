@@ -185,7 +185,7 @@ def smart_liquidate(algo, symbol, tag="Liquidate"):
                 if spread_pct > 0.03:  # 3% spread - log warning but still exit with market
                     algo.Debug(f"⚠️ WIDE SPREAD EXIT: {symbol.Value} spread={spread_pct:.2%}, using market order")
                     algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
-                elif spread_pct > 0.015:  # 1.5% spread - use limit order with fallback
+                elif algo.LiveMode and spread_pct > 0.015:  # 1.5% spread - use limit order with fallback (live mode only)
                     try:
                         sec = algo.Securities[symbol]
                         bid = sec.BidPrice
@@ -613,8 +613,13 @@ def get_slippage_penalty(algo, symbol):
 def place_limit_or_market(algo, symbol, quantity, timeout_seconds=60, tag="Entry"):
     """
     Place a limit order at mid-price with fallback to market order after timeout.
+    In backtest mode, use market orders directly.
     Returns the ticket from the order placement.
     """
+    # In backtest mode, use market orders directly
+    if not algo.LiveMode:
+        return algo.MarketOrder(symbol, quantity, tag=tag)
+    
     try:
         sec = algo.Securities[symbol]
         bid = sec.BidPrice
