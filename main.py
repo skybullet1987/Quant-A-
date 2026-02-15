@@ -76,12 +76,18 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.stale_order_timeout_seconds = 300
         self.live_stale_order_timeout_seconds = 900
         self.max_concurrent_open_orders = 2
+        
+        # Order fill verification settings
+        self.order_fill_check_threshold_seconds = 120  # Check after 2 minutes
+        self.order_timeout_seconds = 300  # Cancel after 5 minutes
+        self.resync_log_interval_seconds = 1800  # Log every 30 minutes
+        self.portfolio_mismatch_threshold = 0.10  # 10% tolerance
 
         self._positions_synced = False
         self._session_blacklist = set()
         self._max_session_blacklist_size = 100
         self._first_post_warmup = True
-        self._submitted_orders = {}  # {symbol: {'order_id': int, 'time': datetime, 'quantity': float}}
+        self._submitted_orders = {}  # {symbol: {'order_id': OrderId, 'time': datetime, 'quantity': float}}
 
         self.weights = {
             'relative_strength': 0.25,
@@ -250,7 +256,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if not self.LiveMode: return
         
         # Only log periodically to avoid spam (every 30 minutes)
-        if not hasattr(self, '_last_resync_log') or (self.Time - self._last_resync_log).total_seconds() > 1800:
+        if not hasattr(self, '_last_resync_log') or (self.Time - self._last_resync_log).total_seconds() > self.resync_log_interval_seconds:
             self.Debug(f"RESYNC CHECK: Portfolio keys={len(list(self.Portfolio.Keys))}, tracked={len(self.entry_prices)}")
             self._last_resync_log = self.Time
         
@@ -304,8 +310,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         for symbol, order_info in list(self._submitted_orders.items()):
             order_age_seconds = (current_time - order_info['time']).total_seconds()
             
-            # Check orders older than 2 minutes (120 seconds)
-            if order_age_seconds > 120:
+            # Check orders older than 2 minutes
+            if order_age_seconds > self.order_fill_check_threshold_seconds:
                 # Check if position exists at brokerage (order filled but we missed the event)
                 if symbol in self.Portfolio and self.Portfolio[symbol].Invested:
                     # The order filled but we missed the event - manually update tracking
@@ -315,14 +321,14 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     
                     self.entry_prices[symbol] = entry_price
                     self.highest_prices[symbol] = max(current_price, entry_price)
-                    self.entry_times[symbol] = current_time
+                    self.entry_times[symbol] = order_info['time']  # Use original submission time
                     self.daily_trade_count += 1
                     
                     symbols_to_remove.append(symbol)
                     self.Debug(f"FILL VERIFIED (missed event): {symbol.Value} | Entry: ${entry_price:.4f} | Qty: {holding.Quantity}")
                     
                 # If order is older than 5 minutes and not filled, cancel it
-                elif order_age_seconds > 300:
+                elif order_age_seconds > self.order_timeout_seconds:
                     try:
                         self.Transactions.CancelOrder(order_info['order_id'])
                         self._session_blacklist.add(symbol.Value)
@@ -355,7 +361,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         
         expected = cash + tracked_value
         
-        if total_qc > 0 and abs(total_qc - expected) / total_qc > 0.10:
+        if total_qc > 0 and abs(total_qc - expected) / total_qc > self.portfolio_mismatch_threshold:
             self.Debug(f"⚠️ PORTFOLIO MISMATCH: QC total=${total_qc:.2f} but cash+tracked=${expected:.2f} (diff=${abs(total_qc - expected):.2f})")
             # Force a resync attempt
             self.ResyncHoldings()
