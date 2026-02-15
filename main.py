@@ -356,16 +356,24 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                         self.Transactions.CancelOrder(order_id)
                         self.Debug(f"ORDER TIMEOUT (attempt 1): {symbol.Value} - canceling limit order, retrying as market")
                         
-                        # Re-submit as market order
+                        # Re-submit as market order based on stored intent
                         quantity = order_info['quantity']
-                        if symbol in self.Portfolio and self.Portfolio[symbol].Quantity != 0:
-                            # This was likely an exit order
-                            holding_qty = self.Portfolio[symbol].Quantity
-                            direction_mult = -1 if holding_qty > 0 else 1
-                            retry_ticket = self.MarketOrder(symbol, abs(holding_qty) * direction_mult, tag="Retry Exit")
-                        else:
-                            # This was likely an entry order
+                        intent = order_info.get('intent', 'unknown')
+                        
+                        if intent == 'exit':
+                            # Exit order - use stored signed quantity
+                            retry_ticket = self.MarketOrder(symbol, quantity, tag="Retry Exit")
+                        elif intent == 'entry':
+                            # Entry order - use stored signed quantity
                             retry_ticket = self.MarketOrder(symbol, quantity, tag="Retry Entry")
+                        else:
+                            # Unknown intent - try to infer from portfolio
+                            if symbol in self.Portfolio and self.Portfolio[symbol].Quantity != 0:
+                                holding_qty = self.Portfolio[symbol].Quantity
+                                direction_mult = -1 if holding_qty > 0 else 1
+                                retry_ticket = self.MarketOrder(symbol, abs(holding_qty) * direction_mult, tag="Retry Exit")
+                            else:
+                                retry_ticket = self.MarketOrder(symbol, quantity, tag="Retry Entry")
                         
                         if retry_ticket is not None:
                             # Track the retry
@@ -373,7 +381,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                             self._submitted_orders[symbol] = {
                                 'order_id': retry_ticket.OrderId,
                                 'time': current_time,
-                                'quantity': quantity
+                                'quantity': quantity,
+                                'intent': intent
                             }
                             # Remove old retry count
                             self._order_retries.pop(order_id, None)
@@ -1028,8 +1037,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             # Apply slippage penalty to position size
             slippage_penalty = get_slippage_penalty(self, sym)
             size *= slippage_penalty
-            if slippage_penalty <= 0.3:
-                self.Debug(f"⚠️ HIGH SLIPPAGE PENALTY: {sym.Value} | penalty={slippage_penalty:.1%}")
+            if slippage_penalty < 0.35:
+                self.Debug(f"⚠️ HIGH SLIPPAGE PENALTY: {sym.Value} | penalty={slippage_penalty:.0%}")
 
             if self.LiveMode and len(crypto['dollar_volume']) >= 6:
                 recent_dollar_vol6 = np.mean(list(crypto['dollar_volume'])[-6:])
@@ -1221,11 +1230,17 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 intended_qty = abs(event.Quantity) if event.Quantity != 0 else abs(event.FillQuantity)
                 self._pending_orders[symbol] += intended_qty
                 # Track submitted orders for fill verification
-                self._submitted_orders[symbol] = {
-                    'order_id': event.OrderId,
-                    'time': self.Time,
-                    'quantity': intended_qty
-                }
+                # Preserve existing tracking if it exists (from place_limit_or_market or smart_liquidate)
+                if symbol not in self._submitted_orders:
+                    self._submitted_orders[symbol] = {
+                        'order_id': event.OrderId,
+                        'time': self.Time,
+                        'quantity': event.Quantity,
+                        'intent': 'entry' if event.Direction == OrderDirection.Buy else 'exit'
+                    }
+                else:
+                    # Update order_id if it changed (shouldn't happen but be defensive)
+                    self._submitted_orders[symbol]['order_id'] = event.OrderId
             elif event.Status == OrderStatus.PartiallyFilled:
                 if symbol in self._pending_orders:
                     self._pending_orders[symbol] -= abs(event.FillQuantity)

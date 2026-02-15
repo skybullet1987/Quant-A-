@@ -198,8 +198,9 @@ def smart_liquidate(algo, symbol, tag="Liquidate"):
                                 algo._submitted_orders[symbol] = {
                                     'order_id': limit_order.OrderId,
                                     'time': algo.Time,
-                                    'quantity': abs(safe_qty),
-                                    'is_limit_exit': True
+                                    'quantity': safe_qty * direction_mult,  # Store signed quantity
+                                    'is_limit_exit': True,
+                                    'intent': 'exit'
                                 }
                             algo.Debug(f"LIMIT EXIT: {symbol.Value} at mid ${mid:.4f} (spread={spread_pct:.2%})")
                         else:
@@ -635,9 +636,10 @@ def place_limit_or_market(algo, symbol, quantity, timeout_seconds=60, tag="Entry
             algo._submitted_orders[symbol] = {
                 'order_id': limit_ticket.OrderId,
                 'time': algo.Time,
-                'quantity': abs(quantity),
+                'quantity': quantity,  # Store signed quantity
                 'is_limit_entry': True,
-                'timeout_seconds': timeout_seconds
+                'timeout_seconds': timeout_seconds,
+                'intent': 'entry'
             }
         
         algo.Debug(f"LIMIT ORDER: {symbol.Value} | qty={quantity} | mid=${mid:.4f} | timeout={timeout_seconds}s")
