@@ -390,12 +390,20 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     def PortfolioSanityCheck(self):
         """
         Check for portfolio value mismatches between QC and tracked positions.
+        Fixed: Use CashBook["USD"].Amount for actual USD cash, not Portfolio.Cash
+        (which in Cash account mode includes crypto holdings value).
         """
         if self.IsWarmingUp:
             return
         
         total_qc = self.Portfolio.TotalPortfolioValue
-        cash = self.Portfolio.Cash
+        
+        # Use actual USD cash, NOT Portfolio.Cash (which double-counts in Cash accounts)
+        try:
+            usd_cash = self.Portfolio.CashBook["USD"].Amount
+        except (KeyError, AttributeError):
+            usd_cash = self.Portfolio.Cash
+        
         tracked_value = 0.0
         
         for sym in list(self.entry_prices.keys()):
@@ -404,7 +412,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 if sym in self.Portfolio:
                     tracked_value += abs(self.Portfolio[sym].Quantity) * price
         
-        expected = cash + tracked_value
+        expected = usd_cash + tracked_value
         
         # Use both percentage and minimum absolute threshold to avoid spam on small portfolios
         # Also add 1-hour cooldown between warnings
@@ -414,7 +422,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             should_warn = pct_diff > self.portfolio_mismatch_threshold and abs_diff > self.portfolio_mismatch_min_dollars
             if should_warn:
                 if self._last_mismatch_warning is None or (self.Time - self._last_mismatch_warning).total_seconds() >= self.portfolio_mismatch_cooldown_seconds:
-                    self.Debug(f"⚠️ PORTFOLIO MISMATCH: QC total=${total_qc:.2f} but cash+tracked=${expected:.2f} (diff=${abs_diff:.2f})")
+                    self.Debug(f"⚠️ PORTFOLIO MISMATCH: QC total=${total_qc:.2f} but usd_cash+tracked=${expected:.2f} (diff=${abs_diff:.2f})")
                     self._last_mismatch_warning = self.Time
 
     def ReviewPerformance(self):
