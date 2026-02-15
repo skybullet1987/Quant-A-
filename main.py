@@ -76,11 +76,18 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.stale_order_timeout_seconds = 300
         self.live_stale_order_timeout_seconds = 900
         self.max_concurrent_open_orders = 2
+        
+        # Order fill verification settings
+        self.order_fill_check_threshold_seconds = 120  # Check after 2 minutes
+        self.order_timeout_seconds = 300  # Cancel after 5 minutes
+        self.resync_log_interval_seconds = 1800  # Log every 30 minutes
+        self.portfolio_mismatch_threshold = 0.10  # 10% tolerance
 
         self._positions_synced = False
         self._session_blacklist = set()
         self._max_session_blacklist_size = 100
         self._first_post_warmup = True
+        self._submitted_orders = {}  # {symbol: {'order_id': OrderId, 'time': datetime, 'quantity': float}}
 
         self.weights = {
             'relative_strength': 0.25,
@@ -170,6 +177,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.At(12, 0), self.HealthCheck)
         # Hourly live resync to catch fills that may have been missed by event stream
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(minutes=5)), self.ResyncHoldings)
+        self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(minutes=2)), self.VerifyOrderFills)
+        self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(minutes=15)), self.PortfolioSanityCheck)
 
         self.SetWarmUp(timedelta(days=5))
         self.SetSecurityInitializer(lambda security: security.SetSlippageModel(RealisticCryptoSlippage()))
@@ -245,6 +254,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         """
         if self.IsWarmingUp: return
         if not self.LiveMode: return
+        
+        # Only log periodically to avoid spam (every 30 minutes)
+        if not hasattr(self, '_last_resync_log') or (self.Time - self._last_resync_log).total_seconds() > self.resync_log_interval_seconds:
+            self.Debug(f"RESYNC CHECK: Portfolio keys={len(list(self.Portfolio.Keys))}, tracked={len(self.entry_prices)}")
+            self._last_resync_log = self.Time
+        
         missing = []
         for symbol in self.Portfolio.Keys:
             holding = self.Portfolio[symbol]
@@ -276,6 +291,79 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 self.Debug(f"RESYNCED: {symbol.Value} | Qty: {holding.Quantity} | Entry: ${entry:.4f} | Now: ${current_price:.4f} | PnL: {pnl_pct:+.2%}")
             except Exception as e:
                 self.Debug(f"Resync error {symbol.Value}: {e}")
+
+    def VerifyOrderFills(self):
+        """
+        Verify that submitted orders either filled or timed out.
+        Tracks orders and manually updates tracking if fills were missed.
+        Note: entry_times uses the original order submission time, which may differ
+        from the actual fill time. This is acceptable as we don't have the exact fill timestamp.
+        """
+        if self.IsWarmingUp:
+            return
+        
+        current_time = self.Time
+        symbols_to_remove = []
+        
+        for symbol, order_info in list(self._submitted_orders.items()):
+            order_age_seconds = (current_time - order_info['time']).total_seconds()
+            
+            # Check orders older than 2 minutes
+            if order_age_seconds > self.order_fill_check_threshold_seconds:
+                # Check if position exists at brokerage (order filled but we missed the event)
+                if symbol in self.Portfolio and self.Portfolio[symbol].Invested:
+                    # The order filled but we missed the event - manually update tracking
+                    holding = self.Portfolio[symbol]
+                    entry_price = holding.AveragePrice
+                    current_price = self.Securities[symbol].Price if symbol in self.Securities else holding.Price
+                    
+                    self.entry_prices[symbol] = entry_price
+                    self.highest_prices[symbol] = max(current_price, entry_price)
+                    self.entry_times[symbol] = order_info['time']  # Use original submission time
+                    self.daily_trade_count += 1
+                    
+                    symbols_to_remove.append(symbol)
+                    self.Debug(f"FILL VERIFIED (missed event): {symbol.Value} | Entry: ${entry_price:.4f} | Qty: {holding.Quantity}")
+                    
+                # If order is older than 5 minutes and not filled, cancel it
+                elif order_age_seconds > self.order_timeout_seconds:
+                    try:
+                        self.Transactions.CancelOrder(order_info['order_id'])
+                        self._session_blacklist.add(symbol.Value)
+                        symbols_to_remove.append(symbol)
+                        self.Debug(f"ORDER TIMEOUT: {symbol.Value} - no fill after 5min, canceled and blacklisted")
+                    except Exception as e:
+                        self.Debug(f"Error canceling order {order_info['order_id']}: {e}")
+                        symbols_to_remove.append(symbol)
+        
+        # Remove processed orders
+        for symbol in symbols_to_remove:
+            self._submitted_orders.pop(symbol, None)
+
+    def PortfolioSanityCheck(self):
+        """
+        Check for portfolio value mismatches between QC and tracked positions.
+        """
+        if self.IsWarmingUp:
+            return
+        
+        total_qc = self.Portfolio.TotalPortfolioValue
+        cash = self.Portfolio.Cash
+        tracked_value = 0.0
+        
+        for sym in list(self.entry_prices.keys()):
+            if sym in self.Securities:
+                price = self.Securities[sym].Price
+                if sym in self.Portfolio:
+                    tracked_value += abs(self.Portfolio[sym].Quantity) * price
+        
+        expected = cash + tracked_value
+        
+        # Use minimum threshold to avoid misleading results on small portfolios
+        if total_qc > 1.0 and abs(total_qc - expected) / total_qc > self.portfolio_mismatch_threshold:
+            self.Debug(f"⚠️ PORTFOLIO MISMATCH: QC total=${total_qc:.2f} but cash+tracked=${expected:.2f} (diff=${abs(total_qc - expected):.2f})")
+            # Force a resync attempt
+            self.ResyncHoldings()
 
     def ReviewPerformance(self):
         if self.IsWarmingUp or len(self.trade_log) < 5: return
@@ -392,6 +480,18 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 self._cancel_stale_orders()
             sync_existing_positions(self)
             self._positions_synced = True
+            
+            # Dump raw portfolio state for diagnostics
+            self.Debug("=== RAW PORTFOLIO STATE ===")
+            for symbol in self.Portfolio.Keys:
+                h = self.Portfolio[symbol]
+                if h.Invested or h.Quantity != 0:
+                    self.Debug(f"  HOLDING: {symbol.Value} | Qty: {h.Quantity} | AvgPrice: ${h.AveragePrice:.4f} | Value: ${h.HoldingsValue:.2f}")
+            if not any(self.Portfolio[s].Invested for s in self.Portfolio.Keys):
+                self.Debug("  (no holdings detected)")
+            self.Debug(f"  CASH: ${self.Portfolio.Cash:.2f} | TOTAL: ${self.Portfolio.TotalPortfolioValue:.2f}")
+            self.Debug("===========================")
+            
             self._first_post_warmup = False
             # Fallback: if status never set, assume online after warmup
             if self.kraken_status == "unknown":
@@ -1051,6 +1151,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     self._pending_orders[symbol] = 0
                 intended_qty = abs(event.Quantity) if event.Quantity != 0 else abs(event.FillQuantity)
                 self._pending_orders[symbol] += intended_qty
+                # Track submitted orders for fill verification
+                self._submitted_orders[symbol] = {
+                    'order_id': event.OrderId,
+                    'time': self.Time,
+                    'quantity': intended_qty
+                }
             elif event.Status == OrderStatus.PartiallyFilled:
                 if symbol in self._pending_orders:
                     self._pending_orders[symbol] -= abs(event.FillQuantity)
@@ -1064,6 +1170,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 slip_log(self, symbol, event.Direction, event.FillPrice)
             elif event.Status == OrderStatus.Filled:
                 self._pending_orders.pop(symbol, None)
+                self._submitted_orders.pop(symbol, None)  # Remove from verification tracking
                 if event.Direction == OrderDirection.Buy:
                     self.entry_prices[symbol] = event.FillPrice
                     self.highest_prices[symbol] = event.FillPrice
@@ -1097,6 +1204,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 slip_log(self, symbol, event.Direction, event.FillPrice)
             elif event.Status == OrderStatus.Canceled:
                 self._pending_orders.pop(symbol, None)
+                self._submitted_orders.pop(symbol, None)  # Remove from verification tracking
                 if event.Direction == OrderDirection.Sell and symbol not in self.entry_prices:
                     if is_invested_not_dust(self, symbol):
                         holding = self.Portfolio[symbol]
@@ -1106,6 +1214,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                         self.Debug(f"RE-TRACKED after cancel: {symbol.Value}")
             elif event.Status == OrderStatus.Invalid:
                 self._pending_orders.pop(symbol, None)
+                self._submitted_orders.pop(symbol, None)  # Remove from verification tracking
                 if event.Direction == OrderDirection.Sell and symbol not in self.entry_prices:
                     if is_invested_not_dust(self, symbol):
                         holding = self.Portfolio[symbol]
