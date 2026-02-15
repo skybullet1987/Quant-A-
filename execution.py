@@ -177,7 +177,45 @@ def smart_liquidate(algo, symbol, tag="Liquidate"):
         return
     if safe_qty > 0:
         direction_mult = -1 if holding_qty > 0 else 1
-        algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
+        # Spread-aware exit logic
+        is_stop_loss = "Stop Loss" in tag
+        if not is_stop_loss:
+            spread_pct = get_spread_pct(algo, symbol)
+            if spread_pct is not None:
+                if spread_pct > 0.03:  # 3% spread - log warning but still exit with market
+                    algo.Debug(f"⚠️ WIDE SPREAD EXIT: {symbol.Value} spread={spread_pct:.2%}, using market order")
+                    algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
+                elif spread_pct > 0.015:  # 1.5% spread - use limit order with fallback
+                    try:
+                        sec = algo.Securities[symbol]
+                        bid = sec.BidPrice
+                        ask = sec.AskPrice
+                        if bid > 0 and ask > 0:
+                            mid = 0.5 * (bid + ask)
+                            limit_order = algo.LimitOrder(symbol, safe_qty * direction_mult, mid, tag=tag)
+                            # Track for fallback in VerifyOrderFills (90 second timeout handled there)
+                            if hasattr(algo, '_submitted_orders'):
+                                algo._submitted_orders[symbol] = {
+                                    'order_id': limit_order.OrderId,
+                                    'time': algo.Time,
+                                    'quantity': abs(safe_qty),
+                                    'is_limit_exit': True
+                                }
+                            algo.Debug(f"LIMIT EXIT: {symbol.Value} at mid ${mid:.4f} (spread={spread_pct:.2%})")
+                        else:
+                            algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
+                    except Exception as e:
+                        algo.Debug(f"Error placing limit exit for {symbol.Value}: {e}")
+                        algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
+                else:
+                    # Spread is acceptable, use market order
+                    algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
+            else:
+                # Spread unknown, use market order
+                algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
+        else:
+            # Stop loss - always use market order
+            algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
     else:
         algo.Debug(f"Warning: {symbol.Value} holding {holding_qty} rounds to 0")
 
@@ -409,7 +447,7 @@ def debug_limited(algo, msg):
 
 
 def slip_log(algo, symbol, direction, fill_price):
-    """Enhanced slip_log with live outlier alert from main_opus."""
+    """Enhanced slip_log with live outlier alert and symbol-level slippage tracking."""
     try:
         sec = algo.Securities[symbol]
         bid = sec.BidPrice
@@ -423,6 +461,14 @@ def slip_log(algo, symbol, direction, fill_price):
         slip = side * (fill_price - mid) / mid
         abs_slip = abs(slip)
         algo._slip_abs.append(abs_slip)
+        
+        # Track slippage per symbol
+        if hasattr(algo, '_symbol_slippage_history'):
+            ticker = symbol.Value if hasattr(symbol, 'Value') else str(symbol)
+            if ticker not in algo._symbol_slippage_history:
+                algo._symbol_slippage_history[ticker] = deque(maxlen=10)
+            algo._symbol_slippage_history[ticker].append(abs_slip)
+        
         # Live slippage alert for unusually high slippage
         if algo.LiveMode and abs(slip) > algo.slip_outlier_threshold:
             algo.Debug(f"⚠️ HIGH SLIPPAGE: {symbol.Value} | {abs(slip):.4%} | dir={direction}")
@@ -532,3 +578,71 @@ def kelly_fraction(algo):
     kelly = (win_rate * b - (1 - win_rate)) / b
     half_kelly = kelly * 0.5
     return max(0.5, min(1.5, half_kelly / 0.5))
+
+
+def get_slippage_penalty(algo, symbol):
+    """
+    Calculate position size multiplier based on historical slippage for a symbol.
+    Returns a value between 0.3 and 1.0.
+    """
+    if not hasattr(algo, '_symbol_slippage_history'):
+        return 1.0
+    
+    ticker = symbol.Value if hasattr(symbol, 'Value') else str(symbol)
+    if ticker not in algo._symbol_slippage_history:
+        return 1.0
+    
+    slippage_history = algo._symbol_slippage_history[ticker]
+    if len(slippage_history) == 0:
+        return 1.0
+    
+    avg_slippage = np.mean(list(slippage_history))
+    
+    # Apply penalties based on average slippage
+    if avg_slippage > 0.010:  # > 1.0%
+        return 0.3
+    elif avg_slippage > 0.005:  # > 0.5%
+        return 0.6
+    elif avg_slippage > 0.003:  # > 0.3%
+        return 0.8
+    else:
+        return 1.0
+
+
+def place_limit_or_market(algo, symbol, quantity, timeout_seconds=60, tag="Entry"):
+    """
+    Place a limit order at mid-price with fallback to market order after timeout.
+    Returns the ticket from the order placement.
+    """
+    try:
+        sec = algo.Securities[symbol]
+        bid = sec.BidPrice
+        ask = sec.AskPrice
+        
+        # If bid/ask unavailable, use market order immediately
+        if bid <= 0 or ask <= 0:
+            algo.Debug(f"BID/ASK unavailable for {symbol.Value}, using market order")
+            return algo.MarketOrder(symbol, quantity, tag=tag)
+        
+        # Calculate mid price
+        mid = 0.5 * (bid + ask)
+        
+        # Place limit order at mid price
+        limit_ticket = algo.LimitOrder(symbol, quantity, mid, tag=tag)
+        
+        # Track for fallback in VerifyOrderFills
+        if hasattr(algo, '_submitted_orders'):
+            algo._submitted_orders[symbol] = {
+                'order_id': limit_ticket.OrderId,
+                'time': algo.Time,
+                'quantity': abs(quantity),
+                'is_limit_entry': True,
+                'timeout_seconds': timeout_seconds
+            }
+        
+        algo.Debug(f"LIMIT ORDER: {symbol.Value} | qty={quantity} | mid=${mid:.4f} | timeout={timeout_seconds}s")
+        return limit_ticket
+        
+    except Exception as e:
+        algo.Debug(f"Error placing limit order for {symbol.Value}: {e}, falling back to market")
+        return algo.MarketOrder(symbol, quantity, tag=tag)
