@@ -1038,8 +1038,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             # Apply slippage penalty to position size
             slippage_penalty = get_slippage_penalty(self, sym)
             size *= slippage_penalty
-            if slippage_penalty < 0.35:  # Warn for severe penalties (< 35% of normal size)
-                self.Debug(f"⚠️ HIGH SLIPPAGE PENALTY: {sym.Value} | penalty={slippage_penalty:.0%}")
+            if slippage_penalty <= 0.3:  # Warn for most severe penalty (30% of normal size)
+                self.Debug(f"⚠️ HIGH SLIPPAGE PENALTY: {sym.Value} | size reduced to {slippage_penalty:.0%}")
 
             if self.LiveMode and len(crypto['dollar_volume']) >= 6:
                 recent_dollar_vol6 = np.mean(list(crypto['dollar_volume'])[-6:])

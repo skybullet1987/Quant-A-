@@ -597,7 +597,7 @@ def get_slippage_penalty(algo, symbol):
     if len(slippage_history) == 0:
         return 1.0
     
-    avg_slippage = np.mean(slippage_history)
+    avg_slippage = sum(slippage_history) / len(slippage_history)
     
     # Apply penalties based on average slippage
     if avg_slippage > 0.010:  # > 1.0%
