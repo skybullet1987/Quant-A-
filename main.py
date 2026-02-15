@@ -76,7 +76,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.stale_order_timeout_seconds = 300
         self.live_stale_order_timeout_seconds = 900
         self.max_concurrent_open_orders = 2
-        self.open_orders_cash_threshold = 0.5  # Exit early if >50% cash reserved for pending orders
+        self.open_orders_cash_threshold = 0.5  # Exit early if ≥50% cash reserved for pending orders
         
         # Order fill verification settings
         self.order_fill_check_threshold_seconds = 120  # Check after 2 minutes
@@ -888,7 +888,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self._execute_trades(scores, threshold_now, dynamic_max_pos)
 
     def _get_open_buy_orders_value(self):
-        """Calculate total value reserved by open buy orders."""
+        """
+        Calculate total value reserved by open buy orders.
+        Uses the limit price if set, otherwise falls back to current market price.
+        Note: Market orders typically execute immediately and shouldn't appear here,
+        but if they do temporarily, current market price provides a reasonable estimate.
+        """
         total_reserved = 0
         for o in self.Transactions.GetOpenOrders():
             if o.Direction == OrderDirection.Buy:
@@ -984,7 +989,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 available_cash = self.Portfolio.Cash
             
             # Subtract open order reservations from available cash (use cached value)
-            available_cash -= open_buy_orders_value
+            # Ensure available_cash doesn't go negative
+            available_cash = max(0, available_cash - open_buy_orders_value)
             
             # Reserve based on portfolio value, not just remaining cash
             portfolio_reserve = total_value * self.cash_reserve_pct
