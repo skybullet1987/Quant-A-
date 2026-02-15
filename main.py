@@ -76,6 +76,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.stale_order_timeout_seconds = 300
         self.live_stale_order_timeout_seconds = 900
         self.max_concurrent_open_orders = 2
+        self.open_orders_cash_threshold = 0.5  # Exit early if ≥50% cash reserved for pending orders
         
         # Order fill verification settings
         self.order_fill_check_threshold_seconds = 120  # Check after 2 minutes
@@ -810,7 +811,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if pos_count >= dynamic_max_pos:
             self._log_skip("at max positions")
             return
-        if len(self.Transactions.GetOpenOrders()) > self.max_concurrent_open_orders:
+        if len(self.Transactions.GetOpenOrders()) >= self.max_concurrent_open_orders:
             self._log_skip("too many open orders")
             return
         if self._compute_portfolio_risk_estimate() > self.portfolio_vol_cap:
@@ -886,16 +887,54 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self._last_skip_reason = None
         self._execute_trades(scores, threshold_now, dynamic_max_pos)
 
+    def _get_open_buy_orders_value(self):
+        """
+        Calculate total value reserved by open buy orders.
+        Uses the order price (limit price for limit orders, market price for market orders).
+        Note: Market orders typically execute immediately and shouldn't appear here.
+        """
+        total_reserved = 0
+        for o in self.Transactions.GetOpenOrders():
+            if o.Direction == OrderDirection.Buy:
+                # Use the order's price if available, otherwise current market price
+                if o.Price > 0:
+                    order_price = o.Price
+                elif o.Symbol in self.Securities:
+                    order_price = self.Securities[o.Symbol].Price
+                    if order_price <= 0:
+                        continue  # Skip if market price is invalid
+                else:
+                    continue  # Skip if we can't determine price
+                total_reserved += abs(o.Quantity) * order_price
+        return total_reserved
+
     def _execute_trades(self, candidates, threshold_now, dynamic_max_pos):
         if not self._positions_synced:
             return
         if self.LiveMode and self.kraken_status in ("maintenance", "cancel_only"):
             return
         cancel_stale_new_orders(self)
-        if len(self.Transactions.GetOpenOrders()) > self.max_concurrent_open_orders:
+        if len(self.Transactions.GetOpenOrders()) >= self.max_concurrent_open_orders:
             return
         if self._compute_portfolio_risk_estimate() > self.portfolio_vol_cap:
             return
+        
+        # Early exit if most cash is reserved for open orders
+        try:
+            available_cash = self.Portfolio.CashBook["USD"].Amount
+        except (KeyError, AttributeError):
+            available_cash = self.Portfolio.Cash
+        
+        # Cache open buy orders value to avoid recalculating
+        open_buy_orders_value = self._get_open_buy_orders_value()
+        
+        # Early exit if insufficient cash or too much reserved
+        if available_cash <= 0:
+            debug_limited(self, f"SKIP TRADES: No cash available (${available_cash:.2f})")
+            return
+        if open_buy_orders_value > available_cash * self.open_orders_cash_threshold:
+            debug_limited(self, f"SKIP TRADES: ${open_buy_orders_value:.2f} reserved (>{self.open_orders_cash_threshold:.0%} of ${available_cash:.2f})")
+            return  # Too much cash locked in pending orders
         
         # Diagnostic counters for rejection reasons
         reject_pending_orders = 0
@@ -955,6 +994,13 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 available_cash = self.Portfolio.CashBook["USD"].Amount
             except (KeyError, AttributeError):
                 available_cash = self.Portfolio.Cash
+            
+            # Subtract open order reservations from available cash (use cached value)
+            # Log warning if reserved orders exceed available cash (accounting inconsistency)
+            if open_buy_orders_value > available_cash:
+                self.Debug(f"⚠️ CASH INCONSISTENCY: ${open_buy_orders_value:.2f} reserved but only ${available_cash:.2f} available")
+            available_cash = max(0, available_cash - open_buy_orders_value)
+            
             # Reserve based on portfolio value, not just remaining cash
             portfolio_reserve = total_value * self.cash_reserve_pct
             fee_reserve = total_value * 0.02  # Reserve 2% of portfolio value for fee coverage
@@ -1053,8 +1099,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 reject_notional += 1
                 continue
             try:
-                # Use limit-then-market entry order
-                ticket = place_limit_or_market(self, sym, qty, timeout_seconds=60, tag="Entry")
+                # Use limit orders only in live mode
+                if self.LiveMode:
+                    ticket = place_limit_or_market(self, sym, qty, timeout_seconds=60, tag="Entry")
+                else:
+                    ticket = self.MarketOrder(sym, qty, tag="Entry")
                 if ticket is not None:
                     self._recent_tickets.append(ticket)
                     self.Debug(f"ORDER: {sym.Value} | ${val:.2f} | id={ticket.OrderId}")
