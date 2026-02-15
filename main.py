@@ -919,8 +919,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         except (KeyError, AttributeError):
             available_cash = self.Portfolio.Cash
         
-        total_reserved = self._get_open_buy_orders_value()
-        if total_reserved > available_cash * self.open_orders_cash_threshold:
+        # Cache open buy orders value to avoid recalculating
+        open_buy_orders_value = self._get_open_buy_orders_value()
+        if available_cash > 0 and open_buy_orders_value > available_cash * self.open_orders_cash_threshold:
             return  # Too much cash locked in pending orders
         
         # Diagnostic counters for rejection reasons
@@ -982,8 +983,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             except (KeyError, AttributeError):
                 available_cash = self.Portfolio.Cash
             
-            # Subtract open order reservations from available cash
-            available_cash -= self._get_open_buy_orders_value()
+            # Subtract open order reservations from available cash (use cached value)
+            available_cash -= open_buy_orders_value
             
             # Reserve based on portfolio value, not just remaining cash
             portfolio_reserve = total_value * self.cash_reserve_pct
