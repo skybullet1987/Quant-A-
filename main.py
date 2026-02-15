@@ -369,10 +369,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                         else:
                             # Unknown intent - try to infer from portfolio
                             if symbol in self.Portfolio and self.Portfolio[symbol].Quantity != 0:
+                                # Position exists, likely an exit order - close the position
                                 holding_qty = self.Portfolio[symbol].Quantity
-                                direction_mult = -1 if holding_qty > 0 else 1
-                                retry_ticket = self.MarketOrder(symbol, abs(holding_qty) * direction_mult, tag="Retry Exit")
+                                retry_ticket = self.MarketOrder(symbol, -holding_qty, tag="Retry Exit")
                             else:
+                                # No position, likely an entry order
                                 retry_ticket = self.MarketOrder(symbol, quantity, tag="Retry Entry")
                         
                         if retry_ticket is not None:
@@ -1037,7 +1038,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             # Apply slippage penalty to position size
             slippage_penalty = get_slippage_penalty(self, sym)
             size *= slippage_penalty
-            if slippage_penalty < 0.35:
+            if slippage_penalty < 0.35:  # Warn for severe penalties (< 35% of normal size)
                 self.Debug(f"⚠️ HIGH SLIPPAGE PENALTY: {sym.Value} | penalty={slippage_penalty:.0%}")
 
             if self.LiveMode and len(crypto['dollar_volume']) >= 6:
@@ -1232,11 +1233,21 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 # Track submitted orders for fill verification
                 # Preserve existing tracking if it exists (from place_limit_or_market or smart_liquidate)
                 if symbol not in self._submitted_orders:
+                    # Infer intent: if we have a position, sell orders are likely exits, otherwise entries
+                    has_position = symbol in self.Portfolio and self.Portfolio[symbol].Invested
+                    if event.Direction == OrderDirection.Sell and has_position:
+                        inferred_intent = 'exit'
+                    elif event.Direction == OrderDirection.Buy and not has_position:
+                        inferred_intent = 'entry'
+                    else:
+                        # Ambiguous case (buy with position, or sell without position)
+                        inferred_intent = 'entry' if event.Direction == OrderDirection.Buy else 'exit'
+                    
                     self._submitted_orders[symbol] = {
                         'order_id': event.OrderId,
                         'time': self.Time,
                         'quantity': event.Quantity,
-                        'intent': 'entry' if event.Direction == OrderDirection.Buy else 'exit'
+                        'intent': inferred_intent
                     }
                 else:
                     # Update order_id if it changed (shouldn't happen but be defensive)
