@@ -296,12 +296,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         """
         Verify that submitted orders either filled or timed out.
         Tracks orders and manually updates tracking if fills were missed.
+        Note: entry_times uses the original order submission time, which may differ
+        from the actual fill time. This is acceptable as we don't have the exact fill timestamp.
         """
         if self.IsWarmingUp:
-            return
-        
-        if not hasattr(self, '_submitted_orders'):
-            self._submitted_orders = {}
             return
         
         current_time = self.Time
@@ -361,7 +359,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         
         expected = cash + tracked_value
         
-        if total_qc > 0 and abs(total_qc - expected) / total_qc > self.portfolio_mismatch_threshold:
+        # Use minimum threshold to avoid misleading results on small portfolios
+        if total_qc > 1.0 and abs(total_qc - expected) / total_qc > self.portfolio_mismatch_threshold:
             self.Debug(f"⚠️ PORTFOLIO MISMATCH: QC total=${total_qc:.2f} but cash+tracked=${expected:.2f} (diff=${abs(total_qc - expected):.2f})")
             # Force a resync attempt
             self.ResyncHoldings()
@@ -1153,8 +1152,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 intended_qty = abs(event.Quantity) if event.Quantity != 0 else abs(event.FillQuantity)
                 self._pending_orders[symbol] += intended_qty
                 # Track submitted orders for fill verification
-                if not hasattr(self, '_submitted_orders'):
-                    self._submitted_orders = {}
                 self._submitted_orders[symbol] = {
                     'order_id': event.OrderId,
                     'time': self.Time,
