@@ -1038,7 +1038,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             # Apply slippage penalty to position size
             slippage_penalty = get_slippage_penalty(self, sym)
             size *= slippage_penalty
-            if slippage_penalty <= 0.3:  # Warn for most severe penalty (30% of normal size)
+            # Warn when penalty reaches the minimum threshold (0.3 = 30% of normal size)
+            if slippage_penalty <= 0.3:
                 self.Debug(f"⚠️ HIGH SLIPPAGE PENALTY: {sym.Value} | size reduced to {slippage_penalty:.0%}")
 
             if self.LiveMode and len(crypto['dollar_volume']) >= 6:
@@ -1228,6 +1229,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if event.Status == OrderStatus.Submitted:
                 if symbol not in self._pending_orders:
                     self._pending_orders[symbol] = 0
+                # _pending_orders tracks absolute quantities for accounting/limits
                 intended_qty = abs(event.Quantity) if event.Quantity != 0 else abs(event.FillQuantity)
                 self._pending_orders[symbol] += intended_qty
                 # Track submitted orders for fill verification
@@ -1243,10 +1245,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                         # Ambiguous case (buy with position, or sell without position)
                         inferred_intent = 'entry' if event.Direction == OrderDirection.Buy else 'exit'
                     
+                    # _submitted_orders stores signed quantities for retry logic
                     self._submitted_orders[symbol] = {
                         'order_id': event.OrderId,
                         'time': self.Time,
-                        'quantity': event.Quantity,
+                        'quantity': event.Quantity,  # Signed quantity needed for retry
                         'intent': inferred_intent
                     }
                 else:
