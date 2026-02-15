@@ -76,6 +76,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.stale_order_timeout_seconds = 300
         self.live_stale_order_timeout_seconds = 900
         self.max_concurrent_open_orders = 2
+        self.open_orders_cash_threshold = 0.5  # Exit early if >50% cash reserved for pending orders
         
         # Order fill verification settings
         self.order_fill_check_threshold_seconds = 120  # Check after 2 minutes
@@ -892,7 +893,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         for o in self.Transactions.GetOpenOrders():
             if o.Direction == OrderDirection.Buy:
                 # Use the limit price if available, otherwise current market price
-                order_price = o.Price if o.Price > 0 else self.Securities[o.Symbol].Price
+                if o.Price > 0:
+                    order_price = o.Price
+                elif o.Symbol in self.Securities:
+                    order_price = self.Securities[o.Symbol].Price
+                else:
+                    continue  # Skip if we can't determine price
                 total_reserved += abs(o.Quantity) * order_price
         return total_reserved
 
@@ -914,7 +920,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             available_cash = self.Portfolio.Cash
         
         total_reserved = self._get_open_buy_orders_value()
-        if total_reserved > available_cash * 0.5:
+        if total_reserved > available_cash * self.open_orders_cash_threshold:
             return  # Too much cash locked in pending orders
         
         # Diagnostic counters for rejection reasons
@@ -977,7 +983,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 available_cash = self.Portfolio.Cash
             
             # Subtract open order reservations from available cash
-            available_cash = available_cash - self._get_open_buy_orders_value()
+            available_cash -= self._get_open_buy_orders_value()
             
             # Reserve based on portfolio value, not just remaining cash
             portfolio_reserve = total_value * self.cash_reserve_pct
