@@ -334,8 +334,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     try:
                         order = self.Transactions.GetOrderById(order_id)
                         if order is not None and order.Status == OrderStatus.Filled:
-                            # Confirmed: order filled but event was missed
-                            # Confirmed: order filled but event was missed
                             holding = self.Portfolio[symbol]
                             entry_price = holding.AveragePrice
                             current_price = self.Securities[symbol].Price if symbol in self.Securities else holding.Price
@@ -447,14 +445,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
     def UniverseFilter(self, universe):
         selected = []
-        forex_suffixes = ["PYUSD","EURUSD","GBPUSD","AUDUSD","NZDUSD","JPYUSD","CADUSD","CHFUSD","CNYUSD","HKDUSD","SGDUSD","SEKUSD","NOKUSD","DKKUSD","KRWUSD","TRYUSD","ZARUSD","MXNUSD","INRUSD","BRLUSD","PLNUSD","THBUSD"]
         for crypto in universe:
             ticker = crypto.Symbol.Value
             if ticker in SYMBOL_BLACKLIST or ticker in self._session_blacklist:
                 continue
             if not ticker.endswith("USD"):
-                continue
-            if any(ticker.endswith(suffix) for suffix in forex_suffixes):
                 continue
             if crypto.VolumeInUsd is None or crypto.VolumeInUsd == 0:
                 continue
