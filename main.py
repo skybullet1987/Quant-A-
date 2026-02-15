@@ -901,6 +901,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     order_price = o.Price
                 elif o.Symbol in self.Securities:
                     order_price = self.Securities[o.Symbol].Price
+                    if order_price <= 0:
+                        continue  # Skip if market price is invalid
                 else:
                     continue  # Skip if we can't determine price
                 total_reserved += abs(o.Quantity) * order_price
@@ -925,8 +927,13 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         
         # Cache open buy orders value to avoid recalculating
         open_buy_orders_value = self._get_open_buy_orders_value()
-        if available_cash > 0 and open_buy_orders_value > available_cash * self.open_orders_cash_threshold:
-            debug_limited(self, f"SKIP TRADES: {open_buy_orders_value:.2f} reserved (>{self.open_orders_cash_threshold:.0%} of ${available_cash:.2f})")
+        
+        # Early exit if insufficient cash or too much reserved
+        if available_cash <= 0:
+            debug_limited(self, f"SKIP TRADES: No cash available (${available_cash:.2f})")
+            return
+        if open_buy_orders_value > available_cash * self.open_orders_cash_threshold:
+            debug_limited(self, f"SKIP TRADES: ${open_buy_orders_value:.2f} reserved (>{self.open_orders_cash_threshold:.0%} of ${available_cash:.2f})")
             return  # Too much cash locked in pending orders
         
         # Diagnostic counters for rejection reasons
