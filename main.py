@@ -1217,7 +1217,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     self._submitted_orders[symbol] = {
                         'order_id': event.OrderId,
                         'time': self.Time,
-                        'quantity': event.Quantity,
+                        'quantity': event.Quantity,  # Signed - needed for retry MarketOrder
                         'intent': inferred_intent
                     }
                 else:
