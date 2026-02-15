@@ -890,14 +890,13 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     def _get_open_buy_orders_value(self):
         """
         Calculate total value reserved by open buy orders.
-        Uses the limit price if set, otherwise falls back to current market price.
-        Note: Market orders typically execute immediately and shouldn't appear here,
-        but if they do temporarily, current market price provides a reasonable estimate.
+        Uses the order price (limit price for limit orders, market price for market orders).
+        Note: Market orders typically execute immediately and shouldn't appear here.
         """
         total_reserved = 0
         for o in self.Transactions.GetOpenOrders():
             if o.Direction == OrderDirection.Buy:
-                # Use the limit price if available, otherwise current market price
+                # Use the order's price if available, otherwise current market price
                 if o.Price > 0:
                     order_price = o.Price
                 elif o.Symbol in self.Securities:
@@ -927,6 +926,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         # Cache open buy orders value to avoid recalculating
         open_buy_orders_value = self._get_open_buy_orders_value()
         if available_cash > 0 and open_buy_orders_value > available_cash * self.open_orders_cash_threshold:
+            debug_limited(self, f"SKIP TRADES: {open_buy_orders_value:.2f} reserved (>{self.open_orders_cash_threshold:.0%} of ${available_cash:.2f})")
             return  # Too much cash locked in pending orders
         
         # Diagnostic counters for rejection reasons
@@ -989,7 +989,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 available_cash = self.Portfolio.Cash
             
             # Subtract open order reservations from available cash (use cached value)
-            # Ensure available_cash doesn't go negative
+            # Log warning if reserved orders exceed available cash (accounting inconsistency)
+            if open_buy_orders_value > available_cash:
+                self.Debug(f"⚠️ CASH INCONSISTENCY: ${open_buy_orders_value:.2f} reserved but only ${available_cash:.2f} available")
             available_cash = max(0, available_cash - open_buy_orders_value)
             
             # Reserve based on portfolio value, not just remaining cash
