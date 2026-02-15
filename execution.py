@@ -266,8 +266,18 @@ def cancel_stale_new_orders(algo):
                 
                 algo.Transactions.CancelOrder(order.Id)
                 algo._cancel_cooldowns[order.Symbol] = algo.Time + timedelta(minutes=algo.cancel_cooldown_minutes)
-                algo._session_blacklist.add(sym_val)
-                algo.Debug(f"⚠️ ZOMBIE ORDER DETECTED: {sym_val} - blacklisted for session")
+                
+                # Only blacklist stale ENTRY orders, not EXIT orders
+                # Exit orders that are stale just get cooldown to allow retry
+                is_exit_order = order.Symbol in algo.entry_prices or (
+                    order.Symbol in algo.Portfolio and algo.Portfolio[order.Symbol].Quantity != 0
+                )
+                
+                if is_exit_order:
+                    algo.Debug(f"STALE EXIT ORDER: {sym_val} - setting cooldown, NOT blacklisting")
+                else:
+                    algo._session_blacklist.add(sym_val)
+                    algo.Debug(f"⚠️ ZOMBIE ORDER DETECTED: {sym_val} - blacklisted for session")
     except Exception as e:
         algo.Debug(f"Error in _cancel_stale_new_orders: {e}")
 
