@@ -204,9 +204,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         return order_time.replace(tzinfo=None) if order_time.tzinfo is not None else order_time
     
     def _record_exit_pnl(self, symbol, entry_price, exit_price):
-        """Helper to record PnL from an exit trade."""
+        """Helper to record PnL from an exit trade. Returns None if prices are invalid."""
         if entry_price <= 0 or exit_price <= 0:
-            return 0
+            self.Debug(f"⚠️ Cannot record PnL for {symbol.Value}: invalid prices (entry=${entry_price:.4f}, exit=${exit_price:.4f})")
+            return None
         
         pnl = (exit_price - entry_price) / entry_price
         self._rolling_wins.append(1 if pnl > 0 else 0)
@@ -425,10 +426,13 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                             if entry:
                                 # Calculate PnL using last known price
                                 current_price = self.Securities[symbol].Price if symbol in self.Securities else 0
-                                if current_price > 0:
-                                    pnl = self._record_exit_pnl(symbol, entry, current_price)
+                                pnl = self._record_exit_pnl(symbol, entry, current_price)
+                                if pnl is not None:
                                     self.Debug(f"⚠️ MISSED EXIT FILL: {symbol.Value} | PnL: {pnl:+.2%} | Entry: ${entry:.4f} | Exit: ${current_price:.4f}")
-                                cleanup_position(self, symbol)
+                                    cleanup_position(self, symbol)
+                                else:
+                                    self.Debug(f"⚠️ MISSED EXIT FILL: {symbol.Value} | Cannot calculate PnL (invalid price), cleaning up anyway")
+                                    cleanup_position(self, symbol)
                             symbols_to_remove.append(symbol)
                             self._order_retries.pop(order_id, None)
                             continue
@@ -462,10 +466,13 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                         if entry:
                             # Calculate PnL using last known price
                             current_price = self.Securities[symbol].Price if symbol in self.Securities else 0
-                            if current_price > 0:
-                                pnl = self._record_exit_pnl(symbol, entry, current_price)
+                            pnl = self._record_exit_pnl(symbol, entry, current_price)
+                            if pnl is not None:
                                 self.Debug(f"⚠️ MISSED EXIT FILL (position gone): {symbol.Value} | PnL: {pnl:+.2%} | Entry: ${entry:.4f} | Estimated Exit: ${current_price:.4f}")
-                            cleanup_position(self, symbol)
+                                cleanup_position(self, symbol)
+                            else:
+                                self.Debug(f"⚠️ MISSED EXIT FILL (position gone): {symbol.Value} | Cannot calculate PnL (invalid price), cleaning up anyway")
+                                cleanup_position(self, symbol)
                         symbols_to_remove.append(symbol)
                         self._order_retries.pop(order_id, None)
                         continue
