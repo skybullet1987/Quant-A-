@@ -1046,6 +1046,7 @@ def portfolio_sanity_check(algo):
     Check for portfolio value mismatches between QC and tracked positions.
     Fixed: Use CashBook["USD"].Amount for actual USD cash, not Portfolio.Cash
     (which in Cash account mode includes crypto holdings value).
+    Fix 6: Trigger resync_holdings_full on mismatch and log detailed breakdown.
     """
     if algo.IsWarmingUp:
         return
@@ -1059,12 +1060,16 @@ def portfolio_sanity_check(algo):
         usd_cash = algo.Portfolio.Cash
     
     tracked_value = 0.0
+    tracked_positions = {}
     
     for sym in list(algo.entry_prices.keys()):
         if sym in algo.Securities:
             price = algo.Securities[sym].Price
             if sym in algo.Portfolio:
-                tracked_value += abs(algo.Portfolio[sym].Quantity) * price
+                qty = algo.Portfolio[sym].Quantity
+                value = abs(qty) * price
+                tracked_value += value
+                tracked_positions[sym.Value] = {'qty': qty, 'price': price, 'value': value}
     
     expected = usd_cash + tracked_value
     
@@ -1076,7 +1081,65 @@ def portfolio_sanity_check(algo):
         should_warn = pct_diff > algo.portfolio_mismatch_threshold and abs_diff > algo.portfolio_mismatch_min_dollars
         if should_warn:
             if algo._last_mismatch_warning is None or (algo.Time - algo._last_mismatch_warning).total_seconds() >= algo.portfolio_mismatch_cooldown_seconds:
-                algo.Debug(f"⚠️ PORTFOLIO MISMATCH: QC total=${total_qc:.2f} but usd_cash+tracked=${expected:.2f} (diff=${abs_diff:.2f})")
+                algo.Debug(f"⚠️ PORTFOLIO MISMATCH: QC total=${total_qc:.2f} but usd_cash+tracked=${expected:.2f} (diff=${abs_diff:.2f}, {pct_diff:.2%})")
+                
+                # Log detailed breakdown
+                algo.Debug("=== PORTFOLIO BREAKDOWN ===")
+                algo.Debug(f"USD Cash: ${usd_cash:.2f}")
+                
+                # Show tracked positions
+                if tracked_positions:
+                    algo.Debug(f"Tracked Positions ({len(tracked_positions)}):")
+                    for ticker, info in tracked_positions.items():
+                        algo.Debug(f"  {ticker}: qty={info['qty']:.6f}, price=${info['price']:.4f}, value=${info['value']:.2f}")
+                else:
+                    algo.Debug("Tracked Positions: None")
+                
+                # Show untracked portfolio holdings
+                untracked = []
+                for symbol in algo.Portfolio.Keys:
+                    holding = algo.Portfolio[symbol]
+                    if holding.Invested and holding.Quantity != 0:
+                        if symbol not in algo.entry_prices:
+                            price = algo.Securities[symbol].Price if symbol in algo.Securities else holding.Price
+                            value = abs(holding.Quantity) * price
+                            untracked.append({'ticker': symbol.Value, 'qty': holding.Quantity, 'price': price, 'value': value})
+                
+                if untracked:
+                    algo.Debug(f"Untracked Portfolio Holdings ({len(untracked)}):")
+                    for info in untracked:
+                        algo.Debug(f"  {info['ticker']}: qty={info['qty']:.6f}, price=${info['price']:.4f}, value=${info['value']:.2f}")
+                else:
+                    algo.Debug("Untracked Portfolio Holdings: None")
+                
+                # Show crypto CashBook entries (non-USD currencies)
+                crypto_cash = []
+                try:
+                    for currency, cash in algo.Portfolio.CashBook.items():
+                        if currency != "USD" and cash.Amount != 0:
+                            crypto_cash.append({'currency': currency, 'amount': cash.Amount, 'value': cash.ValueInAccountCurrency})
+                except Exception:
+                    pass
+                
+                if crypto_cash:
+                    algo.Debug(f"Crypto CashBook Entries ({len(crypto_cash)}):")
+                    for info in crypto_cash:
+                        algo.Debug(f"  {info['currency']}: amount={info['amount']:.6f}, value=${info['value']:.2f}")
+                else:
+                    algo.Debug("Crypto CashBook Entries: None")
+                
+                # Show which side is higher
+                if total_qc > expected:
+                    algo.Debug(f"QC Portfolio is higher by ${abs_diff:.2f} ({pct_diff:.2%})")
+                else:
+                    algo.Debug(f"Tracked value is higher by ${abs_diff:.2f} ({pct_diff:.2%})")
+                
+                algo.Debug("=== END BREAKDOWN ===")
+                
+                # Trigger resync_holdings_full to attempt auto-fix
+                algo.Debug("Triggering resync_holdings_full to attempt auto-fix...")
+                resync_holdings_full(algo)
+                
                 algo._last_mismatch_warning = algo.Time
 
 
