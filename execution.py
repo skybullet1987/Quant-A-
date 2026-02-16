@@ -469,46 +469,6 @@ def sync_existing_positions(algo):
         # Let OnOrderEvent handle cleanup and PnL tracking on fill
 
 
-def resync_holdings(algo):
-    """
-    Live-only safety: backfills tracking for any holdings that exist in the brokerage
-    but were not registered via OnOrderEvent (e.g., missed fill events).
-    """
-    if algo.IsWarmingUp: return
-    if not algo.LiveMode: return
-    missing = []
-    for symbol in algo.Portfolio.Keys:
-        holding = algo.Portfolio[symbol]
-        if not holding.Invested or holding.Quantity == 0:
-            continue
-        if symbol in algo.entry_prices:
-            continue
-        if symbol in algo._exit_cooldowns and algo.Time < algo._exit_cooldowns[symbol]:
-            continue
-        # Check if there are non-stale open orders
-        # If all open orders are stale, we should resync anyway
-        if has_non_stale_open_orders(algo, symbol):
-            continue
-        missing.append(symbol)
-    if not missing:
-        return
-    algo.Debug(f"RESYNC: detected {len(missing)} holdings without tracking; backfilling.")
-    for symbol in missing:
-        try:
-            if symbol not in algo.Securities:
-                algo.AddCrypto(symbol.Value, Resolution.Hour, Market.Kraken)
-            holding = algo.Portfolio[symbol]
-            entry = holding.AveragePrice
-            algo.entry_prices[symbol] = entry
-            algo.highest_prices[symbol] = entry
-            algo.entry_times[symbol] = algo.Time
-            current_price = algo.Securities[symbol].Price if symbol in algo.Securities else holding.Price
-            pnl_pct = (current_price - entry) / entry if entry > 0 else 0
-            algo.Debug(f"RESYNCED: {symbol.Value} | Qty: {holding.Quantity} | Entry: ${entry:.4f} | Now: ${current_price:.4f} | PnL: {pnl_pct:+.2%}")
-        except Exception as e:
-            algo.Debug(f"Resync error {symbol.Value}: {e}")
-
-
 def debug_limited(algo, msg):
     if "CANCELED" in msg or "ZOMBIE" in msg or "INVALID" in msg:
         algo.Debug(msg)
