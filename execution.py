@@ -141,6 +141,17 @@ def round_quantity(algo, symbol, quantity):
         return quantity
 
 
+def track_exit_order(algo, symbol, ticket, quantity):
+    """Helper to track exit order in _submitted_orders for verification."""
+    if hasattr(algo, '_submitted_orders') and ticket is not None:
+        algo._submitted_orders[symbol] = {
+            'order_id': ticket.OrderId,
+            'time': algo.Time,
+            'quantity': quantity,
+            'intent': 'exit'
+        }
+
+
 def smart_liquidate(algo, symbol, tag="Liquidate"):
     if len(algo.Transactions.GetOpenOrders(symbol)) > 0:
         return
@@ -186,13 +197,7 @@ def smart_liquidate(algo, symbol, tag="Liquidate"):
                 if spread_pct > 0.03:  # 3% spread - log warning but still exit with market
                     algo.Debug(f"⚠️ WIDE SPREAD EXIT: {symbol.Value} spread={spread_pct:.2%}, using market order")
                     ticket = algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
-                    if hasattr(algo, '_submitted_orders') and ticket is not None:
-                        algo._submitted_orders[symbol] = {
-                            'order_id': ticket.OrderId,
-                            'time': algo.Time,
-                            'quantity': safe_qty * direction_mult,
-                            'intent': 'exit'
-                        }
+                    track_exit_order(algo, symbol, ticket, safe_qty * direction_mult)
                 elif algo.LiveMode and spread_pct > 0.015:  # 1.5% spread - use limit order with fallback (live mode only)
                     try:
                         sec = algo.Securities[symbol]
@@ -213,53 +218,23 @@ def smart_liquidate(algo, symbol, tag="Liquidate"):
                             algo.Debug(f"LIMIT EXIT: {symbol.Value} at mid ${mid:.4f} (spread={spread_pct:.2%})")
                         else:
                             ticket = algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
-                            if hasattr(algo, '_submitted_orders') and ticket is not None:
-                                algo._submitted_orders[symbol] = {
-                                    'order_id': ticket.OrderId,
-                                    'time': algo.Time,
-                                    'quantity': safe_qty * direction_mult,
-                                    'intent': 'exit'
-                                }
+                            track_exit_order(algo, symbol, ticket, safe_qty * direction_mult)
                     except Exception as e:
                         algo.Debug(f"Error placing limit exit for {symbol.Value}: {e}")
                         ticket = algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
-                        if hasattr(algo, '_submitted_orders') and ticket is not None:
-                            algo._submitted_orders[symbol] = {
-                                'order_id': ticket.OrderId,
-                                'time': algo.Time,
-                                'quantity': safe_qty * direction_mult,
-                                'intent': 'exit'
-                            }
+                        track_exit_order(algo, symbol, ticket, safe_qty * direction_mult)
                 else:
                     # Spread is acceptable, use market order
                     ticket = algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
-                    if hasattr(algo, '_submitted_orders') and ticket is not None:
-                        algo._submitted_orders[symbol] = {
-                            'order_id': ticket.OrderId,
-                            'time': algo.Time,
-                            'quantity': safe_qty * direction_mult,
-                            'intent': 'exit'
-                        }
+                    track_exit_order(algo, symbol, ticket, safe_qty * direction_mult)
             else:
                 # Spread unknown, use market order
                 ticket = algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
-                if hasattr(algo, '_submitted_orders') and ticket is not None:
-                    algo._submitted_orders[symbol] = {
-                        'order_id': ticket.OrderId,
-                        'time': algo.Time,
-                        'quantity': safe_qty * direction_mult,
-                        'intent': 'exit'
-                    }
+                track_exit_order(algo, symbol, ticket, safe_qty * direction_mult)
         else:
             # Stop loss - always use market order
             ticket = algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
-            if hasattr(algo, '_submitted_orders') and ticket is not None:
-                algo._submitted_orders[symbol] = {
-                    'order_id': ticket.OrderId,
-                    'time': algo.Time,
-                    'quantity': safe_qty * direction_mult,
-                    'intent': 'exit'
-                }
+            track_exit_order(algo, symbol, ticket, safe_qty * direction_mult)
     else:
         algo.Debug(f"Warning: {symbol.Value} holding {holding_qty} rounds to 0")
 
