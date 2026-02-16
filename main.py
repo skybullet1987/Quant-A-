@@ -199,6 +199,29 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             self.Debug(f"Error getting parameter {name}: {e}")
             return default
 
+    def _normalize_order_time(self, order_time):
+        """Helper to normalize order time by removing timezone info if present."""
+        return order_time.replace(tzinfo=None) if order_time.tzinfo is not None else order_time
+    
+    def _record_exit_pnl(self, symbol, entry_price, exit_price):
+        """Helper to record PnL from an exit trade. Returns None if prices are invalid."""
+        if entry_price <= 0 or exit_price <= 0:
+            self.Debug(f"⚠️ Cannot record PnL for {symbol.Value}: invalid prices (entry=${entry_price:.4f}, exit=${exit_price:.4f})")
+            return None
+        
+        pnl = (exit_price - entry_price) / entry_price
+        self._rolling_wins.append(1 if pnl > 0 else 0)
+        if pnl > 0:
+            self._rolling_win_sizes.append(pnl)
+            self.winning_trades += 1
+            self.consecutive_losses = 0
+        else:
+            self._rolling_loss_sizes.append(abs(pnl))
+            self.losing_trades += 1
+            self.consecutive_losses += 1
+        self.total_pnl += pnl
+        return pnl
+
     def EmitInsights(self, *insights):
         return []
 
@@ -221,8 +244,26 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if self.Portfolio.Cash < 5:
             issues.append(f"Low cash: ${self.Portfolio.Cash:.2f}")
         for symbol in list(self.entry_prices.keys()):
-            if len(self.Transactions.GetOpenOrders(symbol)) > 0:
-                continue
+            open_orders = self.Transactions.GetOpenOrders(symbol)
+            if len(open_orders) > 0:
+                # Check if all orders are stuck (older than timeout)
+                all_stale = True
+                for o in open_orders:
+                    order_time = self._normalize_order_time(o.Time)
+                    if (self.Time - order_time).total_seconds() <= self.live_stale_order_timeout_seconds:
+                        all_stale = False
+                        break
+                if not all_stale:
+                    continue  # Has non-stale orders, skip this symbol
+                
+                # All orders are stale - cancel them
+                for o in open_orders:
+                    try:
+                        self.Transactions.CancelOrder(o.Id)
+                        issues.append(f"Canceled stale order: {symbol.Value} (order {o.Id})")
+                    except Exception as e:
+                        self.Debug(f"Error canceling stale order for {symbol.Value}: {e}")
+            
             if not is_invested_not_dust(self, symbol):
                 issues.append(f"Orphan tracking: {symbol.Value}")
                 cleanup_position(self, symbol)
@@ -271,23 +312,65 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if has_non_stale_open_orders(self, symbol):
                 continue
             missing.append(symbol)
-        if not missing:
-            return
-        self.Debug(f"RESYNC: detected {len(missing)} holdings without tracking; backfilling.")
-        for symbol in missing:
-            try:
-                if symbol not in self.Securities:
-                    self.AddCrypto(symbol.Value, Resolution.Hour, Market.Kraken)
-                holding = self.Portfolio[symbol]
-                entry = holding.AveragePrice
-                self.entry_prices[symbol] = entry
-                self.highest_prices[symbol] = entry
-                self.entry_times[symbol] = self.Time
-                current_price = self.Securities[symbol].Price if symbol in self.Securities else holding.Price
-                pnl_pct = (current_price - entry) / entry if entry > 0 else 0
-                self.Debug(f"RESYNCED: {symbol.Value} | Qty: {holding.Quantity} | Entry: ${entry:.4f} | Now: ${current_price:.4f} | PnL: {pnl_pct:+.2%}")
-            except Exception as e:
-                self.Debug(f"Resync error {symbol.Value}: {e}")
+        if missing:
+            self.Debug(f"RESYNC: detected {len(missing)} holdings without tracking; backfilling.")
+            for symbol in missing:
+                try:
+                    if symbol not in self.Securities:
+                        self.AddCrypto(symbol.Value, Resolution.Hour, Market.Kraken)
+                    holding = self.Portfolio[symbol]
+                    entry = holding.AveragePrice
+                    self.entry_prices[symbol] = entry
+                    self.highest_prices[symbol] = entry
+                    self.entry_times[symbol] = self.Time
+                    current_price = self.Securities[symbol].Price if symbol in self.Securities else holding.Price
+                    pnl_pct = (current_price - entry) / entry if entry > 0 else 0
+                    self.Debug(f"RESYNCED: {symbol.Value} | Qty: {holding.Quantity} | Entry: ${entry:.4f} | Now: ${current_price:.4f} | PnL: {pnl_pct:+.2%}")
+                except Exception as e:
+                    self.Debug(f"Resync error {symbol.Value}: {e}")
+        
+        # Reverse resync: detect positions we're tracking but broker no longer holds
+        phantoms = []
+        for symbol in list(self.entry_prices.keys()):
+            # Skip if order still pending
+            if symbol in self._submitted_orders:
+                continue
+            # Skip if in exit cooldown
+            if symbol in self._exit_cooldowns and self.Time < self._exit_cooldowns[symbol]:
+                continue
+            
+            holding = self.Portfolio[symbol] if symbol in self.Portfolio else None
+            if holding is None or not holding.Invested or holding.Quantity == 0:
+                # We're tracking this position but broker says it's gone
+                # Check for open orders first
+                open_orders = self.Transactions.GetOpenOrders(symbol)
+                if len(open_orders) > 0:
+                    # Has open orders - check if all are stuck
+                    all_stuck = True
+                    for o in open_orders:
+                        order_time = self._normalize_order_time(o.Time)
+                        if (self.Time - order_time).total_seconds() <= self.live_stale_order_timeout_seconds:
+                            all_stuck = False
+                            break
+                    
+                    if not all_stuck:
+                        continue  # Has non-stuck orders, wait
+                    
+                    # All orders are stuck - cancel them
+                    for o in open_orders:
+                        try:
+                            self.Transactions.CancelOrder(o.Id)
+                            self.Debug(f"PHANTOM: Canceling stuck order {o.Id} for {symbol.Value}")
+                        except Exception as e:
+                            self.Debug(f"Error canceling stuck order for {symbol.Value}: {e}")
+                
+                phantoms.append(symbol)
+        
+        if phantoms:
+            self.Debug(f"⚠️ REVERSE RESYNC: detected {len(phantoms)} phantom positions")
+            for symbol in phantoms:
+                self.Debug(f"⚠️ PHANTOM POSITION DETECTED: {symbol.Value} — tracked but broker qty=0, cleaning up")
+                cleanup_position(self, symbol)
 
     def VerifyOrderFills(self):
         """Verify submitted orders filled/timed out. Retry once before blacklisting."""
@@ -330,30 +413,73 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             
             # Check for missed fills (order filled but event missed)
             if order_age_seconds > self.order_fill_check_threshold_seconds:
-                if symbol in self.Portfolio and self.Portfolio[symbol].Invested:
-                    # Verify the order is actually filled by checking its status
-                    try:
-                        order = self.Transactions.GetOrderById(order_id)
-                        if order is not None and order.Status == OrderStatus.Filled:
-                            holding = self.Portfolio[symbol]
-                            entry_price = holding.AveragePrice
-                            current_price = self.Securities[symbol].Price if symbol in self.Securities else holding.Price
-                            
-                            # Only set tracking if not already tracked (avoid double increment)
-                            if symbol not in self.entry_prices:
-                                self.entry_prices[symbol] = entry_price
-                                self.highest_prices[symbol] = max(current_price, entry_price)
-                                self.entry_times[symbol] = order_info['time']
-                                self.daily_trade_count += 1
-                                self.Debug(f"FILL VERIFIED (missed event): {symbol.Value} | Entry: ${entry_price:.4f} | Qty: {holding.Quantity}")
-                            
+                intent = order_info.get('intent', 'entry')
+                
+                # Check order status
+                try:
+                    order = self.Transactions.GetOrderById(order_id)
+                    if order is not None and order.Status == OrderStatus.Filled:
+                        # Order filled but we missed the event
+                        if intent == 'exit':
+                            # Exit order filled - position should be gone
+                            entry = self.entry_prices.get(symbol, None)
+                            if entry:
+                                # Calculate PnL using last known price
+                                current_price = self.Securities[symbol].Price if symbol in self.Securities else None
+                                if current_price is not None and current_price > 0:
+                                    pnl = self._record_exit_pnl(symbol, entry, current_price)
+                                    if pnl is not None:
+                                        self.Debug(f"⚠️ MISSED EXIT FILL: {symbol.Value} | PnL: {pnl:+.2%} | Entry: ${entry:.4f} | Exit: ${current_price:.4f}")
+                                    else:
+                                        self.Debug(f"⚠️ MISSED EXIT FILL: {symbol.Value} | Cannot calculate PnL (invalid price), cleaning up anyway")
+                                else:
+                                    self.Debug(f"⚠️ MISSED EXIT FILL: {symbol.Value} | Cannot get current price, cleaning up without PnL")
+                                cleanup_position(self, symbol)
                             symbols_to_remove.append(symbol)
                             self._order_retries.pop(order_id, None)
                             continue
-                        # Position exists but order not filled - might be partial fill or pre-existing position
-                        # Let timeout handle it
-                    except Exception as e:
-                        self.Debug(f"Error checking order status for {symbol.Value}: {e}")
+                        else:
+                            # Entry order filled
+                            if symbol in self.Portfolio and self.Portfolio[symbol].Invested:
+                                holding = self.Portfolio[symbol]
+                                entry_price = holding.AveragePrice
+                                current_price = self.Securities[symbol].Price if symbol in self.Securities else holding.Price
+                                
+                                # Only set tracking if not already tracked (avoid double increment)
+                                if symbol not in self.entry_prices:
+                                    self.entry_prices[symbol] = entry_price
+                                    self.highest_prices[symbol] = max(current_price, entry_price)
+                                    self.entry_times[symbol] = order_info['time']
+                                    self.daily_trade_count += 1
+                                    self.Debug(f"FILL VERIFIED (missed event): {symbol.Value} | Entry: ${entry_price:.4f} | Qty: {holding.Quantity}")
+                                
+                                symbols_to_remove.append(symbol)
+                                self._order_retries.pop(order_id, None)
+                                continue
+                except Exception as e:
+                    self.Debug(f"Error checking order status for {symbol.Value}: {e}")
+                
+                # Check for exit orders where position is now gone (fill event missed)
+                if intent == 'exit':
+                    holding = self.Portfolio[symbol] if symbol in self.Portfolio else None
+                    if holding is None or not holding.Invested or holding.Quantity == 0:
+                        # Position is gone - the exit filled but we missed the event
+                        entry = self.entry_prices.get(symbol, None)
+                        if entry:
+                            # Calculate PnL using last known price
+                            current_price = self.Securities[symbol].Price if symbol in self.Securities else None
+                            if current_price is not None and current_price > 0:
+                                pnl = self._record_exit_pnl(symbol, entry, current_price)
+                                if pnl is not None:
+                                    self.Debug(f"⚠️ MISSED EXIT FILL (position gone): {symbol.Value} | PnL: {pnl:+.2%} | Entry: ${entry:.4f} | Estimated Exit: ${current_price:.4f}")
+                                else:
+                                    self.Debug(f"⚠️ MISSED EXIT FILL (position gone): {symbol.Value} | Cannot calculate PnL (invalid price), cleaning up anyway")
+                            else:
+                                self.Debug(f"⚠️ MISSED EXIT FILL (position gone): {symbol.Value} | Cannot get current price, cleaning up without PnL")
+                            cleanup_position(self, symbol)
+                        symbols_to_remove.append(symbol)
+                        self._order_retries.pop(order_id, None)
+                        continue
             
             # Handle timeout with retry logic
             if order_age_seconds > timeout:
