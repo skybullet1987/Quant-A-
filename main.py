@@ -425,14 +425,16 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                             entry = self.entry_prices.get(symbol, None)
                             if entry:
                                 # Calculate PnL using last known price
-                                current_price = self.Securities[symbol].Price if symbol in self.Securities else 0
-                                pnl = self._record_exit_pnl(symbol, entry, current_price)
-                                if pnl is not None:
-                                    self.Debug(f"⚠️ MISSED EXIT FILL: {symbol.Value} | PnL: {pnl:+.2%} | Entry: ${entry:.4f} | Exit: ${current_price:.4f}")
-                                    cleanup_position(self, symbol)
+                                current_price = self.Securities[symbol].Price if symbol in self.Securities else None
+                                if current_price is not None and current_price > 0:
+                                    pnl = self._record_exit_pnl(symbol, entry, current_price)
+                                    if pnl is not None:
+                                        self.Debug(f"⚠️ MISSED EXIT FILL: {symbol.Value} | PnL: {pnl:+.2%} | Entry: ${entry:.4f} | Exit: ${current_price:.4f}")
+                                    else:
+                                        self.Debug(f"⚠️ MISSED EXIT FILL: {symbol.Value} | Cannot calculate PnL (invalid price), cleaning up anyway")
                                 else:
-                                    self.Debug(f"⚠️ MISSED EXIT FILL: {symbol.Value} | Cannot calculate PnL (invalid price), cleaning up anyway")
-                                    cleanup_position(self, symbol)
+                                    self.Debug(f"⚠️ MISSED EXIT FILL: {symbol.Value} | Cannot get current price, cleaning up without PnL")
+                                cleanup_position(self, symbol)
                             symbols_to_remove.append(symbol)
                             self._order_retries.pop(order_id, None)
                             continue
@@ -465,14 +467,16 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                         entry = self.entry_prices.get(symbol, None)
                         if entry:
                             # Calculate PnL using last known price
-                            current_price = self.Securities[symbol].Price if symbol in self.Securities else 0
-                            pnl = self._record_exit_pnl(symbol, entry, current_price)
-                            if pnl is not None:
-                                self.Debug(f"⚠️ MISSED EXIT FILL (position gone): {symbol.Value} | PnL: {pnl:+.2%} | Entry: ${entry:.4f} | Estimated Exit: ${current_price:.4f}")
-                                cleanup_position(self, symbol)
+                            current_price = self.Securities[symbol].Price if symbol in self.Securities else None
+                            if current_price is not None and current_price > 0:
+                                pnl = self._record_exit_pnl(symbol, entry, current_price)
+                                if pnl is not None:
+                                    self.Debug(f"⚠️ MISSED EXIT FILL (position gone): {symbol.Value} | PnL: {pnl:+.2%} | Entry: ${entry:.4f} | Estimated Exit: ${current_price:.4f}")
+                                else:
+                                    self.Debug(f"⚠️ MISSED EXIT FILL (position gone): {symbol.Value} | Cannot calculate PnL (invalid price), cleaning up anyway")
                             else:
-                                self.Debug(f"⚠️ MISSED EXIT FILL (position gone): {symbol.Value} | Cannot calculate PnL (invalid price), cleaning up anyway")
-                                cleanup_position(self, symbol)
+                                self.Debug(f"⚠️ MISSED EXIT FILL (position gone): {symbol.Value} | Cannot get current price, cleaning up without PnL")
+                            cleanup_position(self, symbol)
                         symbols_to_remove.append(symbol)
                         self._order_retries.pop(order_id, None)
                         continue
