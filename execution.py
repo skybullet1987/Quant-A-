@@ -407,7 +407,21 @@ def spread_ok(algo, symbol):
     return True
 
 
-def cleanup_position(algo, symbol):
+def cleanup_position(algo, symbol, record_pnl=False, exit_price=None):
+    """
+    Clean up position tracking for a symbol.
+    If record_pnl=True, records the PnL before cleanup using record_exit_pnl helper.
+    """
+    entry_price = algo.entry_prices.get(symbol, None)
+    if record_pnl and entry_price is not None and entry_price > 0:
+        if exit_price is None:
+            try:
+                exit_price = algo.Securities[symbol].Price if symbol in algo.Securities else 0
+            except Exception:
+                exit_price = 0
+        if exit_price > 0:
+            record_exit_pnl(algo, symbol, entry_price, exit_price)
+    # Then do existing cleanup
     algo.entry_prices.pop(symbol, None)
     algo.highest_prices.pop(symbol, None)
     algo.entry_times.pop(symbol, None)
@@ -910,7 +924,12 @@ def resync_holdings_full(algo):
         algo.Debug(f"⚠️ REVERSE RESYNC: detected {len(phantoms)} phantom positions")
         for symbol in phantoms:
             algo.Debug(f"⚠️ PHANTOM POSITION DETECTED: {symbol.Value} — tracked but broker qty=0, cleaning up")
-            cleanup_position(algo, symbol)
+            cleanup_position(algo, symbol, record_pnl=True)
+            # Fix 3: Set exit cooldown after phantom cleanup
+            if hasattr(algo, 'exit_cooldown_hours') and hasattr(algo, '_exit_cooldowns'):
+                algo._exit_cooldowns[symbol] = algo.Time + timedelta(hours=algo.exit_cooldown_hours)
+        # Fix 4: Call persist_state after phantom cleanup
+        persist_state(algo)
 
 
 def verify_order_fills(algo):
