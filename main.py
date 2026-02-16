@@ -199,6 +199,28 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             self.Debug(f"Error getting parameter {name}: {e}")
             return default
 
+    def _normalize_order_time(self, order_time):
+        """Helper to normalize order time by removing timezone info if present."""
+        return order_time.replace(tzinfo=None) if order_time.tzinfo is not None else order_time
+    
+    def _record_exit_pnl(self, symbol, entry_price, exit_price):
+        """Helper to record PnL from an exit trade."""
+        if entry_price <= 0 or exit_price <= 0:
+            return 0
+        
+        pnl = (exit_price - entry_price) / entry_price
+        self._rolling_wins.append(1 if pnl > 0 else 0)
+        if pnl > 0:
+            self._rolling_win_sizes.append(pnl)
+            self.winning_trades += 1
+            self.consecutive_losses = 0
+        else:
+            self._rolling_loss_sizes.append(abs(pnl))
+            self.losing_trades += 1
+            self.consecutive_losses += 1
+        self.total_pnl += pnl
+        return pnl
+
     def EmitInsights(self, *insights):
         return []
 
@@ -226,7 +248,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 # Check if all orders are stuck (older than timeout)
                 all_stale = True
                 for o in open_orders:
-                    order_time = o.Time.replace(tzinfo=None) if o.Time.tzinfo is not None else o.Time
+                    order_time = self._normalize_order_time(o.Time)
                     if (self.Time - order_time).total_seconds() <= self.live_stale_order_timeout_seconds:
                         all_stale = False
                         break
@@ -325,7 +347,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     # Has open orders - check if all are stuck
                     all_stuck = True
                     for o in open_orders:
-                        order_time = o.Time.replace(tzinfo=None) if o.Time.tzinfo else o.Time
+                        order_time = self._normalize_order_time(o.Time)
                         if (self.Time - order_time).total_seconds() <= self.live_stale_order_timeout_seconds:
                             all_stuck = False
                             break
@@ -404,17 +426,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                                 # Calculate PnL using last known price
                                 current_price = self.Securities[symbol].Price if symbol in self.Securities else 0
                                 if current_price > 0:
-                                    pnl = (current_price - entry) / entry
-                                    self._rolling_wins.append(1 if pnl > 0 else 0)
-                                    if pnl > 0:
-                                        self._rolling_win_sizes.append(pnl)
-                                        self.winning_trades += 1
-                                        self.consecutive_losses = 0
-                                    else:
-                                        self._rolling_loss_sizes.append(abs(pnl))
-                                        self.losing_trades += 1
-                                        self.consecutive_losses += 1
-                                    self.total_pnl += pnl
+                                    pnl = self._record_exit_pnl(symbol, entry, current_price)
                                     self.Debug(f"⚠️ MISSED EXIT FILL: {symbol.Value} | PnL: {pnl:+.2%} | Entry: ${entry:.4f} | Exit: ${current_price:.4f}")
                                 cleanup_position(self, symbol)
                             symbols_to_remove.append(symbol)
@@ -451,17 +463,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                             # Calculate PnL using last known price
                             current_price = self.Securities[symbol].Price if symbol in self.Securities else 0
                             if current_price > 0:
-                                pnl = (current_price - entry) / entry
-                                self._rolling_wins.append(1 if pnl > 0 else 0)
-                                if pnl > 0:
-                                    self._rolling_win_sizes.append(pnl)
-                                    self.winning_trades += 1
-                                    self.consecutive_losses = 0
-                                else:
-                                    self._rolling_loss_sizes.append(abs(pnl))
-                                    self.losing_trades += 1
-                                    self.consecutive_losses += 1
-                                self.total_pnl += pnl
+                                pnl = self._record_exit_pnl(symbol, entry, current_price)
                                 self.Debug(f"⚠️ MISSED EXIT FILL (position gone): {symbol.Value} | PnL: {pnl:+.2%} | Entry: ${entry:.4f} | Estimated Exit: ${current_price:.4f}")
                             cleanup_position(self, symbol)
                         symbols_to_remove.append(symbol)
