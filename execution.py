@@ -141,6 +141,17 @@ def round_quantity(algo, symbol, quantity):
         return quantity
 
 
+def track_exit_order(algo, symbol, ticket, quantity):
+    """Helper to track exit order in _submitted_orders for verification."""
+    if hasattr(algo, '_submitted_orders') and ticket is not None:
+        algo._submitted_orders[symbol] = {
+            'order_id': ticket.OrderId,
+            'time': algo.Time,
+            'quantity': quantity,
+            'intent': 'exit'
+        }
+
+
 def smart_liquidate(algo, symbol, tag="Liquidate"):
     if len(algo.Transactions.GetOpenOrders(symbol)) > 0:
         return
@@ -185,7 +196,8 @@ def smart_liquidate(algo, symbol, tag="Liquidate"):
             if spread_pct is not None:
                 if spread_pct > 0.03:  # 3% spread - log warning but still exit with market
                     algo.Debug(f"⚠️ WIDE SPREAD EXIT: {symbol.Value} spread={spread_pct:.2%}, using market order")
-                    algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
+                    ticket = algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
+                    track_exit_order(algo, symbol, ticket, safe_qty * direction_mult)
                 elif algo.LiveMode and spread_pct > 0.015:  # 1.5% spread - use limit order with fallback (live mode only)
                     try:
                         sec = algo.Securities[symbol]
@@ -205,19 +217,24 @@ def smart_liquidate(algo, symbol, tag="Liquidate"):
                                 }
                             algo.Debug(f"LIMIT EXIT: {symbol.Value} at mid ${mid:.4f} (spread={spread_pct:.2%})")
                         else:
-                            algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
+                            ticket = algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
+                            track_exit_order(algo, symbol, ticket, safe_qty * direction_mult)
                     except Exception as e:
                         algo.Debug(f"Error placing limit exit for {symbol.Value}: {e}")
-                        algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
+                        ticket = algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
+                        track_exit_order(algo, symbol, ticket, safe_qty * direction_mult)
                 else:
                     # Spread is acceptable, use market order
-                    algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
+                    ticket = algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
+                    track_exit_order(algo, symbol, ticket, safe_qty * direction_mult)
             else:
                 # Spread unknown, use market order
-                algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
+                ticket = algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
+                track_exit_order(algo, symbol, ticket, safe_qty * direction_mult)
         else:
             # Stop loss - always use market order
-            algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
+            ticket = algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
+            track_exit_order(algo, symbol, ticket, safe_qty * direction_mult)
     else:
         algo.Debug(f"Warning: {symbol.Value} holding {holding_qty} rounds to 0")
 
@@ -365,7 +382,21 @@ def spread_ok(algo, symbol):
     return True
 
 
-def cleanup_position(algo, symbol):
+def cleanup_position(algo, symbol, record_pnl=False, exit_price=None):
+    """
+    Clean up position tracking for a symbol.
+    If record_pnl=True, records the PnL before cleanup using record_exit_pnl helper.
+    """
+    entry_price = algo.entry_prices.get(symbol, None)
+    if record_pnl and entry_price is not None and entry_price > 0:
+        if exit_price is None:
+            try:
+                exit_price = algo.Securities[symbol].Price if symbol in algo.Securities else 0
+            except Exception:
+                exit_price = 0
+        if exit_price > 0:
+            record_exit_pnl(algo, symbol, entry_price, exit_price)
+    # Then do existing cleanup
     algo.entry_prices.pop(symbol, None)
     algo.highest_prices.pop(symbol, None)
     algo.entry_times.pop(symbol, None)
@@ -411,46 +442,6 @@ def sync_existing_positions(algo):
         algo.Debug(f"IMMEDIATE {reason}: {ticker} at {pnl_pct:+.2%}")
         smart_liquidate(algo, symbol, reason)
         # Let OnOrderEvent handle cleanup and PnL tracking on fill
-
-
-def resync_holdings(algo):
-    """
-    Live-only safety: backfills tracking for any holdings that exist in the brokerage
-    but were not registered via OnOrderEvent (e.g., missed fill events).
-    """
-    if algo.IsWarmingUp: return
-    if not algo.LiveMode: return
-    missing = []
-    for symbol in algo.Portfolio.Keys:
-        holding = algo.Portfolio[symbol]
-        if not holding.Invested or holding.Quantity == 0:
-            continue
-        if symbol in algo.entry_prices:
-            continue
-        if symbol in algo._exit_cooldowns and algo.Time < algo._exit_cooldowns[symbol]:
-            continue
-        # Check if there are non-stale open orders
-        # If all open orders are stale, we should resync anyway
-        if has_non_stale_open_orders(algo, symbol):
-            continue
-        missing.append(symbol)
-    if not missing:
-        return
-    algo.Debug(f"RESYNC: detected {len(missing)} holdings without tracking; backfilling.")
-    for symbol in missing:
-        try:
-            if symbol not in algo.Securities:
-                algo.AddCrypto(symbol.Value, Resolution.Hour, Market.Kraken)
-            holding = algo.Portfolio[symbol]
-            entry = holding.AveragePrice
-            algo.entry_prices[symbol] = entry
-            algo.highest_prices[symbol] = entry
-            algo.entry_times[symbol] = algo.Time
-            current_price = algo.Securities[symbol].Price if symbol in algo.Securities else holding.Price
-            pnl_pct = (current_price - entry) / entry if entry > 0 else 0
-            algo.Debug(f"RESYNCED: {symbol.Value} | Qty: {holding.Quantity} | Entry: ${entry:.4f} | Now: ${current_price:.4f} | PnL: {pnl_pct:+.2%}")
-        except Exception as e:
-            algo.Debug(f"Resync error {symbol.Value}: {e}")
 
 
 def debug_limited(algo, msg):
@@ -868,7 +859,12 @@ def resync_holdings_full(algo):
         algo.Debug(f"⚠️ REVERSE RESYNC: detected {len(phantoms)} phantom positions")
         for symbol in phantoms:
             algo.Debug(f"⚠️ PHANTOM POSITION DETECTED: {symbol.Value} — tracked but broker qty=0, cleaning up")
-            cleanup_position(algo, symbol)
+            cleanup_position(algo, symbol, record_pnl=True)
+            # Fix 3: Set exit cooldown after phantom cleanup
+            if hasattr(algo, 'exit_cooldown_hours') and hasattr(algo, '_exit_cooldowns'):
+                algo._exit_cooldowns[symbol] = algo.Time + timedelta(hours=algo.exit_cooldown_hours)
+        # Fix 4: Call persist_state after phantom cleanup
+        persist_state(algo)
 
 
 def verify_order_fills(algo):
@@ -1025,6 +1021,7 @@ def portfolio_sanity_check(algo):
     Check for portfolio value mismatches between QC and tracked positions.
     Fixed: Use CashBook["USD"].Amount for actual USD cash, not Portfolio.Cash
     (which in Cash account mode includes crypto holdings value).
+    Fix 6: Trigger resync_holdings_full on mismatch and log detailed breakdown.
     """
     if algo.IsWarmingUp:
         return
@@ -1038,12 +1035,16 @@ def portfolio_sanity_check(algo):
         usd_cash = algo.Portfolio.Cash
     
     tracked_value = 0.0
+    tracked_positions = {}
     
     for sym in list(algo.entry_prices.keys()):
         if sym in algo.Securities:
             price = algo.Securities[sym].Price
             if sym in algo.Portfolio:
-                tracked_value += abs(algo.Portfolio[sym].Quantity) * price
+                qty = algo.Portfolio[sym].Quantity
+                value = abs(qty) * price
+                tracked_value += value
+                tracked_positions[sym.Value] = {'qty': qty, 'price': price, 'value': value}
     
     expected = usd_cash + tracked_value
     
@@ -1055,7 +1056,65 @@ def portfolio_sanity_check(algo):
         should_warn = pct_diff > algo.portfolio_mismatch_threshold and abs_diff > algo.portfolio_mismatch_min_dollars
         if should_warn:
             if algo._last_mismatch_warning is None or (algo.Time - algo._last_mismatch_warning).total_seconds() >= algo.portfolio_mismatch_cooldown_seconds:
-                algo.Debug(f"⚠️ PORTFOLIO MISMATCH: QC total=${total_qc:.2f} but usd_cash+tracked=${expected:.2f} (diff=${abs_diff:.2f})")
+                algo.Debug(f"⚠️ PORTFOLIO MISMATCH: QC total=${total_qc:.2f} but usd_cash+tracked=${expected:.2f} (diff=${abs_diff:.2f}, {pct_diff:.2%})")
+                
+                # Log detailed breakdown
+                algo.Debug("=== PORTFOLIO BREAKDOWN ===")
+                algo.Debug(f"USD Cash: ${usd_cash:.2f}")
+                
+                # Show tracked positions
+                if tracked_positions:
+                    algo.Debug(f"Tracked Positions ({len(tracked_positions)}):")
+                    for ticker, info in tracked_positions.items():
+                        algo.Debug(f"  {ticker}: qty={info['qty']:.6f}, price=${info['price']:.4f}, value=${info['value']:.2f}")
+                else:
+                    algo.Debug("Tracked Positions: None")
+                
+                # Show untracked portfolio holdings
+                untracked = []
+                for symbol in algo.Portfolio.Keys:
+                    holding = algo.Portfolio[symbol]
+                    if holding.Invested and holding.Quantity != 0:
+                        if symbol not in algo.entry_prices:
+                            price = algo.Securities[symbol].Price if symbol in algo.Securities else holding.Price
+                            value = abs(holding.Quantity) * price
+                            untracked.append({'ticker': symbol.Value, 'qty': holding.Quantity, 'price': price, 'value': value})
+                
+                if untracked:
+                    algo.Debug(f"Untracked Portfolio Holdings ({len(untracked)}):")
+                    for info in untracked:
+                        algo.Debug(f"  {info['ticker']}: qty={info['qty']:.6f}, price=${info['price']:.4f}, value=${info['value']:.2f}")
+                else:
+                    algo.Debug("Untracked Portfolio Holdings: None")
+                
+                # Show crypto CashBook entries (non-USD currencies)
+                crypto_cash = []
+                try:
+                    for currency, cash in algo.Portfolio.CashBook.items():
+                        if currency != "USD" and cash.Amount != 0:
+                            crypto_cash.append({'currency': currency, 'amount': cash.Amount, 'value': cash.ValueInAccountCurrency})
+                except Exception:
+                    pass
+                
+                if crypto_cash:
+                    algo.Debug(f"Crypto CashBook Entries ({len(crypto_cash)}):")
+                    for info in crypto_cash:
+                        algo.Debug(f"  {info['currency']}: amount={info['amount']:.6f}, value=${info['value']:.2f}")
+                else:
+                    algo.Debug("Crypto CashBook Entries: None")
+                
+                # Show which side is higher
+                if total_qc > expected:
+                    algo.Debug(f"QC Portfolio is higher by ${abs_diff:.2f} ({pct_diff:.2%})")
+                else:
+                    algo.Debug(f"Tracked value is higher by ${abs_diff:.2f} ({pct_diff:.2%})")
+                
+                algo.Debug("=== END BREAKDOWN ===")
+                
+                # Trigger resync_holdings_full to attempt auto-fix
+                algo.Debug("Triggering resync_holdings_full to attempt auto-fix...")
+                resync_holdings_full(algo)
+                
                 algo._last_mismatch_warning = algo.Time
 
 
