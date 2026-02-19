@@ -730,11 +730,18 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 continue
             count_scored += 1
 
-            # FLASH PUMP: massive volume spike — bypass all standard checks
-            if factor_scores.get('flash_event', 0.0) > 0.8:
-                self.Debug(f"FLASH PUMP DETECTED ON {symbol.Value} - GOING ALL IN")
+            # KALMAN MEAN REVERSION: strong buy signal — enter immediately
+            if factor_scores.get('kalman_signal', 0.0) == 1.0:
+                self.Debug(f"KALMAN BUY SIGNAL ON {symbol.Value} - ENTERING POSITION")
                 self.SetHoldings(symbol, self.position_size_pct)
                 return
+
+            # KALMAN MEAN REVERSION: sell signal — exit position if invested
+            if factor_scores.get('kalman_signal', 0.0) == -1.0:
+                if is_invested_not_dust(self, symbol):
+                    self.Debug(f"KALMAN SELL SIGNAL ON {symbol.Value} - EXITING POSITION")
+                    smart_liquidate(self, symbol, "Kalman Sell Signal")
+                    continue
 
             composite_score = self._calculate_composite_score(factor_scores, crypto)
             net_score = self._apply_fee_adjustment(composite_score)

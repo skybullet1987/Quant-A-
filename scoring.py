@@ -21,6 +21,9 @@ class OpusScoringEngine:
             algorithm: Reference to OpusCryptoStrategy instance
         """
         self.algo = algorithm
+        self.kf_state = {}  # Kalman Filter states per symbol
+        self.Q = 0.0001     # Process noise
+        self.R = 0.01       # Measurement noise
     
     def get_sentiment_score(self, symbol):
         """
@@ -41,6 +44,48 @@ class OpusScoringEngine:
             Sentiment score between 0 (bearish) and 1 (bullish), 0.5 = neutral
         """
         return 0.5
+
+    def update_kalman(self, symbol, price):
+        """
+        Run a 1D Kalman Filter predict/update step for the given symbol and price.
+
+        Returns the Z-Score (deviation / std_dev), or 0.0 if not yet initialized.
+
+        Args:
+            symbol: Symbol object (used as dict key)
+            price: Latest observed price
+
+        Returns:
+            Z-Score float
+        """
+        if symbol not in self.kf_state:
+            # Initialize: state estimate = price, error covariance = 1.0, variance estimate = 1.0
+            self.kf_state[symbol] = {'x': price, 'P': 1.0, 'var': 1.0}
+            return 0.0
+
+        state = self.kf_state[symbol]
+        x = state['x']
+        P = state['P']
+
+        # Predict
+        P_pred = P + self.Q
+
+        # Update (Kalman gain)
+        K = P_pred / (P_pred + self.R)
+        innovation = price - x
+        x_new = x + K * innovation
+        P_new = (1.0 - K) * P_pred
+
+        # Update running variance via exponential moving average of squared innovations
+        state['var'] = 0.99 * state['var'] + 0.01 * (innovation ** 2)
+        std_dev = state['var'] ** 0.5
+
+        state['x'] = x_new
+        state['P'] = P_new
+
+        if std_dev < 1e-10:
+            return 0.0
+        return innovation / std_dev
 
     def _normalize(self, v, mn, mx):
         """Normalize value to [0, 1] range."""
@@ -232,6 +277,19 @@ class OpusScoringEngine:
                     scores['flash_event'] = 0.0
             else:
                 scores['flash_event'] = 0.0
+
+            # 11. KALMAN FILTER MEAN REVERSION SIGNAL
+            price = crypto.get('last_price', 0)
+            if price and price > 0:
+                z_score = self.update_kalman(symbol, price)
+                if z_score < -2.5:
+                    scores['kalman_signal'] = 1.0   # Strong Buy: price far below Kalman state
+                elif z_score > 2.0:
+                    scores['kalman_signal'] = -1.0  # Sell: price reverted or overshot
+                else:
+                    scores['kalman_signal'] = 0.0
+            else:
+                scores['kalman_signal'] = 0.0
 
             return scores
         except Exception as e:
