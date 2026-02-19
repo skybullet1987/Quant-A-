@@ -22,6 +22,26 @@ class OpusScoringEngine:
         """
         self.algo = algorithm
     
+    def get_sentiment_score(self, symbol):
+        """
+        Return a sentiment score for the given symbol.
+        
+        Currently returns a neutral 0.5 placeholder.
+        
+        To integrate live sentiment data in the future, consider using:
+        - TiingoNews: self.algo.AddData(TiingoNews, symbol) then query
+          self.algo.History(TiingoNews, symbol, 1, Resolution.Daily)
+        - CryptoWizard or similar alternative-data providers available
+          on QuantConnect via AddData / ObjectStore APIs.
+        
+        Args:
+            symbol: Symbol object for the asset
+            
+        Returns:
+            Sentiment score between 0 (bearish) and 1 (bullish), 0.5 = neutral
+        """
+        return 0.5
+
     def _normalize(self, v, mn, mx):
         """Normalize value to [0, 1] range."""
         if mx == mn:
@@ -74,25 +94,32 @@ class OpusScoringEngine:
                 vol_trend = (crypto['volume_ma'][-1] / (vol_ma_prev + 1e-8)) - 1
                 price_trend = np.mean(list(crypto['returns'])[-3:])
                 
-                # Continuous base score from price trend
-                base = 0.5 + price_trend * 20  # scale price trend to [0,1] range
-                base = max(0.1, min(0.9, base))
-                
-                # Volume trend bonus (continuous)
-                if vol_trend > 0:
-                    vol_bonus = min(0.15, vol_trend * 3)
-                    base += vol_bonus
-                
-                # Volume spike bonus (continuous, not binary)
-                if len(crypto['volume']) >= 12:
-                    median_vol = np.median(list(crypto['volume'])[-12:])
-                    current_vol = crypto['volume'][-1]
-                    if median_vol > 0:
-                        vol_ratio = current_vol / median_vol
-                        spike_bonus = min(0.1, max(0, (vol_ratio - 1.5) * 0.1))
-                        base += spike_bonus
-                
-                scores['volume_momentum'] = max(0.05, min(0.95, base))
+                # Whale detection: >50% volume increase vs MA forces max score.
+                # A 50% surge above the rolling volume MA is a statistically
+                # significant anomaly consistent with large-player accumulation.
+                # Forcing 1.0 ensures this conviction overrides other scoring noise.
+                if vol_trend > 0.5:
+                    scores['volume_momentum'] = 1.0
+                else:
+                    # Continuous base score from price trend
+                    base = 0.5 + price_trend * 20  # scale price trend to [0,1] range
+                    base = max(0.1, min(0.9, base))
+                    
+                    # Volume trend bonus (continuous)
+                    if vol_trend > 0:
+                        vol_bonus = min(0.15, vol_trend * 3)
+                        base += vol_bonus
+                    
+                    # Volume spike bonus (continuous, not binary)
+                    if len(crypto['volume']) >= 12:
+                        median_vol = np.median(list(crypto['volume'])[-12:])
+                        current_vol = crypto['volume'][-1]
+                        if median_vol > 0:
+                            vol_ratio = current_vol / median_vol
+                            spike_bonus = min(0.1, max(0, (vol_ratio - 1.5) * 0.1))
+                            base += spike_bonus
+                    
+                    scores['volume_momentum'] = max(0.05, min(0.95, base))
             else:
                 scores['volume_momentum'] = 0.5
 
@@ -185,6 +212,9 @@ class OpusScoringEngine:
 
             # 8. MULTI-TIMEFRAME ALIGNMENT (NEW)
             scores['multi_timeframe'] = self.calculate_multi_tf_score(crypto)
+
+            # 9. SENTIMENT
+            scores['sentiment'] = self.get_sentiment_score(symbol)
 
             return scores
         except Exception as e:
