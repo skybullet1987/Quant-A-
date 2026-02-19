@@ -729,7 +729,13 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if not factor_scores:
                 continue
             count_scored += 1
-            
+
+            # FLASH PUMP: massive volume spike — bypass all standard checks
+            if factor_scores.get('flash_event', 0.0) > 0.8:
+                self.Debug(f"FLASH PUMP DETECTED ON {symbol.Value} - GOING ALL IN")
+                self.SetHoldings(symbol, self.position_size_pct)
+                return
+
             composite_score = self._calculate_composite_score(factor_scores, crypto)
             net_score = self._apply_fee_adjustment(composite_score)
 

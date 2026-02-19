@@ -216,6 +216,23 @@ class OpusScoringEngine:
             # 9. SENTIMENT
             scores['sentiment'] = self.get_sentiment_score(symbol)
 
+            # 10. FLASH EVENT (volume spike vs 20-period MA)
+            if len(crypto['volume']) >= 20:
+                volumes = list(crypto['volume'])
+                avg_vol = np.mean(volumes[-20:])
+                current_vol = volumes[-1]
+                if avg_vol > 0:
+                    if current_vol > 10 * avg_vol:
+                        scores['flash_event'] = 1.0
+                    elif current_vol > 3 * avg_vol:
+                        scores['flash_event'] = 0.8
+                    else:
+                        scores['flash_event'] = 0.0
+                else:
+                    scores['flash_event'] = 0.0
+            else:
+                scores['flash_event'] = 0.0
+
             return scores
         except Exception as e:
             self.algo.Debug(f"Error in calculate_factor_scores for {symbol.Value}: {e}")
