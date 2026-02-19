@@ -1,6 +1,7 @@
 # region imports
 from AlgorithmImports import *
 from execution import *
+from scoring import OpusScoringEngine
 from collections import deque
 import numpy as np
 # endregion
@@ -159,6 +160,24 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
         self._last_skip_reason = None
 
+        # === Spike Sniper v5.0 ===
+        self.fear_greed = 50  # neutral default (0=extreme fear, 100=extreme greed)
+        self.whale_net_flow = 0  # net exchange flow (positive = sell pressure)
+        self.fng_symbol = None
+        self.whale_symbol = None
+        self._spike_entries = {}  # {symbol: True} — track which entries were spike-triggered
+
+        # Spike detection settings
+        self.explosion_volume_lookback = 24
+        self.explosion_bb_lookback = 12
+        self.explosion_high_conviction_threshold = 0.70  # bypass normal scoring
+        self.explosion_boost_threshold = 0.40  # boost composite score
+        self.spike_position_size_pct = 0.85  # aggressive sizing for spike entries
+        self.spike_stop_loss = 0.08  # wider stop for spike trades
+        self.spike_take_profit = 0.25  # higher TP target
+        self.spike_trailing_pct = 0.03  # tighter trail after profit
+        self.spike_time_exit_hours = 48  # longer time stop
+
         self.UniverseSettings.Resolution = Resolution.Hour
         self.AddUniverse(CryptoUniverse.Kraken(self.UniverseFilter))
 
@@ -167,6 +186,32 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             self.btc_symbol = btc.Symbol
         except Exception as e:
             self.Debug(f"Warning: Could not add BTC - {e}")
+
+        # Fear & Greed Index (daily, free)
+        try:
+            from alt_data import FearGreedData
+            self.fng_symbol = self.AddData(FearGreedData, "FNG", Resolution.Daily).Symbol
+            self.Debug("Added Fear & Greed data feed")
+        except Exception as e:
+            self.Debug(f"Could not add Fear/Greed data: {e}")
+            self.fng_symbol = None
+
+        # Whale Alert (hourly, free tier)
+        try:
+            from alt_data import WhaleAlertData
+            try:
+                whale_key = self.GetParameter("whale_alert_api_key") or ""
+            except Exception:
+                whale_key = ""
+            if whale_key:
+                self.whale_symbol = self.AddData(WhaleAlertData, "WHALE", Resolution.Hour).Symbol
+                self.Debug("Added Whale Alert data feed")
+            else:
+                self.Debug("Whale Alert API key not set, skipping")
+                self.whale_symbol = None
+        except Exception as e:
+            self.Debug(f"Could not add Whale Alert data: {e}")
+            self.whale_symbol = None
 
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(hours=1)), self.Rebalance)
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(hours=1)), self.CheckExits)
@@ -182,6 +227,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.SetSecurityInitializer(lambda security: security.SetSlippageModel(RealisticCryptoSlippage()))
         self.Settings.FreePortfolioValuePercentage = 0.05
         self.Settings.InsightScore = False
+
+        self._scoring_engine = OpusScoringEngine(self)
 
         if self.LiveMode:
             cleanup_object_store(self)
@@ -321,6 +368,19 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             self.btc_prices.append(btc_price)
             if len(self.btc_returns) >= 10:
                 self.btc_volatility.append(np.std(list(self.btc_returns)[-10:]))
+        # === Consume alternative data feeds ===
+        try:
+            from alt_data import FearGreedData, WhaleAlertData
+            if self.fng_symbol:
+                fng_data = data.Get(FearGreedData)
+                if fng_data and self.fng_symbol in fng_data:
+                    self.fear_greed = fng_data[self.fng_symbol].Value
+            if self.whale_symbol:
+                whale_data = data.Get(WhaleAlertData)
+                if whale_data and self.whale_symbol in whale_data:
+                    self.whale_net_flow = whale_data[self.whale_symbol].net_exchange_flow
+        except Exception:
+            pass  # Degrade gracefully
         for symbol in list(self.crypto_data.keys()):
             if not data.Bars.ContainsKey(symbol):
                 continue
@@ -656,6 +716,21 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             
             composite_score = self._calculate_composite_score(factor_scores)
             net_score = self._apply_fee_adjustment(composite_score)
+
+            # Calculate explosion score for spike detection
+            try:
+                explosion = self._scoring_engine.calculate_explosion_score(crypto)
+            except Exception:
+                explosion = 0.0
+
+            is_spike = False
+            if explosion > self.explosion_high_conviction_threshold:
+                net_score = 0.80  # Force high score for high-conviction spike
+                is_spike = True
+            elif explosion > self.explosion_boost_threshold:
+                composite_score *= (1.0 + explosion * 0.5)
+                net_score = self._apply_fee_adjustment(composite_score)
+                is_spike = explosion > 0.55
             
             # Populate recent_net_scores for persistence filter (Fix 3)
             crypto['recent_net_scores'].append(net_score)
@@ -669,6 +744,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     'factors': factor_scores,
                     'volatility': crypto['volatility'][-1] if len(crypto['volatility']) > 0 else 0.05,
                     'dollar_volume': list(crypto['dollar_volume'])[-6:] if len(crypto['dollar_volume']) >= 6 else [],
+                    'is_spike': is_spike,
+                    'explosion': explosion,
                 })
         
         # Log diagnostic summary
@@ -739,6 +816,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             sym = cand['symbol']
             comp_score = cand.get('composite_score', 0.5)
             net_score = cand.get('net_score', 0.5)
+            is_spike = cand.get('is_spike', False)
+            explosion = cand.get('explosion', 0.0)
             if sym in self._pending_orders and self._pending_orders[sym] > 0:
                 reject_pending_orders += 1
                 continue
@@ -766,6 +845,14 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             effective_size_cap = self.position_size_pct
             if self.LiveMode and (self.volatility_regime == "high" or self.market_regime == "sideways"):
                 effective_size_cap = min(effective_size_cap, 0.25)
+            # Sentiment-driven position size caps
+            if self.fear_greed < 25:
+                effective_size_cap = max(effective_size_cap, 0.70)  # contrarian: allow larger size
+            elif self.fear_greed > 75:
+                effective_size_cap = min(effective_size_cap, 0.35)  # cautious during greed
+            # Whale sell pressure gate: skip unless high-conviction spike
+            if self.whale_net_flow > 5 and not (is_spike and explosion > 0.6):
+                continue
 
             total_value = self.Portfolio.TotalPortfolioValue
             try:
@@ -821,6 +908,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             
             vol = self._annualized_vol(crypto)
             size = self._calculate_position_size(net_score, threshold_now, vol)
+            if is_spike:
+                size = self.spike_position_size_pct  # Override to aggressive sizing for spike entries
             size = min(size, effective_size_cap)
             if self.volatility_regime == "high":
                 size *= 0.7
@@ -876,6 +965,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     self.Debug(f"ORDER: {sym.Value} | ${val:.2f} | id={ticket.OrderId}")
                     success_count += 1
                     self.trade_count += 1
+                    if is_spike:
+                        self._spike_entries[sym] = True
+                        self.Debug(f"🚀 SPIKE ENTRY: {sym.Value} | explosion={explosion:.2f}")
                     if self.LiveMode:
                         self._last_live_trade_time = self.Time
             except Exception as e:
@@ -890,12 +982,27 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
     def _get_threshold(self):
         if self.market_regime == "bull" and self.market_breadth > 0.6:
-            return self.threshold_bull
+            base = self.threshold_bull
         elif self.market_regime == "bear":
-            return self.threshold_bear
+            base = self.threshold_bear
         elif self.volatility_regime == "high":
-            return self.threshold_high_vol
-        return self.threshold_sideways
+            base = self.threshold_high_vol
+        else:
+            base = self.threshold_sideways
+
+        # Sentiment overlay from Fear & Greed
+        if self.fear_greed < 20:
+            base *= 0.93  # Lower bar during extreme fear (contrarian buy)
+        elif self.fear_greed > 80:
+            base *= 1.07  # Higher bar during extreme greed (cautious)
+
+        # Whale flow overlay - heavy exchange inflows = sell pressure
+        if self.whale_net_flow > 5:
+            base *= 1.05  # Raise bar when sell pressure detected
+        elif self.whale_net_flow < -3:
+            base *= 0.97  # Lower bar when accumulation detected
+
+        return base
 
     def _is_ready(self, c):
         return len(c['prices']) >= 14 and c['rsi'].IsReady
@@ -956,6 +1063,20 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             trailing_activation = 0.03
             trailing_stop_pct = 0.02
 
+        # Spike-specific exit parameters
+        is_spike_entry = symbol in self._spike_entries
+        if is_spike_entry:
+            sl = max(sl, self.spike_stop_loss)
+            tp = max(tp, self.spike_take_profit)
+            trailing_stop_pct = self.spike_trailing_pct
+            time_exit_hours = self.spike_time_exit_hours
+        else:
+            time_exit_hours = 18
+
+        # Fear & Greed: tighten trailing stops during extreme greed
+        if self.fear_greed > 75:
+            trailing_stop_pct *= 0.80
+
         tag = ""
         min_notional_usd = get_min_notional_usd(self, symbol)
         trailing_allowed = hours >= self.trailing_grace_hours
@@ -967,7 +1088,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             tag = "Trailing Stop"
         elif self.market_regime == "bear" and pnl > 0.03:
             tag = "Bear Exit"
-        elif hours > 18 and pnl < 0.01:
+        elif self.whale_net_flow > 8 and hours > 12 and pnl < 0.02:
+            tag = "Whale Exit"
+        elif hours > time_exit_hours and pnl < 0.01:
             tag = "Time Exit"
         if not tag and trailing_allowed and atr and entry > 0 and holding.Quantity != 0:
             trail_offset = atr * self.atr_trail_mult

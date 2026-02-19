@@ -323,6 +323,91 @@ class OpusScoringEngine:
         """
         return score - (self.algo.expected_round_trip_fees * 1.1 + self.algo.fee_slippage_buffer)
 
+    def calculate_explosion_score(self, crypto):
+        """
+        Detect the IGNITION moment of a potential altcoin spike.
+        Combines volume explosion, BB squeeze breakout, KAMA divergence,
+        multi-bar acceleration, and period-high breakout.
+
+        Returns 0.0-1.0, where >0.7 = extremely high conviction spike signal.
+        """
+        price = crypto['last_price']
+        if price <= 0:
+            return 0.0
+
+        score = 0.0
+        signals_firing = 0
+
+        # === SIGNAL 1: Volume Explosion (strongest predictor) ===
+        lookback = self.algo.explosion_volume_lookback
+        if len(crypto['volume']) >= lookback:
+            volumes = list(crypto['volume'])
+            median_vol = np.median(volumes[-lookback:])
+            if median_vol > 0:
+                current_ratio = volumes[-1] / median_vol
+                recent_avg = np.mean(volumes[-3:]) / median_vol if len(volumes) >= 3 else current_ratio
+
+                if current_ratio > 5.0:
+                    score += 0.30
+                    signals_firing += 1
+                elif current_ratio > 3.0:
+                    score += 0.20
+                    signals_firing += 1
+                elif recent_avg > 2.0:
+                    score += 0.10
+                    signals_firing += 1
+
+        # === SIGNAL 2: BB Squeeze → Breakout ===
+        bb_lookback = self.algo.explosion_bb_lookback
+        if len(crypto['bb_width']) >= bb_lookback and len(crypto['bb_upper']) >= 1:
+            avg_width = np.mean(list(crypto['bb_width'])[-bb_lookback:])
+            current_width = crypto['bb_width'][-1]
+            if avg_width > 0:
+                squeeze = current_width / avg_width
+                if squeeze < 0.5 and price > crypto['bb_upper'][-1]:
+                    score += 0.25
+                    signals_firing += 1
+                elif squeeze < 0.7 and price > crypto['bb_upper'][-1]:
+                    score += 0.15
+                    signals_firing += 1
+
+        # === SIGNAL 3: KAMA Divergence (catches acceleration) ===
+        if crypto['kama'].IsReady and crypto['ema_short'].IsReady:
+            kama_val = crypto['kama'].Current.Value
+            ema_val = crypto['ema_short'].Current.Value
+            if ema_val > 0:
+                kama_lead = (kama_val - ema_val) / ema_val
+                if kama_lead > 0.01:
+                    score += 0.15
+                    signals_firing += 1
+
+        # === SIGNAL 4: Multi-bar Acceleration ===
+        if len(crypto['returns']) >= 6:
+            returns = list(crypto['returns'])
+            r_recent = np.mean(returns[-3:])
+            r_prior = np.mean(returns[-6:-3])
+            if r_recent > 0 and r_prior > 0 and r_recent > r_prior * 2:
+                score += 0.15
+                signals_firing += 1
+            elif r_recent > 0.02:
+                score += 0.10
+                signals_firing += 1
+
+        # === SIGNAL 5: Breaking Period High ===
+        if len(crypto['highs']) >= 48:
+            period_high = max(list(crypto['highs'])[-48:])
+            if period_high > 0 and price > period_high:
+                score += 0.15
+                signals_firing += 1
+
+        # === CONFLUENCE BONUS ===
+        if signals_firing >= 4:
+            score *= 1.3
+        elif signals_firing >= 3:
+            score *= 1.15
+
+        return min(score, 1.0)
+
     def calculate_position_size(self, score, threshold, asset_vol_ann):
         """
         Calculate position size using conviction, volatility, and Kelly fraction.
