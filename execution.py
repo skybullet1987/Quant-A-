@@ -164,17 +164,17 @@ def track_exit_order(algo, symbol, ticket, quantity):
 
 def smart_liquidate(algo, symbol, tag="Liquidate"):
     if len(algo.Transactions.GetOpenOrders(symbol)) > 0:
-        return
+        return False
     if symbol in algo._cancel_cooldowns and algo.Time < algo._cancel_cooldowns[symbol]:
-        return
+        return False
     if symbol not in algo.Portfolio or algo.Portfolio[symbol].Quantity == 0:
-        return
+        return False
     holding_qty = algo.Portfolio[symbol].Quantity
     min_qty = get_min_quantity(algo, symbol)
     min_notional = get_min_notional_usd(algo, symbol)
     price = algo.Securities[symbol].Price if symbol in algo.Securities else 0
     if price * abs(holding_qty) < min_notional * 0.9:
-        return
+        return False
     # Verify fee reserve before selling (Kraken cash account requirement)
     if algo.LiveMode and holding_qty > 0:
         estimated_fee = price * abs(holding_qty) * 0.006  # 0.6% fee estimate (0.4% base + 0.2% safety buffer)
@@ -190,10 +190,21 @@ def smart_liquidate(algo, symbol, tag="Liquidate"):
                 algo.entry_prices[symbol] = algo.Portfolio[symbol].AveragePrice
                 algo.highest_prices[symbol] = algo.Portfolio[symbol].AveragePrice
                 algo.entry_times[symbol] = algo.Time
-            return
+            return False
     algo.Transactions.CancelOpenOrders(symbol)
-    if abs(holding_qty) < min_qty:
-        return
+    # For exits: use lot_size as the floor, not min_qty (entry min order size).
+    # Kraken allows selling holdings at lot_size granularity.
+    try:
+        lot_size = algo.Securities[symbol].SymbolProperties.LotSize
+        if lot_size is not None and lot_size > 0:
+            exit_min_qty = lot_size
+        else:
+            exit_min_qty = min_qty
+    except Exception as e:
+        algo.Debug(f"Warning: could not get lot_size for {symbol.Value}: {e}")
+        exit_min_qty = min_qty
+    if abs(holding_qty) < exit_min_qty:
+        return False
     # Apply a fee safety buffer so we never attempt to sell more than Kraken
     # actually holds after fee deduction from the base asset (Cash Modeling).
     # Use the same 0.6% estimate already referenced in the fee-reserve check above.
@@ -203,8 +214,8 @@ def smart_liquidate(algo, symbol, tag="Liquidate"):
     actual_qty = abs(algo.Portfolio[symbol].Quantity)
     if safe_qty > actual_qty:
         safe_qty = round_quantity(algo, symbol, actual_qty)
-    if safe_qty < min_qty:
-        return
+    if safe_qty < exit_min_qty:
+        return False
     if safe_qty > 0:
         direction_mult = -1 if holding_qty > 0 else 1
         # Spread-aware exit logic
@@ -216,6 +227,7 @@ def smart_liquidate(algo, symbol, tag="Liquidate"):
                     algo.Debug(f"⚠️ WIDE SPREAD EXIT: {symbol.Value} spread={spread_pct:.2%}, using market order")
                     ticket = algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
                     track_exit_order(algo, symbol, ticket, safe_qty * direction_mult)
+                    return True
                 elif algo.LiveMode and spread_pct > 0.015:  # 1.5% spread - use limit order with fallback (live mode only)
                     try:
                         sec = algo.Securities[symbol]
@@ -234,27 +246,34 @@ def smart_liquidate(algo, symbol, tag="Liquidate"):
                                     'intent': 'exit'
                                 }
                             algo.Debug(f"LIMIT EXIT: {symbol.Value} at mid ${mid:.4f} (spread={spread_pct:.2%})")
+                            return True
                         else:
                             ticket = algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
                             track_exit_order(algo, symbol, ticket, safe_qty * direction_mult)
+                            return True
                     except Exception as e:
                         algo.Debug(f"Error placing limit exit for {symbol.Value}: {e}")
                         ticket = algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
                         track_exit_order(algo, symbol, ticket, safe_qty * direction_mult)
+                        return True
                 else:
                     # Spread is acceptable, use market order
                     ticket = algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
                     track_exit_order(algo, symbol, ticket, safe_qty * direction_mult)
+                    return True
             else:
                 # Spread unknown, use market order
                 ticket = algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
                 track_exit_order(algo, symbol, ticket, safe_qty * direction_mult)
+                return True
         else:
             # Stop loss - always use market order
             ticket = algo.MarketOrder(symbol, safe_qty * direction_mult, tag=tag)
             track_exit_order(algo, symbol, ticket, safe_qty * direction_mult)
+            return True
     else:
         algo.Debug(f"Warning: {symbol.Value} holding {holding_qty} rounds to 0")
+        return False
 
 
 def cancel_stale_orders(algo):
@@ -460,7 +479,10 @@ def sync_existing_positions(algo):
     algo.Debug("=" * 50)
     for symbol, ticker, pnl_pct, reason in positions_to_close:
         algo.Debug(f"IMMEDIATE {reason}: {ticker} at {pnl_pct:+.2%}")
-        smart_liquidate(algo, symbol, reason)
+        sold = smart_liquidate(algo, symbol, reason)
+        if not sold:
+            algo.Debug(f"⚠️ IMMEDIATE {reason} FAILED: {ticker} — position unsellable, cleaning up tracking")
+            cleanup_position(algo, symbol)
         # Let OnOrderEvent handle cleanup and PnL tracking on fill
 
 
