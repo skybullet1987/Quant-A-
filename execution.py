@@ -402,6 +402,8 @@ def cleanup_position(algo, symbol, record_pnl=False, exit_price=None):
     algo.entry_times.pop(symbol, None)
     if symbol in algo.crypto_data:
         algo.crypto_data[symbol]['trail_stop'] = None
+    if hasattr(algo, '_spike_entries'):
+        algo._spike_entries.pop(symbol, None)
 
 
 def sync_existing_positions(algo):
@@ -491,6 +493,7 @@ def persist_state(algo):
     if not algo.LiveMode:
         return
     try:
+        spike_entries = [s.Value for s in getattr(algo, '_spike_entries', {}).keys() if hasattr(s, 'Value')]
         state = {
             "session_blacklist": list(algo._session_blacklist),
             "winning_trades": algo.winning_trades,
@@ -500,6 +503,7 @@ def persist_state(algo):
             "daily_trade_count": algo.daily_trade_count,
             "trade_count": algo.trade_count,
             "peak_value": algo.peak_value if algo.peak_value is not None else 0,
+            "spike_entries": spike_entries,
         }
         algo.ObjectStore.Save("live_state", json.dumps(state))
     except Exception as e:
@@ -522,6 +526,12 @@ def load_persisted_state(algo):
             peak = data.get("peak_value", 0)
             if peak > 0:
                 algo.peak_value = peak
+            # Restore spike entries: map string values back to Symbol objects
+            spike_entry_values = set(data.get("spike_entries", []))
+            if spike_entry_values and hasattr(algo, '_spike_entries'):
+                for symbol in algo.Securities.Keys:
+                    if hasattr(symbol, 'Value') and symbol.Value in spike_entry_values:
+                        algo._spike_entries[symbol] = True
             algo.Debug(f"Loaded persisted state: blacklist {len(algo._session_blacklist)}, "
                        f"trades W:{algo.winning_trades}/L:{algo.losing_trades}")
     except Exception as e:
@@ -1153,6 +1163,7 @@ def daily_report(algo):
     algo.Debug(f"Portfolio: ${algo.Portfolio.TotalPortfolioValue:.2f} | Cash: ${algo.Portfolio.Cash:.2f}")
     algo.Debug(f"Pos: {get_actual_position_count(algo)}/{algo.base_max_positions} | {algo.market_regime} {algo.volatility_regime} {algo.market_breadth:.0%}")
     algo.Debug(f"Trades: {total} | WR: {wr:.1%} | Avg: {avg:+.2%}")
+    algo.Debug(f"Sentiment: F&G={algo.fear_greed} | WhaleFlow={algo.whale_net_flow}")
     if algo._session_blacklist:
         algo.Debug(f"Blacklist: {len(algo._session_blacklist)}")
     for kvp in algo.Portfolio:
