@@ -580,16 +580,42 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         except Exception as e:
             return None
 
-    def _calculate_composite_score(self, factors):
-        score = sum(factors.get(f, 0.5) * w for f, w in self.weights.items())
-        
+    def _get_regime_weights(self):
+        """Return signal weights adapted to the current market regime."""
+        if self.market_regime == "bear":
+            return {
+                'mean_reversion': 0.30, 'relative_strength': 0.10, 'trend_strength': 0.10,
+                'risk_adjusted_momentum': 0.20, 'volume_momentum': 0.15, 'liquidity': 0.15,
+            }
+        elif self.market_regime == "sideways":
+            return {
+                'mean_reversion': 0.25, 'relative_strength': 0.15, 'trend_strength': 0.10,
+                'risk_adjusted_momentum': 0.20, 'volume_momentum': 0.15, 'liquidity': 0.15,
+            }
+        return dict(self.weights)  # bull: use static weights
+
+    def _calculate_composite_score(self, factors, crypto=None):
+        weights = self._get_regime_weights()
+        score = sum(factors.get(f, 0.5) * w for f, w in weights.items())
+
+        # Hurst exponent integration (item 10)
+        if crypto and len(crypto.get('prices', [])) >= 30:
+            try:
+                hurst = self._scoring_engine._hurst_exponent(crypto['prices'])
+                if hurst > 0.6:
+                    score *= 1.05
+                elif hurst < 0.4:
+                    score *= 0.95
+            except Exception:
+                pass
+
         # Momentum acceleration bonus
         strong_factors = sum(1 for v in factors.values() if v >= 0.7)
         if strong_factors >= 4:
             score *= 1.10
         elif strong_factors >= 3:
             score *= 1.05
-        
+
         if self.market_regime == "bear":
             score *= 0.85
         if self.volatility_regime == "high":
@@ -611,6 +637,41 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
     def _kelly_fraction(self):
         return kelly_fraction(self)
+
+    def _get_max_daily_trades(self):
+        """Return max daily trades adapted to market regime (items 7 & 11)."""
+        if self.market_regime == "sideways":
+            return 4
+        elif self.market_regime == "bear":
+            return 3
+        return 10  # bull + normal vol
+
+    def _check_correlation(self, new_symbol):
+        """Reject candidate if it is too correlated with any existing position (item 8)."""
+        if not self.entry_prices:
+            return True
+        new_crypto = self.crypto_data.get(new_symbol)
+        if not new_crypto or len(new_crypto['returns']) < 24:
+            return True
+        new_rets = np.array(list(new_crypto['returns'])[-24:])
+        if np.std(new_rets) < 1e-10:
+            return True
+        for sym in list(self.entry_prices.keys()):
+            if sym == new_symbol:
+                continue
+            existing = self.crypto_data.get(sym)
+            if not existing or len(existing['returns']) < 24:
+                continue
+            exist_rets = np.array(list(existing['returns'])[-24:])
+            if np.std(exist_rets) < 1e-10:
+                continue
+            try:
+                corr = np.corrcoef(new_rets, exist_rets)[0, 1]
+                if corr > 0.85:
+                    return False
+            except Exception:
+                continue
+        return True
 
     def _log_skip(self, reason):
         if self.LiveMode:
@@ -643,7 +704,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if self.LiveMode and self.Time.hour in self.skip_hours_utc:
             self._log_skip("skip hour")
             return
-        if self.daily_trade_count >= self.max_daily_trades:
+        if self.daily_trade_count >= self._get_max_daily_trades():
             self._log_skip("max daily trades")
             return
         val = self.Portfolio.TotalPortfolioValue
@@ -668,7 +729,13 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             self.consecutive_losses = 0
             self._log_skip("consecutive loss cooldown")
             return
-        dynamic_max_pos = self.base_max_positions
+        # Fear & Greed hard gate (item 9)
+        if self.fear_greed > 85:
+            dynamic_max_pos = 1  # extreme greed: de-risk
+        elif self.fear_greed < 15:
+            dynamic_max_pos = self.base_max_positions + 1  # extreme fear: contrarian
+        else:
+            dynamic_max_pos = self.base_max_positions
         pos_count = get_actual_position_count(self)
         if pos_count >= dynamic_max_pos:
             self._log_skip("at max positions")
@@ -714,7 +781,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 continue
             count_scored += 1
             
-            composite_score = self._calculate_composite_score(factor_scores)
+            composite_score = self._calculate_composite_score(factor_scores, crypto)
             net_score = self._apply_fee_adjustment(composite_score)
 
             # Calculate explosion score for spike detection
@@ -809,7 +876,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         success_count = 0
         
         for cand in candidates:
-            if self.daily_trade_count >= self.max_daily_trades:
+            if self.daily_trade_count >= self._get_max_daily_trades():
                 break
             if get_actual_position_count(self) >= dynamic_max_pos:
                 break
@@ -892,8 +959,15 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
                 if not is_mean_reversion:
                     if ema_short <= ema_medium:
-                        reject_ema_gate += 1
-                        continue
+                        if self.market_regime == "bull":
+                            reject_ema_gate += 1
+                            continue
+                        else:
+                            # Soft gate: penalize score but allow if still above threshold
+                            net_score *= 0.75
+                            if net_score <= threshold_now:
+                                reject_ema_gate += 1
+                                continue
                     if len(crypto['returns']) >= 3:
                         recent_return = np.mean(list(crypto['returns'])[-3:])
                         if recent_return <= 0:
@@ -953,6 +1027,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 continue
             if val < min_notional_usd or val < self.min_notional or val > reserved_cash:
                 reject_notional += 1
+                continue
+            # Correlation gate: reject if too correlated with existing positions (item 8)
+            if not self._check_correlation(sym):
                 continue
             try:
                 # Use limit orders only in live mode
@@ -1045,17 +1122,19 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         
         dd = (highest - price) / highest if highest > 0 else 0
         hours = (self.Time - self.entry_times.get(symbol, self.Time)).total_seconds() / 3600
-        sl, tp = self.base_stop_loss, self.base_take_profit
+        # ATR-based stops as primary (item 3): ATR is primary, absolute values are floors
+        atr = crypto['atr'].Current.Value if crypto and crypto['atr'].IsReady else None
+        if atr and entry > 0:
+            sl = (atr * self.atr_sl_mult) / entry
+            tp = (atr * self.atr_tp_mult) / entry
+        else:
+            sl, tp = self.base_stop_loss, self.base_take_profit
+        sl = max(sl, 0.02)  # 2% floor
+        tp = max(tp, 0.04)  # 4% floor
         if self.volatility_regime == "high":
             sl *= 1.2; tp *= 1.3
         elif self.market_regime == "bear":
             sl *= 0.8; tp *= 0.7
-        atr = crypto['atr'].Current.Value if crypto and crypto['atr'].IsReady else None
-        if atr and entry > 0:
-            atr_sl = (atr * self.atr_sl_mult) / entry
-            atr_tp = (atr * self.atr_tp_mult) / entry
-            sl = max(sl, atr_sl * 0.8)
-            tp = max(tp, atr_tp * 0.7)
 
         trailing_activation = self.trailing_activation
         trailing_stop_pct = self.trailing_stop_pct
@@ -1070,8 +1149,22 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             tp = max(tp, self.spike_take_profit)
             trailing_stop_pct = self.spike_trailing_pct
             time_exit_hours = self.spike_time_exit_hours
+            time_exit_pnl_thresh = 0.01
+            # Item 6: tighten stops once spike has achieved 5%+ profit
+            if pnl > 0.05:
+                trailing_stop_pct = 0.02
+                trailing_activation = min(trailing_activation, 0.02)
         else:
-            time_exit_hours = 18
+            # Regime-adaptive time stop (item 4)
+            if self.market_regime == "bull":
+                time_exit_hours = 24
+                time_exit_pnl_thresh = 0.01
+            elif self.market_regime == "sideways":
+                time_exit_hours = 48
+                time_exit_pnl_thresh = 0.005
+            else:  # bear or unknown
+                time_exit_hours = 12
+                time_exit_pnl_thresh = 0.005
 
         # Fear & Greed: tighten trailing stops during extreme greed
         if self.fear_greed > 75:
@@ -1090,7 +1183,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             tag = "Bear Exit"
         elif self.whale_net_flow > 8 and hours > 12 and pnl < 0.02:
             tag = "Whale Exit"
-        elif hours > time_exit_hours and pnl < 0.01:
+        elif is_spike_entry and hours > 6 and pnl < 0.02:
+            tag = "Spike Fizzle"
+        elif hours > time_exit_hours and pnl < time_exit_pnl_thresh:
             tag = "Time Exit"
         if not tag and trailing_allowed and atr and entry > 0 and holding.Quantity != 0:
             trail_offset = atr * self.atr_trail_mult
@@ -1108,7 +1203,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 if crypto and self._is_ready(crypto):
                     factors = self._calculate_factor_scores(symbol, crypto)
                     if factors:
-                        comp = self._calculate_composite_score(factors)
+                        comp = self._calculate_composite_score(factors, crypto)
                         net = self._apply_fee_adjustment(comp)
                         if net < self._get_threshold() - self.signal_decay_buffer:
                             tag = "Signal Decay"
