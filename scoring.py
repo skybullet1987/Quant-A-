@@ -4,806 +4,179 @@ import numpy as np
 # endregion
 
 
-class OpusScoringEngine:
+class MicroScalpEngine:
     """
-    Scoring Engine for Opus Crypto Strategy
-    
-    Handles all 8-factor scoring, composite scoring, fee adjustments,
-    and position sizing calculations. This module is separated from
-    the main algorithm to keep both files under QuantConnect's 64K limit.
+    Micro-Scalping Signal Engine - v5.0.0
+
+    Replaces the multi-factor OpusScoringEngine with a focused 5-signal
+    scalp engine optimised for fast, high-frequency entries and exits.
+
+    Score: 0.0 – 1.0, each of the 5 signals contributes exactly 0.20.
+      >= 0.40 → entry (2+ signals firing)
+      >= 0.60 → high-conviction entry (3+ signals) → full position size
     """
-    
+
     def __init__(self, algorithm):
-        """
-        Initialize scoring engine with reference to main algorithm.
-        
-        Args:
-            algorithm: Reference to OpusCryptoStrategy instance
-        """
         self.algo = algorithm
-        self.kf_state = {}  # Kalman Filter states per symbol
-        self.Q = 0.0001     # Process noise
-        self.R = 0.01       # Measurement noise
-    
-    def get_sentiment_score(self, symbol):
+
+    # ------------------------------------------------------------------
+    # Primary entry: returns (score, components_dict)
+    # ------------------------------------------------------------------
+    def calculate_scalp_score(self, crypto):
         """
-        Return a sentiment score for the given symbol.
-        
-        Currently returns a neutral 0.5 placeholder.
-        
-        To integrate live sentiment data in the future, consider using:
-        - TiingoNews: self.algo.AddData(TiingoNews, symbol) then query
-          self.algo.History(TiingoNews, symbol, 1, Resolution.Daily)
-        - CryptoWizard or similar alternative-data providers available
-          on QuantConnect via AddData / ObjectStore APIs.
-        
-        Args:
-            symbol: Symbol object for the asset
-            
-        Returns:
-            Sentiment score between 0 (bearish) and 1 (bullish), 0.5 = neutral
+        Calculate the aggregate scalp score for a crypto asset.
+
+        Returns
+        -------
+        (score, components) where score ∈ [0, 1] and components is a dict
+        mapping each signal name to its individual contribution (0 or 0.20).
         """
-        return 0.5
+        components = {
+            'rsi_divergence':       0.0,
+            'volume_bb_compression': 0.0,
+            'ema_crossover':        0.0,
+            'vwap_reclaim':         0.0,
+            'orderbook_proxy':      0.0,
+        }
 
-    def update_kalman(self, symbol, price):
-        """
-        Run a 1D Kalman Filter predict/update step for the given symbol and price.
-
-        Returns the Z-Score (deviation / std_dev), or 0.0 if not yet initialized.
-
-        Args:
-            symbol: Symbol object (used as dict key)
-            price: Latest observed price
-
-        Returns:
-            Z-Score float
-        """
-        if symbol not in self.kf_state:
-            # Initialize: state estimate = price, error covariance = 1.0, variance estimate = 1.0
-            self.kf_state[symbol] = {'x': price, 'P': 1.0, 'var': 1.0}
-            return 0.0
-
-        state = self.kf_state[symbol]
-        x = state['x']
-        P = state['P']
-
-        # Predict
-        P_pred = P + self.Q
-
-        # Update (Kalman gain)
-        K = P_pred / (P_pred + self.R)
-        innovation = price - x
-        x_new = x + K * innovation
-        P_new = (1.0 - K) * P_pred
-
-        # Update running variance via exponential moving average of squared innovations
-        state['var'] = 0.99 * state['var'] + 0.01 * (innovation ** 2)
-        std_dev = state['var'] ** 0.5
-
-        state['x'] = x_new
-        state['P'] = P_new
-
-        if std_dev < 1e-10:
-            return 0.0
-        return innovation / std_dev
-
-    def _normalize(self, v, mn, mx):
-        """Normalize value to [0, 1] range."""
-        if mx == mn:
-            return 0.5
-        return max(0, min(1, (v - mn) / (mx - mn)))
-    
-    def _hurst_exponent(self, prices, max_lag=20):
-        """Estimate Hurst exponent to detect trending vs mean-reverting behavior."""
-        if len(prices) < max_lag + 5:
-            return 0.5  # Not enough data, assume random walk
         try:
-            price_arr = np.array(list(prices))
-            lags = range(2, min(max_lag, len(price_arr) // 2))
-            if len(list(lags)) < 3:
-                return 0.5
-            tau = [np.std(price_arr[lag:] - price_arr[:-lag]) for lag in lags]
-            if any(t <= 0 for t in tau):
-                return 0.5
-            log_lags = np.log(list(lags))
-            log_tau = np.log(tau)
-            poly = np.polyfit(log_lags, log_tau, 1)
-            return max(0.0, min(1.0, poly[0]))
-        except Exception as e:
-            self.algo.Debug(f"Error in _hurst_exponent: {e}")
-            return 0.5
-    
-    def calculate_factor_scores(self, symbol, crypto):
-        """
-        Calculate all 8 factor scores for a given crypto.
-        
-        Args:
-            symbol: Symbol object
-            crypto: Crypto data dictionary with indicators
-            
-        Returns:
-            Dictionary of factor scores or None if calculation fails
-        """
-        try:
-            scores = {}
-
-            # 1. RELATIVE STRENGTH vs BTC
-            if len(crypto['rs_vs_btc']) >= 3:
-                scores['relative_strength'] = self._normalize(np.mean(list(crypto['rs_vs_btc'])[-3:]), -0.05, 0.05)
-            else:
-                scores['relative_strength'] = 0.5
-
-            # 2. VOLUME MOMENTUM (smoothed)
-            if len(crypto['volume_ma']) >= 2 and len(crypto['returns']) >= 3:
-                vol_ma_prev = crypto['volume_ma'][-2]
-                vol_trend = (crypto['volume_ma'][-1] / (vol_ma_prev + 1e-8)) - 1
-                price_trend = np.mean(list(crypto['returns'])[-3:])
-                
-                # Whale detection: >50% volume increase vs MA forces max score.
-                # A 50% surge above the rolling volume MA is a statistically
-                # significant anomaly consistent with large-player accumulation.
-                # Forcing 1.0 ensures this conviction overrides other scoring noise.
-                if vol_trend > 0.5:
-                    scores['volume_momentum'] = 1.0
-                else:
-                    # Continuous base score from price trend
-                    base = 0.5 + price_trend * 20  # scale price trend to [0,1] range
-                    base = max(0.1, min(0.9, base))
-                    
-                    # Volume trend bonus (continuous)
-                    if vol_trend > 0:
-                        vol_bonus = min(0.15, vol_trend * 3)
-                        base += vol_bonus
-                    
-                    # Volume spike bonus (continuous, not binary)
-                    if len(crypto['volume']) >= 12:
-                        median_vol = np.median(list(crypto['volume'])[-12:])
-                        current_vol = crypto['volume'][-1]
-                        if median_vol > 0:
-                            vol_ratio = current_vol / median_vol
-                            spike_bonus = min(0.1, max(0, (vol_ratio - 1.5) * 0.1))
-                            base += spike_bonus
-                    
-                    scores['volume_momentum'] = max(0.05, min(0.95, base))
-            else:
-                scores['volume_momentum'] = 0.5
-
-            # 3. TREND STRENGTH (smoothed + incorporates multi-timeframe)
-            if crypto['ema_short'].IsReady and crypto['ema_trend'].IsReady:
-                us = crypto['ema_ultra_short'].Current.Value
-                s = crypto['ema_short'].Current.Value
-                m = crypto['ema_medium'].Current.Value
-                l = crypto['ema_long'].Current.Value
-                t = crypto['ema_trend'].Current.Value
-                
-                # Continuous alignment score: each pair contributes proportionally
-                pairs = [(us, s), (s, m), (m, l), (l, t)]
-                alignment_score = 0.0
-                for fast, slow in pairs:
-                    if slow > 0:
-                        diff_pct = (fast - slow) / slow
-                        # Sigmoid-like: maps diff_pct to [0, 1] smoothly
-                        pair_score = 1.0 / (1.0 + np.exp(-diff_pct * 200))
-                        alignment_score += pair_score * 0.25  # each pair = 25%
-                
-                # Blend with multi-timeframe momentum for richer signal
-                if len(crypto['returns']) >= 24:
-                    returns = list(crypto['returns'])
-                    tf_scores = []
-                    for period in [3, 6, 12, 24]:
-                        if len(returns) >= period:
-                            tf_ret = np.mean(returns[-period:])
-                            tf_scores.append(1.0 / (1.0 + np.exp(-tf_ret * 300)))
-                    if tf_scores:
-                        multi_tf = np.mean(tf_scores)
-                        # 70% EMA alignment + 30% multi-TF momentum
-                        scores['trend_strength'] = max(0.05, min(0.95, alignment_score * 0.7 + multi_tf * 0.3))
-                    else:
-                        scores['trend_strength'] = max(0.05, min(0.95, alignment_score))
-                else:
-                    scores['trend_strength'] = max(0.05, min(0.95, alignment_score))
-            elif crypto['ema_short'].IsReady:
-                s = crypto['ema_short'].Current.Value
-                m = crypto['ema_medium'].Current.Value
-                l = crypto['ema_long'].Current.Value
-                if l > 0:
-                    diff = (s - l) / l
-                    scores['trend_strength'] = max(0.1, min(0.9, 0.5 + diff * 10))
-                else:
-                    scores['trend_strength'] = 0.5
-            else:
-                scores['trend_strength'] = 0.5
-
-            # 4. MEAN REVERSION (smoothed continuous)
-            if len(crypto['zscore']) >= 1:
-                z = crypto['zscore'][-1]
+            # ----------------------------------------------------------
+            # Signal 1: RSI Divergence Scalp
+            # RSI(7) recovering from oversold (<35) while price makes a
+            # higher low over the last few bars (bullish divergence).
+            # ----------------------------------------------------------
+            if (crypto['rsi'].IsReady
+                    and len(crypto['lows']) >= 6
+                    and len(crypto['returns']) >= 1):
                 rsi = crypto['rsi'].Current.Value
-                
-                # Sigmoid mapping: very negative z + low RSI = high score (oversold bounce opportunity)
-                # very positive z + high RSI = low score (overbought, avoid)
-                z_component = 1.0 / (1.0 + np.exp(z * 1.5))  # z=-2 → 0.95, z=0 → 0.5, z=2 → 0.05
-                rsi_component = 1.0 / (1.0 + np.exp((rsi - 50) * 0.08))  # rsi=20 → 0.92, rsi=50 → 0.5, rsi=80 → 0.08
-                
-                # Weighted blend: z-score is more reliable than RSI for mean reversion
-                scores['mean_reversion'] = max(0.05, min(0.95, z_component * 0.6 + rsi_component * 0.4))
-            else:
-                scores['mean_reversion'] = 0.5
+                lows = list(crypto['lows'])
+                if rsi < 35 and lows[-1] > lows[-3]:
+                    # Classic bullish divergence: oversold + higher low
+                    components['rsi_divergence'] = 0.20
+                elif rsi < 40 and crypto['returns'][-1] > 0 and lows[-1] > lows[-2]:
+                    # Partial: recovering from near-oversold with momentum
+                    components['rsi_divergence'] = 0.10
 
-            # 5. LIQUIDITY (smoothed)
-            if len(crypto['dollar_volume']) >= 12:
-                avg = np.mean(list(crypto['dollar_volume'])[-12:])
-                # Log-scale continuous scoring
-                if avg > 0:
-                    scores['liquidity'] = max(0.1, min(0.95, 0.2 + 0.15 * np.log10(max(avg, 1))))
-                else:
-                    scores['liquidity'] = 0.1
-            else:
-                scores['liquidity'] = 0.5
-
-            # 6. RISK-ADJUSTED MOMENTUM (Sharpe-like)
-            if len(crypto['returns']) >= self.algo.medium_period:
-                rets = list(crypto['returns'])[-self.algo.medium_period:]
-                std = np.std(rets)
-                if std > 1e-10:
-                    sharpe = np.mean(rets) / std
-                    scores['risk_adjusted_momentum'] = self._normalize(sharpe, -1, 1)
-                else:
-                    scores['risk_adjusted_momentum'] = 0.5
-            else:
-                scores['risk_adjusted_momentum'] = 0.5
-
-            # 7. BREAKOUT SCORE (NEW)
-            scores['breakout_score'] = self.calculate_breakout_score(crypto)
-
-            # 8. MULTI-TIMEFRAME ALIGNMENT (NEW)
-            scores['multi_timeframe'] = self.calculate_multi_tf_score(crypto)
-
-            # 9. SENTIMENT
-            scores['sentiment'] = self.get_sentiment_score(symbol)
-
-            # 10. FLASH EVENT (volume spike vs 20-period MA)
-            if len(crypto['volume']) >= 20:
+            # ----------------------------------------------------------
+            # Signal 2: Volume Spike + Price Compression
+            # Volume > 2× median AND BB width in bottom 20th percentile
+            # → breakout imminent
+            # ----------------------------------------------------------
+            if len(crypto['volume']) >= 12 and len(crypto['bb_width']) >= 10:
                 volumes = list(crypto['volume'])
-                avg_vol = np.mean(volumes[-20:])
+                median_vol = np.median(volumes[-12:])
                 current_vol = volumes[-1]
-                if avg_vol > 0:
-                    if current_vol > 10 * avg_vol:
-                        scores['flash_event'] = 1.0
-                    elif current_vol > 3 * avg_vol:
-                        scores['flash_event'] = 0.8
-                    else:
-                        scores['flash_event'] = 0.0
-                else:
-                    scores['flash_event'] = 0.0
-            else:
-                scores['flash_event'] = 0.0
 
-            # 11. KALMAN FILTER MEAN REVERSION SIGNAL
-            price = crypto.get('last_price', 0)
-            if price and price > 0:
-                z_score = self.update_kalman(symbol, price)
-                if z_score < -2.5:
-                    scores['kalman_signal'] = 1.0   # Strong Buy: price far below Kalman state
-                elif z_score > 2.0:
-                    scores['kalman_signal'] = -1.0  # Sell: price reverted or overshot
-                else:
-                    scores['kalman_signal'] = 0.0
-            else:
-                scores['kalman_signal'] = 0.0
+                bb_widths = list(crypto['bb_width'])
+                pct20 = np.percentile(bb_widths, 20)
+                pct35 = np.percentile(bb_widths, 35)
+                current_bw = bb_widths[-1]
 
-            return scores
+                if (median_vol > 0
+                        and current_vol > 2.0 * median_vol
+                        and current_bw <= pct20):
+                    components['volume_bb_compression'] = 0.20
+                elif (median_vol > 0
+                      and current_vol > 1.5 * median_vol
+                      and current_bw <= pct35):
+                    components['volume_bb_compression'] = 0.10
+
+            # ----------------------------------------------------------
+            # Signal 3: EMA Crossover Momentum
+            # EMA(3) crosses above EMA(6) with volume > 1.5× average
+            # ----------------------------------------------------------
+            if (crypto['ema_ultra_short'].IsReady
+                    and crypto['ema_short'].IsReady
+                    and len(crypto['volume']) >= 6):
+                ema3 = crypto['ema_ultra_short'].Current.Value
+                ema6 = crypto['ema_short'].Current.Value
+                volumes = list(crypto['volume'])
+                avg_vol = np.mean(volumes[-6:])
+                current_vol = volumes[-1]
+
+                if ema3 > ema6:
+                    if avg_vol > 0 and current_vol > 1.5 * avg_vol:
+                        components['ema_crossover'] = 0.20
+                    elif ema3 > ema6 * 1.001:
+                        # Meaningful crossover even without volume spike
+                        components['ema_crossover'] = 0.10
+
+            # ----------------------------------------------------------
+            # Signal 4: VWAP Reclaim
+            # Price crosses above VWAP from below with increasing volume.
+            # VWAP approximated as volume-weighted mean of last 12 bars.
+            # ----------------------------------------------------------
+            if len(crypto['prices']) >= 4 and len(crypto['volume']) >= 4:
+                prices = list(crypto['prices'])
+                volumes = list(crypto['volume'])
+                lookback = min(12, len(prices))
+                total_vol = sum(volumes[-lookback:])
+                vwap = (
+                    sum(p * v for p, v in
+                        zip(prices[-lookback:], volumes[-lookback:]))
+                    / max(total_vol, 1e-10)
+                )
+                price = prices[-1]
+                prev_price = prices[-2]
+                vol_increasing = (len(volumes) >= 2
+                                  and volumes[-1] > volumes[-2])
+
+                if prev_price <= vwap < price and vol_increasing:
+                    components['vwap_reclaim'] = 0.20
+                elif price > vwap and vol_increasing:
+                    # Already above VWAP with volume support → partial credit
+                    components['vwap_reclaim'] = 0.10
+
+            # ----------------------------------------------------------
+            # Signal 5: Orderbook Imbalance Proxy
+            # Spread narrowing + volume spike → buy-pressure confirmation
+            # ----------------------------------------------------------
+            if len(crypto['spreads']) >= 4 and len(crypto['volume']) >= 6:
+                spreads = list(crypto['spreads'])
+                volumes = list(crypto['volume'])
+                avg_spread = np.mean(spreads[-4:])
+                current_spread = spreads[-1]
+                avg_vol = np.mean(volumes[-6:])
+                current_vol = volumes[-1]
+
+                spread_narrowing = (avg_spread > 0
+                                    and current_spread < avg_spread * 0.85)
+                vol_spike = avg_vol > 0 and current_vol > 1.5 * avg_vol
+
+                if spread_narrowing and vol_spike:
+                    components['orderbook_proxy'] = 0.20
+                elif vol_spike:
+                    components['orderbook_proxy'] = 0.10
+
         except Exception as e:
-            self.algo.Debug(f"Error in calculate_factor_scores for {symbol.Value}: {e}")
-            return None
+            self.algo.Debug(f"MicroScalpEngine.calculate_scalp_score error: {e}")
 
-    def calculate_breakout_score(self, crypto):
-        """
-        Detect breakouts using price range, volume, and Bollinger Bands.
-        
-        Args:
-            crypto: Crypto data dictionary with price and indicator history
-            
-        Returns:
-            Breakout score between 0 and 1
-        """
-        score = 0.5
-        price = crypto['last_price']
-        if price <= 0:
-            return score
+        score = sum(components.values())
+        return min(score, 1.0), components
 
-        # Price breakout from recent range
-        if len(crypto['highs']) >= self.algo.long_period:
-            recent_high = max(list(crypto['highs'])[-self.algo.long_period:])
-            recent_low = min(list(crypto['lows'])[-self.algo.long_period:])
-            range_pct = (recent_high - recent_low) / recent_low if recent_low > 0 else 0
-            position_in_range = (price - recent_low) / (recent_high - recent_low) if (recent_high - recent_low) > 0 else 0.5
-
-            if position_in_range > 0.95:  # Breaking out above range
-                score += 0.2
-            elif position_in_range > 0.85:
-                score += 0.1
-
-        # Bollinger Band squeeze (low width → upcoming breakout)
-        if len(crypto['bb_width']) >= self.algo.medium_period:
-            current_width = crypto['bb_width'][-1]
-            avg_width = np.mean(list(crypto['bb_width']))
-            if avg_width > 0:
-                squeeze_ratio = current_width / avg_width
-                if squeeze_ratio < 0.6:  # Squeeze detected
-                    # Check if breaking upward
-                    if len(crypto['bb_upper']) >= 1 and price > crypto['bb_upper'][-1]:
-                        score += 0.25  # Squeeze breakout!
-                    elif len(crypto['returns']) >= 2 and np.mean(list(crypto['returns'])[-2:]) > 0:
-                        score += 0.1   # Squeeze with upward bias
-
-        # Volume confirmation
-        if len(crypto['volume']) >= 12:
-            median_vol = np.median(list(crypto['volume'])[-12:])
-            if median_vol > 0 and crypto['volume'][-1] > 2.0 * median_vol:
-                score += 0.1  # Volume spike confirms breakout
-
-        return min(score, 1.0)
-
-    def calculate_multi_tf_score(self, crypto):
-        """
-        Now returns neutral since multi-TF is merged into trend_strength.
-        
-        Args:
-            crypto: Crypto data dictionary with returns history
-            
-        Returns:
-            Neutral score of 0.5
-        """
-        return 0.5
-
-    def calculate_composite_score(self, factors, crypto=None):
-        """
-        Calculate weighted composite score with regime adjustments.
-        
-        Args:
-            factors: Dictionary of individual factor scores
-            crypto: Optional crypto data dictionary for overextension penalty
-            
-        Returns:
-            Composite score adjusted for market regime and breadth
-        """
-        # Dynamic weight adjustment based on Hurst exponent
-        weights = dict(self.algo.weights)  # copy base weights
-
-        hurst_mult = 1.0
-        if crypto and len(crypto.get('prices', [])) >= 30:
-            hurst = self._hurst_exponent(crypto['prices'])
-            if hurst > 0.6:
-                hurst_mult = 1.05  # trending: boost score
-            elif hurst < 0.4:
-                hurst_mult = 0.95  # mean-reverting: reduce score
-        
-        # Normalize weights to sum to 1.0
-        total_w = sum(weights.values())
-        if total_w > 0:
-            weights = {k: v / total_w for k, v in weights.items()}
-        
-        score = sum(factors.get(f, 0.5) * w for f, w in weights.items())
-        score *= hurst_mult  # apply Hurst-based multiplier (item 10)
-        
-        # Regime adjustments (mild penalties to avoid stacking with main.py)
-        if self.algo.market_regime == "bear":
-            score *= 0.92  # Mild penalty
-        if self.algo.volatility_regime == "high":
-            score *= 0.93
-        if self.algo.market_breadth > 0.7:
-            score *= 1.08
-        elif self.algo.market_breadth < 0.3:
-            score *= 0.95  # Mild penalty
-        
-        # Bonus for strong breakout
-        if factors.get('breakout_score', 0) > 0.8:
-            score *= 1.05
-        
-        # NEW: Overextension penalty
-        # Penalize entries where price is far above EMA-medium (buying the top)
-        if crypto and crypto.get('ema_medium') and crypto['ema_medium'].IsReady:
-            price = crypto.get('last_price', 0)
-            ema_m = crypto['ema_medium'].Current.Value
-            if ema_m > 0 and price > 0:
-                extension_pct = (price - ema_m) / ema_m
-                if extension_pct > 0.08:  # >8% above EMA-medium
-                    # Continuous penalty: 8% over = small penalty, 15%+ = heavy penalty
-                    penalty = min(0.25, (extension_pct - 0.08) * 2.5)
-                    score *= (1.0 - penalty)
-        
-        return min(score, 1.0)
-
-    def apply_fee_adjustment(self, score):
-        """
-        Apply fee and slippage buffer deduction to score.
-        
-        Args:
-            score: Raw composite score
-            
-        Returns:
-            Fee-adjusted score
-        """
-        return score - (self.algo.expected_round_trip_fees * 1.1 + self.algo.fee_slippage_buffer)
-
-    def calculate_explosion_score(self, crypto):
-        """
-        Detect the IGNITION moment of a potential altcoin spike.
-        Combines volume explosion, BB squeeze breakout, KAMA divergence,
-        multi-bar acceleration, and period-high breakout.
-
-        Returns 0.0-1.0, where >0.7 = extremely high conviction spike signal.
-        """
-        price = crypto['last_price']
-        if price <= 0:
-            return 0.0
-
-        score = 0.0
-        signals_firing = 0
-
-        # === SIGNAL 1: Volume Explosion (strongest predictor) ===
-        lookback = self.algo.explosion_volume_lookback
-        if len(crypto['volume']) >= lookback:
-            volumes = list(crypto['volume'])
-            median_vol = np.median(volumes[-lookback:])
-            if median_vol > 0:
-                current_ratio = volumes[-1] / median_vol
-                recent_avg = np.mean(volumes[-3:]) / median_vol if len(volumes) >= 3 else current_ratio
-
-                if current_ratio > 5.0:
-                    score += 0.30
-                    signals_firing += 1
-                elif current_ratio > 3.0:
-                    score += 0.20
-                    signals_firing += 1
-                elif recent_avg > 2.0:
-                    score += 0.10
-                    signals_firing += 1
-
-        # === SIGNAL 2: BB Squeeze → Breakout ===
-        bb_lookback = self.algo.explosion_bb_lookback
-        if len(crypto['bb_width']) >= bb_lookback and len(crypto['bb_upper']) >= 1:
-            avg_width = np.mean(list(crypto['bb_width'])[-bb_lookback:])
-            current_width = crypto['bb_width'][-1]
-            if avg_width > 0:
-                squeeze = current_width / avg_width
-                if squeeze < 0.5 and price > crypto['bb_upper'][-1]:
-                    score += 0.25
-                    signals_firing += 1
-                elif squeeze < 0.7 and price > crypto['bb_upper'][-1]:
-                    score += 0.15
-                    signals_firing += 1
-
-        # === SIGNAL 3: KAMA Divergence (catches acceleration) ===
-        if crypto['kama'].IsReady and crypto['ema_short'].IsReady:
-            kama_val = crypto['kama'].Current.Value
-            ema_val = crypto['ema_short'].Current.Value
-            if ema_val > 0:
-                kama_lead = (kama_val - ema_val) / ema_val
-                if kama_lead > 0.01:
-                    score += 0.15
-                    signals_firing += 1
-
-        # === SIGNAL 4: Multi-bar Acceleration ===
-        if len(crypto['returns']) >= 6:
-            returns = list(crypto['returns'])
-            r_recent = np.mean(returns[-3:])
-            r_prior = np.mean(returns[-6:-3])
-            if r_recent > 0 and r_prior > 0 and r_recent > r_prior * 2:
-                score += 0.15
-                signals_firing += 1
-            elif r_recent > 0.02:
-                score += 0.10
-                signals_firing += 1
-
-        # === SIGNAL 5: Breaking Period High ===
-        if len(crypto['highs']) >= 48:
-            period_high = max(list(crypto['highs'])[-48:])
-            if period_high > 0 and price > period_high:
-                score += 0.15
-                signals_firing += 1
-
-        # === CONFLUENCE BONUS ===
-        if signals_firing >= 4:
-            score *= 1.3
-        elif signals_firing >= 3:
-            score *= 1.15
-
-        # === SPIKE CONFIRMATION (item 5) ===
-        if len(crypto['returns']) >= 1:
-            returns_list = list(crypto['returns'])
-            curr_ret = returns_list[-1]
-            if curr_ret < -0.02:
-                score *= 0.3  # Current bar dropped >2%: likely dump, not pump
-            elif len(returns_list) >= 2 and returns_list[-2] <= 0:
-                score *= 0.7  # Previous bar not positive: weaker confirmation
-
-        return min(score, 1.0)
-
-    def calculate_accumulation_score(self, crypto):
-        """
-        Detect Wyckoff-style accumulation: smart money loading before a pump.
-        This catches the SETUP phase, not the explosion.
-        Returns 0.0-1.0.
-        """
-        score = 0.0
-        signals = 0
-        price = crypto['last_price']
-        if price <= 0:
-            return 0.0
-
-        # SIGNAL 1: Volume Dry-Up then Surge (Accumulation Signature)
-        if len(crypto['volume']) >= 24:
-            volumes = list(crypto['volume'])
-            recent_vol = np.mean(volumes[-3:])
-            prior_vol = np.mean(volumes[-12:-3])
-            baseline_vol = np.median(volumes[-24:])
-
-            if baseline_vol > 0:
-                prior_ratio = prior_vol / baseline_vol
-                recent_ratio = recent_vol / baseline_vol
-
-                if prior_ratio < 0.6 and recent_ratio > 1.2:
-                    score += 0.25
-                    signals += 1
-                elif prior_ratio < 0.8 and recent_ratio > 1.5:
-                    score += 0.20
-                    signals += 1
-
-        # SIGNAL 2: Narrowing Range with Rising Floor (Compression before expansion)
-        if len(crypto['highs']) >= 24 and len(crypto['lows']) >= 24:
-            highs = list(crypto['highs'])
-            lows = list(crypto['lows'])
-
-            recent_range = max(highs[-6:]) - min(lows[-6:])
-            prior_range = max(highs[-18:-6]) - min(lows[-18:-6]) if len(highs) >= 18 else recent_range * 2
-
-            if len(lows) >= 12:
-                recent_low = min(lows[-6:])
-                prior_low = min(lows[-12:-6])
-                lows_rising = recent_low > prior_low
-            else:
-                lows_rising = False
-
-            if prior_range > 0:
-                range_compression = recent_range / prior_range
-                if range_compression < 0.5 and lows_rising:
-                    score += 0.25
-                    signals += 1
-                elif range_compression < 0.7 and lows_rising:
-                    score += 0.15
-                    signals += 1
-
-        # SIGNAL 3: OBV Divergence (cumulative buying pressure rising while price flat)
-        if len(crypto['returns']) >= 18 and len(crypto['volume']) >= 18:
-            returns = list(crypto['returns'])
-            volumes = list(crypto['volume'])
-
-            obv_changes = []
-            for i in range(-18, 0):
-                if returns[i] > 0:
-                    obv_changes.append(volumes[i])
-                elif returns[i] < 0:
-                    obv_changes.append(-volumes[i])
-                else:
-                    obv_changes.append(0)
-
-            obv = np.cumsum(obv_changes)
-
-            price_change_18 = sum(returns[-18:])
-            obv_trend = obv[-1] - obv[0]
-
-            if abs(price_change_18) < 0.03 and obv_trend > 0:
-                total_vol = sum(abs(v) for v in obv_changes)
-                if total_vol > 0:
-                    obv_strength = obv_trend / total_vol
-                    if obv_strength > 0.3:
-                        score += 0.25
-                        signals += 1
-                    elif obv_strength > 0.15:
-                        score += 0.15
-                        signals += 1
-
-        # SIGNAL 4: RSI Recovery from Oversold (early momentum shift)
-        if crypto['rsi'].IsReady:
-            rsi = crypto['rsi'].Current.Value
-            if len(crypto['zscore']) >= 6:
-                recent_z = list(crypto['zscore'])
-                was_oversold = any(z < -1.5 for z in recent_z[-6:])
-                recovering = rsi > 40 and rsi < 60
-
-                if was_oversold and recovering:
-                    score += 0.20
-                    signals += 1
-
-        # CONFLUENCE BONUS
-        if signals >= 3:
-            score *= 1.30
-        elif signals >= 2:
-            score *= 1.15
-
-        return min(score, 1.0)
-
-    def calculate_relative_outperformance_score(self, crypto):
-        """
-        Find coins outperforming the market — the ones pumping while everything else is flat.
-        Returns 0.0-1.0.
-        """
-        score = 0.0
-
-        if len(crypto['rs_vs_btc']) >= 6:
-            rs_list = list(crypto['rs_vs_btc'])
-            rs_3 = np.mean(rs_list[-3:])
-            rs_6 = np.mean(rs_list[-6:])
-
-            if rs_3 > 0.02:
-                score += 0.25
-            elif rs_3 > 0.01:
-                score += 0.15
-
-            if rs_6 > 0.015:
-                score += 0.15
-
-            if rs_3 > rs_6 and rs_3 > 0.01:
-                score += 0.10
-
-        if len(crypto['returns']) >= 24:
-            returns = list(crypto['returns'])
-            recent_ret = np.mean(returns[-3:])
-            historical_std = np.std(returns[-24:])
-
-            if historical_std > 0:
-                z_move = recent_ret / historical_std
-                if z_move > 2.0:
-                    score += 0.25
-                elif z_move > 1.0:
-                    score += 0.15
-
-        if len(crypto['volume']) >= 12 and len(crypto['returns']) >= 6:
-            volumes = list(crypto['volume'])
-            returns = list(crypto['returns'])
-
-            recent_vol = np.mean(volumes[-3:])
-            baseline_vol = np.median(volumes[-12:])
-            recent_ret = sum(returns[-6:])
-
-            if baseline_vol > 0 and recent_vol > baseline_vol * 1.3 and recent_ret > 0.02:
-                score += 0.15
-
-        return min(score, 1.0)
-
-    def calculate_smart_money_flow(self, crypto):
-        """
-        Detect institutional accumulation from OHLCV candle structure.
-        Returns 0.0-1.0.
-        """
-        score = 0.0
-
-        if len(crypto['prices']) < 12 or len(crypto['highs']) < 12 or len(crypto['lows']) < 12 or len(crypto['volume']) < 12:
-            return 0.0
-
-        prices = list(crypto['prices'])
-        highs = list(crypto['highs'])
-        lows = list(crypto['lows'])
-        volumes = list(crypto['volume'])
-
-        # SIGNAL 1: Close Location Value (CLV) trend
-        clv_values = []
-        for i in range(-12, 0):
-            bar_range = highs[i] - lows[i]
-            if bar_range > 0:
-                clv = (prices[i] - lows[i]) / bar_range
-                clv_values.append(clv)
-
-        if len(clv_values) >= 6:
-            avg_clv = np.mean(clv_values[-6:])
-            recent_clv = np.mean(clv_values[-3:])
-
-            if recent_clv > 0.65:
-                score += 0.20
-            if avg_clv > 0.55 and recent_clv > avg_clv:
-                score += 0.10
-
-        # SIGNAL 2: Money Flow = CLV × Volume (Chaikin-style)
-        if len(clv_values) >= 12:
-            mf_recent = sum((clv_values[i] * 2 - 1) * volumes[-12 + i] for i in range(6, 12))
-            mf_prior = sum((clv_values[i] * 2 - 1) * volumes[-12 + i] for i in range(0, 6))
-
-            price_change = (prices[-1] - prices[-7]) / prices[-7] if prices[-7] > 0 else 0
-
-            if mf_recent > mf_prior and abs(price_change) < 0.03:
-                score += 0.25
-            elif mf_recent > mf_prior * 1.5:
-                score += 0.15
-
-        # SIGNAL 3: Bar Absorption (high volume + small range = large player absorbing)
-        absorption_count = 0
-        for i in range(-6, 0):
-            bar_range = highs[i] - lows[i]
-            median_range = np.median([highs[j] - lows[j] for j in range(-12, 0)])
-            median_vol = np.median(volumes[-12:])
-
-            if median_range > 0 and median_vol > 0:
-                range_ratio = bar_range / median_range
-                vol_ratio = volumes[i] / median_vol
-
-                if range_ratio < 0.5 and vol_ratio > 1.5:
-                    absorption_count += 1
-
-        if absorption_count >= 2:
-            score += 0.20
-        elif absorption_count >= 1:
-            score += 0.10
-
-        # SIGNAL 4: Tail Ratio (lower wicks = buyers defending)
-        tail_strength = 0
-        for i in range(-6, 0):
-            bar_range = highs[i] - lows[i]
-            if bar_range > 0 and i > -6:
-                close_vs_prev = prices[i] - prices[i - 1]
-                if close_vs_prev >= 0:
-                    lower_tail = (min(prices[i], prices[i - 1]) - lows[i]) / bar_range
-                    if lower_tail > 0.3:
-                        tail_strength += 1
-
-        if tail_strength >= 3:
-            score += 0.15
-
-        return min(score, 1.0)
-
-    def calculate_snipe_score(self, crypto):
-        """
-        Master snipe score combining all 4 detection engines.
-        Returns (snipe_score, is_snipe, components_dict).
-        """
-        try:
-            explosion = self.calculate_explosion_score(crypto)
-            accumulation = self.calculate_accumulation_score(crypto)
-            relative_outperf = self.calculate_relative_outperformance_score(crypto)
-            smart_money = self.calculate_smart_money_flow(crypto)
-
-            snipe_score = (
-                explosion * 0.20 +
-                accumulation * 0.30 +
-                relative_outperf * 0.25 +
-                smart_money * 0.25
-            )
-
-            engines_firing = sum(1 for s in [explosion, accumulation, relative_outperf, smart_money] if s > 0.4)
-            if engines_firing >= 3:
-                snipe_score *= 1.25
-            elif engines_firing >= 2:
-                snipe_score *= 1.10
-
-            engines_above_half = sum(1 for s in [explosion, accumulation, relative_outperf, smart_money] if s > 0.5)
-            is_snipe = snipe_score > 0.55 and engines_above_half >= 2
-
-            components = {
-                'explosion': explosion,
-                'accumulation': accumulation,
-                'relative_outperf': relative_outperf,
-                'smart_money': smart_money,
-            }
-
-            return min(snipe_score, 1.0), is_snipe, components
-        except Exception as e:
-            self.algo.Debug(f"Error in calculate_snipe_score: {e}")
-            return 0.0, False, {}
-
+    # ------------------------------------------------------------------
+    # Position sizing
+    # ------------------------------------------------------------------
     def calculate_position_size(self, score, threshold, asset_vol_ann):
         """
-        Calculate position size using conviction, volatility, and Kelly fraction.
-        
-        Args:
-            score: Net score after fee adjustment
-            threshold: Entry threshold
-            asset_vol_ann: Annualized volatility of the asset
-            
-        Returns:
-            Position size as percentage of portfolio
+        Kelly-adjusted aggressive position sizing.
+
+        Base: 70 % of available capital.
+        Conviction multiplier: 1.0 (normal) → 1.3 (high-conviction).
+        Bear regime: base reduced to 50 %.
         """
-        conviction_mult = max(0.8, min(1.5, 0.8 + (score - threshold) * 3.5))
-        vol_floor = max(asset_vol_ann if asset_vol_ann else 0.05, 0.05)
-        risk_mult = max(0.7, min(1.3, self.algo.target_position_ann_vol / vol_floor))
-        kelly_mult = self.algo._kelly_fraction()
-        return self.algo.position_size_pct * conviction_mult * risk_mult * kelly_mult
+        base = self.algo.position_size_pct  # 0.70
+
+        # Conviction scales linearly from 0.40 → 0.60 threshold range
+        if score >= 0.60:
+            conviction = 1.30
+        elif score >= threshold:
+            conviction = 1.0 + (score - threshold) / 0.20 * 0.30
+        else:
+            conviction = 0.70
+
+        if self.algo.market_regime == "bear":
+            base *= 0.50
+
+        kelly = self.algo._kelly_fraction()
+        return base * conviction * kelly
