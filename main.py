@@ -35,8 +35,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.target_position_ann_vol = self._get_param("target_position_ann_vol", 0.35)
         self.portfolio_vol_cap = self._get_param("portfolio_vol_cap", 0.45)
         self.signal_decay_buffer = self._get_param("signal_decay_buffer", 0.05)
-        self.min_signal_age_hours = self._get_param("signal_decay_min_hours", 12)
-        self.cash_reserve_pct = 0.10
+        self.min_signal_age_hours = self._get_param("signal_decay_min_hours", 1)
+        self.cash_reserve_pct = 0.0
 
         self.ultra_short_period = 3
         self.short_period = 6
@@ -47,9 +47,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.sqrt_annualization = np.sqrt(24 * 365)
         self.min_asset_vol_floor = 0.05
 
-        self.base_max_positions = 3
+        self.base_max_positions = 1
         self.max_positions = self.base_max_positions
-        self.position_size_pct = 0.40
+        self.position_size_pct = 0.98
         self.min_notional = 5.0  # lowered per request
         self.min_price_usd = 0.005
         self.min_dollar_volume_usd = 10000  # minimum 6h avg dollar volume for any mode
