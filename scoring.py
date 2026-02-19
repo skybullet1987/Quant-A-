@@ -281,15 +281,15 @@ class OpusScoringEngine:
         score = sum(factors.get(f, 0.5) * w for f, w in weights.items())
         score *= hurst_mult  # apply Hurst-based multiplier (item 10)
         
-        # Regime adjustments
+        # Regime adjustments (mild penalties to avoid stacking with main.py)
         if self.algo.market_regime == "bear":
-            score *= 0.78
+            score *= 0.90  # Mild penalty, not crushing
         if self.algo.volatility_regime == "high":
             score *= 0.85
         if self.algo.market_breadth > 0.7:
             score *= 1.08
         elif self.algo.market_breadth < 0.3:
-            score *= 0.80
+            score *= 0.92  # Mild penalty
         
         # Bonus for strong breakout
         if factors.get('breakout_score', 0) > 0.8:
@@ -414,6 +414,275 @@ class OpusScoringEngine:
                 score *= 0.7  # Previous bar not positive: weaker confirmation
 
         return min(score, 1.0)
+
+    def calculate_accumulation_score(self, crypto):
+        """
+        Detect Wyckoff-style accumulation: smart money loading before a pump.
+        This catches the SETUP phase, not the explosion.
+        Returns 0.0-1.0.
+        """
+        score = 0.0
+        signals = 0
+        price = crypto['last_price']
+        if price <= 0:
+            return 0.0
+
+        # SIGNAL 1: Volume Dry-Up then Surge (Accumulation Signature)
+        if len(crypto['volume']) >= 24:
+            volumes = list(crypto['volume'])
+            recent_vol = np.mean(volumes[-3:])
+            prior_vol = np.mean(volumes[-12:-3])
+            baseline_vol = np.median(volumes[-24:])
+
+            if baseline_vol > 0:
+                prior_ratio = prior_vol / baseline_vol
+                recent_ratio = recent_vol / baseline_vol
+
+                if prior_ratio < 0.6 and recent_ratio > 1.2:
+                    score += 0.25
+                    signals += 1
+                elif prior_ratio < 0.8 and recent_ratio > 1.5:
+                    score += 0.20
+                    signals += 1
+
+        # SIGNAL 2: Narrowing Range with Rising Floor (Compression before expansion)
+        if len(crypto['highs']) >= 24 and len(crypto['lows']) >= 24:
+            highs = list(crypto['highs'])
+            lows = list(crypto['lows'])
+
+            recent_range = max(highs[-6:]) - min(lows[-6:])
+            prior_range = max(highs[-18:-6]) - min(lows[-18:-6]) if len(highs) >= 18 else recent_range * 2
+
+            if len(lows) >= 12:
+                recent_low = min(lows[-6:])
+                prior_low = min(lows[-12:-6])
+                lows_rising = recent_low > prior_low
+            else:
+                lows_rising = False
+
+            if prior_range > 0:
+                range_compression = recent_range / prior_range
+                if range_compression < 0.5 and lows_rising:
+                    score += 0.25
+                    signals += 1
+                elif range_compression < 0.7 and lows_rising:
+                    score += 0.15
+                    signals += 1
+
+        # SIGNAL 3: OBV Divergence (cumulative buying pressure rising while price flat)
+        if len(crypto['returns']) >= 18 and len(crypto['volume']) >= 18:
+            returns = list(crypto['returns'])
+            volumes = list(crypto['volume'])
+
+            obv_changes = []
+            for i in range(-18, 0):
+                if returns[i] > 0:
+                    obv_changes.append(volumes[i])
+                elif returns[i] < 0:
+                    obv_changes.append(-volumes[i])
+                else:
+                    obv_changes.append(0)
+
+            obv = np.cumsum(obv_changes)
+
+            price_change_18 = sum(returns[-18:])
+            obv_trend = obv[-1] - obv[0]
+
+            if abs(price_change_18) < 0.03 and obv_trend > 0:
+                total_vol = sum(abs(v) for v in obv_changes)
+                if total_vol > 0:
+                    obv_strength = obv_trend / total_vol
+                    if obv_strength > 0.3:
+                        score += 0.25
+                        signals += 1
+                    elif obv_strength > 0.15:
+                        score += 0.15
+                        signals += 1
+
+        # SIGNAL 4: RSI Recovery from Oversold (early momentum shift)
+        if crypto['rsi'].IsReady:
+            rsi = crypto['rsi'].Current.Value
+            if len(crypto['zscore']) >= 6:
+                recent_z = list(crypto['zscore'])
+                was_oversold = any(z < -1.5 for z in recent_z[-6:])
+                recovering = rsi > 40 and rsi < 60
+
+                if was_oversold and recovering:
+                    score += 0.20
+                    signals += 1
+
+        # CONFLUENCE BONUS
+        if signals >= 3:
+            score *= 1.30
+        elif signals >= 2:
+            score *= 1.15
+
+        return min(score, 1.0)
+
+    def calculate_relative_outperformance_score(self, crypto):
+        """
+        Find coins outperforming the market — the ones pumping while everything else is flat.
+        Returns 0.0-1.0.
+        """
+        score = 0.0
+
+        if len(crypto['rs_vs_btc']) >= 6:
+            rs_list = list(crypto['rs_vs_btc'])
+            rs_3 = np.mean(rs_list[-3:])
+            rs_6 = np.mean(rs_list[-6:])
+
+            if rs_3 > 0.02:
+                score += 0.25
+            elif rs_3 > 0.01:
+                score += 0.15
+
+            if rs_6 > 0.015:
+                score += 0.15
+
+            if rs_3 > rs_6 and rs_3 > 0.01:
+                score += 0.10
+
+        if len(crypto['returns']) >= 24:
+            returns = list(crypto['returns'])
+            recent_ret = np.mean(returns[-3:])
+            historical_std = np.std(returns[-24:])
+
+            if historical_std > 0:
+                z_move = recent_ret / historical_std
+                if z_move > 2.0:
+                    score += 0.25
+                elif z_move > 1.0:
+                    score += 0.15
+
+        if len(crypto['volume']) >= 12 and len(crypto['returns']) >= 6:
+            volumes = list(crypto['volume'])
+            returns = list(crypto['returns'])
+
+            recent_vol = np.mean(volumes[-3:])
+            baseline_vol = np.median(volumes[-12:])
+            recent_ret = sum(returns[-6:])
+
+            if baseline_vol > 0 and recent_vol > baseline_vol * 1.3 and recent_ret > 0.02:
+                score += 0.15
+
+        return min(score, 1.0)
+
+    def calculate_smart_money_flow(self, crypto):
+        """
+        Detect institutional accumulation from OHLCV candle structure.
+        Returns 0.0-1.0.
+        """
+        score = 0.0
+
+        if len(crypto['prices']) < 12 or len(crypto['highs']) < 12 or len(crypto['lows']) < 12 or len(crypto['volume']) < 12:
+            return 0.0
+
+        prices = list(crypto['prices'])
+        highs = list(crypto['highs'])
+        lows = list(crypto['lows'])
+        volumes = list(crypto['volume'])
+
+        # SIGNAL 1: Close Location Value (CLV) trend
+        clv_values = []
+        for i in range(-12, 0):
+            bar_range = highs[i] - lows[i]
+            if bar_range > 0:
+                clv = (prices[i] - lows[i]) / bar_range
+                clv_values.append(clv)
+
+        if len(clv_values) >= 6:
+            avg_clv = np.mean(clv_values[-6:])
+            recent_clv = np.mean(clv_values[-3:])
+
+            if recent_clv > 0.65:
+                score += 0.20
+            if avg_clv > 0.55 and recent_clv > avg_clv:
+                score += 0.10
+
+        # SIGNAL 2: Money Flow = CLV × Volume (Chaikin-style)
+        if len(clv_values) >= 12:
+            mf_recent = sum((clv_values[i] * 2 - 1) * volumes[-12 + i] for i in range(6, 12))
+            mf_prior = sum((clv_values[i] * 2 - 1) * volumes[-12 + i] for i in range(0, 6))
+
+            price_change = (prices[-1] - prices[-7]) / prices[-7] if prices[-7] > 0 else 0
+
+            if mf_recent > mf_prior and abs(price_change) < 0.03:
+                score += 0.25
+            elif mf_recent > mf_prior * 1.5:
+                score += 0.15
+
+        # SIGNAL 3: Bar Absorption (high volume + small range = large player absorbing)
+        absorption_count = 0
+        for i in range(-6, 0):
+            bar_range = highs[i] - lows[i]
+            median_range = np.median([highs[j] - lows[j] for j in range(-12, 0)])
+            median_vol = np.median(volumes[-12:])
+
+            if median_range > 0 and median_vol > 0:
+                range_ratio = bar_range / median_range
+                vol_ratio = volumes[i] / median_vol
+
+                if range_ratio < 0.5 and vol_ratio > 1.5:
+                    absorption_count += 1
+
+        if absorption_count >= 2:
+            score += 0.20
+        elif absorption_count >= 1:
+            score += 0.10
+
+        # SIGNAL 4: Tail Ratio (lower wicks = buyers defending)
+        tail_strength = 0
+        for i in range(-6, 0):
+            bar_range = highs[i] - lows[i]
+            if bar_range > 0 and i > -6:
+                close_vs_prev = prices[i] - prices[i - 1]
+                if close_vs_prev >= 0:
+                    lower_tail = (min(prices[i], prices[i - 1]) - lows[i]) / bar_range
+                    if lower_tail > 0.3:
+                        tail_strength += 1
+
+        if tail_strength >= 3:
+            score += 0.15
+
+        return min(score, 1.0)
+
+    def calculate_snipe_score(self, crypto):
+        """
+        Master snipe score combining all 4 detection engines.
+        Returns (snipe_score, is_snipe, components_dict).
+        """
+        try:
+            explosion = self.calculate_explosion_score(crypto)
+            accumulation = self.calculate_accumulation_score(crypto)
+            relative_outperf = self.calculate_relative_outperformance_score(crypto)
+            smart_money = self.calculate_smart_money_flow(crypto)
+
+            snipe_score = (
+                explosion * 0.20 +
+                accumulation * 0.30 +
+                relative_outperf * 0.25 +
+                smart_money * 0.25
+            )
+
+            engines_firing = sum(1 for s in [explosion, accumulation, relative_outperf, smart_money] if s > 0.4)
+            if engines_firing >= 3:
+                snipe_score *= 1.25
+            elif engines_firing >= 2:
+                snipe_score *= 1.10
+
+            is_snipe = snipe_score > 0.45
+
+            components = {
+                'explosion': explosion,
+                'accumulation': accumulation,
+                'relative_outperf': relative_outperf,
+                'smart_money': smart_money,
+            }
+
+            return min(snipe_score, 1.0), is_snipe, components
+        except Exception as e:
+            self.algo.Debug(f"Error in calculate_snipe_score: {e}")
+            return 0.0, False, {}
 
     def calculate_position_size(self, score, threshold, asset_vol_ann):
         """

@@ -141,6 +141,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.market_regime = "unknown"
         self.volatility_regime = "normal"
         self.market_breadth = 0.5
+        self._regime_hold_count = 0
 
         self.winning_trades = 0
         self.losing_trades = 0
@@ -450,16 +451,24 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             crypto['spreads'].append(sp)
 
     def _update_market_context(self):
-        if len(self.btc_prices) >= self.medium_period:
+        if len(self.btc_prices) >= 72:
             btc_arr = np.array(list(self.btc_prices))
-            btc_sma = np.mean(btc_arr[-self.medium_period:])
+            btc_sma = np.mean(btc_arr[-72:])
             current_btc = btc_arr[-1]
-            if current_btc > btc_sma * 1.03:
-                self.market_regime = "bull"
-            elif current_btc < btc_sma * 0.97:
-                self.market_regime = "bear"
+            if current_btc > btc_sma * 1.05:
+                new_regime = "bull"
+            elif current_btc < btc_sma * 0.95:
+                new_regime = "bear"
             else:
-                self.market_regime = "sideways"
+                new_regime = "sideways"
+            # Hysteresis: only change if held for 6+ bars
+            if new_regime != self.market_regime:
+                self._regime_hold_count += 1
+                if self._regime_hold_count >= 6:
+                    self.market_regime = new_regime
+                    self._regime_hold_count = 0
+            else:
+                self._regime_hold_count = 0
         if len(self.btc_volatility) >= 5:
             current_vol = self.btc_volatility[-1]
             avg_vol = np.mean(list(self.btc_volatility))
@@ -595,36 +604,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         return dict(self.weights)  # bull: use static weights
 
     def _calculate_composite_score(self, factors, crypto=None):
-        weights = self._get_regime_weights()
-        score = sum(factors.get(f, 0.5) * w for f, w in weights.items())
-
-        # Hurst exponent integration (item 10)
-        if crypto and len(crypto.get('prices', [])) >= 30:
-            try:
-                hurst = self._scoring_engine._hurst_exponent(crypto['prices'])
-                if hurst > 0.6:
-                    score *= 1.05
-                elif hurst < 0.4:
-                    score *= 0.95
-            except Exception:
-                pass
-
-        # Momentum acceleration bonus
-        strong_factors = sum(1 for v in factors.values() if v >= 0.7)
-        if strong_factors >= 4:
-            score *= 1.10
-        elif strong_factors >= 3:
-            score *= 1.05
-
-        if self.market_regime == "bear":
-            score *= 0.85
-        if self.volatility_regime == "high":
-            score *= 0.90
-        if self.market_breadth > 0.7:
-            score *= 1.08
-        elif self.market_breadth < 0.3:
-            score *= 0.90
-        return min(score, 1.0)
+        return self._scoring_engine.calculate_composite_score(factors, crypto)
 
     def _apply_fee_adjustment(self, score):
         return score - (self.expected_round_trip_fees * 1.1 + self.fee_slippage_buffer)
@@ -639,11 +619,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         return kelly_fraction(self)
 
     def _get_max_daily_trades(self):
-        """Return max daily trades adapted to market regime (items 7 & 11)."""
+        """Return max daily trades adapted to market regime."""
         if self.market_regime == "sideways":
-            return 4
+            return 6
         elif self.market_regime == "bear":
-            return 3
+            return 5
         return 10  # bull + normal vol
 
     def _check_correlation(self, new_symbol):
@@ -784,22 +764,27 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             composite_score = self._calculate_composite_score(factor_scores, crypto)
             net_score = self._apply_fee_adjustment(composite_score)
 
-            # Calculate explosion score for spike detection
+            # Calculate snipe score (replaces old explosion-only detection)
             try:
-                explosion = self._scoring_engine.calculate_explosion_score(crypto)
+                snipe_score, is_snipe, snipe_components = self._scoring_engine.calculate_snipe_score(crypto)
             except Exception:
-                explosion = 0.0
+                snipe_score, is_snipe, snipe_components = 0.0, False, {}
 
             is_spike = False
-            if explosion > self.explosion_high_conviction_threshold:
-                net_score = 0.80  # Force high score for high-conviction spike
+            explosion = snipe_components.get('explosion', 0.0)
+
+            # HIGH CONVICTION SNIPE: bypass normal scoring
+            if snipe_score > 0.65:
+                net_score = max(net_score, 0.80)
                 is_spike = True
-            elif explosion > self.explosion_boost_threshold:
-                composite_score *= (1.0 + explosion * 0.5)
+            # MEDIUM CONVICTION: boost composite score proportionally
+            elif snipe_score > 0.40:
+                boost = 1.0 + snipe_score * 0.6
+                composite_score *= boost
                 net_score = self._apply_fee_adjustment(composite_score)
-                is_spike = explosion > 0.55
+                is_spike = snipe_score > 0.50
             
-            # Populate recent_net_scores for persistence filter (Fix 3)
+            # Populate recent_net_scores for persistence filter
             crypto['recent_net_scores'].append(net_score)
             
             if net_score > threshold_now:
@@ -813,6 +798,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     'dollar_volume': list(crypto['dollar_volume'])[-6:] if len(crypto['dollar_volume']) >= 6 else [],
                     'is_spike': is_spike,
                     'explosion': explosion,
+                    'snipe_score': snipe_score,
+                    'snipe_components': snipe_components,
                 })
         
         # Log diagnostic summary
@@ -946,6 +933,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             crypto = self.crypto_data.get(sym)
             if not crypto:
                 continue
+
+            # Snipe bypass: high-conviction snipes skip EMA and momentum gates
+            is_snipe_bypass = cand.get('snipe_score', 0) > 0.50
+
             if crypto['ema_short'].IsReady and crypto['ema_medium'].IsReady:
                 ema_short = crypto['ema_short'].Current.Value
                 ema_medium = crypto['ema_medium'].Current.Value
@@ -957,25 +948,17 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     if z < -1.5 and rsi < 35:
                         is_mean_reversion = True
 
-                if not is_mean_reversion:
+                if not is_mean_reversion and not is_snipe_bypass:
                     if ema_short <= ema_medium:
-                        if self.market_regime == "bull":
+                        # Soft gate in ALL regimes: apply 0.80 penalty instead of hard reject
+                        penalized_score = net_score * 0.80
+                        if penalized_score <= threshold_now:
                             reject_ema_gate += 1
                             continue
-                        else:
-                            # Soft gate: penalize score but allow if still above threshold
-                            net_score *= 0.75
-                            if net_score <= threshold_now:
-                                reject_ema_gate += 1
-                                continue
-                    if len(crypto['returns']) >= 3:
-                        recent_return = np.mean(list(crypto['returns'])[-3:])
-                        if recent_return <= 0:
-                            reject_ema_gate += 1
-                            continue
-            
-            if len(crypto['recent_net_scores']) >= 2:
-                above_threshold_count = sum(1 for score in list(crypto['recent_net_scores'])[-2:] if score > threshold_now)
+                        net_score = penalized_score
+
+            if len(crypto['recent_net_scores']) >= 3:
+                above_threshold_count = sum(1 for score in list(crypto['recent_net_scores'])[-3:] if score > threshold_now)
                 if above_threshold_count == 0:
                     reject_recent_net_scores += 1
                     continue
@@ -1044,7 +1027,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     self.trade_count += 1
                     if is_spike:
                         self._spike_entries[sym] = True
-                        self.Debug(f"🚀 SPIKE ENTRY: {sym.Value} | explosion={explosion:.2f}")
+                        components = cand.get('snipe_components', {})
+                        self.Debug(f"🎯 SNIPE ENTRY: {sym.Value} | snipe={cand.get('snipe_score', 0):.2f} | "
+                                   f"acc={components.get('accumulation', 0):.2f} "
+                                   f"rel={components.get('relative_outperf', 0):.2f} "
+                                   f"smf={components.get('smart_money', 0):.2f} "
+                                   f"exp={components.get('explosion', 0):.2f}")
                     if self.LiveMode:
                         self._last_live_trade_time = self.Time
             except Exception as e:
