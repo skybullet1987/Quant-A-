@@ -25,6 +25,12 @@ SYMBOL_BLACKLIST = {
     "PLNUSD", "THBUSD",
 }
 
+# Known fiat currency codes used to filter forex pairs from the crypto universe
+KNOWN_FIAT_CURRENCIES = frozenset({
+    "EUR", "GBP", "AUD", "NZD", "JPY", "CAD", "CHF", "CNY", "HKD", "SGD",
+    "SEK", "NOK", "DKK", "KRW", "TRY", "ZAR", "MXN", "INR", "BRL", "PLN", "THB",
+})
+
 KRAKEN_MIN_QTY_FALLBACK = {
     'AXSUSD': 5.0, 'SANDUSD': 10.0, 'MANAUSD': 10.0, 'ADAUSD': 10.0,
     'MATICUSD': 10.0, 'DOTUSD': 1.0, 'LINKUSD': 0.5, 'AVAXUSD': 0.2,
@@ -193,6 +199,10 @@ def smart_liquidate(algo, symbol, tag="Liquidate"):
     # Use the same 0.6% estimate already referenced in the fee-reserve check above.
     adjusted_qty = abs(holding_qty) * (1.0 - KRAKEN_SELL_FEE_BUFFER)
     safe_qty = round_quantity(algo, symbol, adjusted_qty)
+    # Ensure we never attempt to sell more than the actual portfolio quantity
+    actual_qty = abs(algo.Portfolio[symbol].Quantity)
+    if safe_qty > actual_qty:
+        safe_qty = round_quantity(algo, symbol, actual_qty)
     if safe_qty < min_qty:
         return
     if safe_qty > 0:
