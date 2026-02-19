@@ -20,7 +20,7 @@ SYMBOL_BLACKLIST = {
     "ARCUSD", "PAXGUSD",
     "PARTIUSD", "RAREUSD", "BANANAS31USD",
     # Forex pairs
-    "GBPUSD", "AUDUSD", "NZDUSD", "JPYUSD", "CADUSD", "CHFUSD", "CNYUSD", "HKDUSD", "SGDUSD",
+    "EURUSD", "GBPUSD", "AUDUSD", "NZDUSD", "JPYUSD", "CADUSD", "CHFUSD", "CNYUSD", "HKDUSD", "SGDUSD",
     "SEKUSD", "NOKUSD", "DKKUSD", "KRWUSD", "TRYUSD", "ZARUSD", "MXNUSD", "INRUSD", "BRLUSD",
     "PLNUSD", "THBUSD",
 }
@@ -45,6 +45,10 @@ MIN_NOTIONAL_FALLBACK = {
     'AUDUSD': 10.0, 'LPTUSD': 0.3, 'OXTUSD': 40.0, 'ENJUSD': 15.0,
     'UNIUSD': 0.5, 'LSKUSD': 3.0, 'BCHUSD': 1.0,
 }
+
+# Fee buffer applied when computing sell quantity to prevent overselling due to
+# Kraken deducting fees from the base asset after a buy (Cash Modeling discrepancy).
+KRAKEN_SELL_FEE_BUFFER = 0.006  # 0.6% (0.4% base fee + 0.2% safety margin)
 
 
 class RealisticCryptoSlippage:
@@ -184,7 +188,11 @@ def smart_liquidate(algo, symbol, tag="Liquidate"):
     algo.Transactions.CancelOpenOrders(symbol)
     if abs(holding_qty) < min_qty:
         return
-    safe_qty = round_quantity(algo, symbol, abs(holding_qty))
+    # Apply a fee safety buffer so we never attempt to sell more than Kraken
+    # actually holds after fee deduction from the base asset (Cash Modeling).
+    # Use the same 0.6% estimate already referenced in the fee-reserve check above.
+    adjusted_qty = abs(holding_qty) * (1.0 - KRAKEN_SELL_FEE_BUFFER)
+    safe_qty = round_quantity(algo, symbol, adjusted_qty)
     if safe_qty < min_qty:
         return
     if safe_qty > 0:
