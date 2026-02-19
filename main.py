@@ -21,20 +21,20 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.SetCash(20)
         self.SetBrokerageModel(BrokerageName.Kraken, AccountType.Cash)
 
-        self.threshold_bull = self._get_param("threshold_bull", 0.42)
-        self.threshold_bear = self._get_param("threshold_bear", 0.52)
-        self.threshold_sideways = self._get_param("threshold_sideways", 0.47)
-        self.threshold_high_vol = self._get_param("threshold_high_vol", 0.50)
-        self.trailing_activation = self._get_param("trailing_activation", 0.04)
-        self.trailing_stop_pct = self._get_param("trailing_stop_pct", 0.025)
+        self.threshold_bull = self._get_param("threshold_bull", 0.50)
+        self.threshold_bear = self._get_param("threshold_bear", 0.58)
+        self.threshold_sideways = self._get_param("threshold_sideways", 0.53)
+        self.threshold_high_vol = self._get_param("threshold_high_vol", 0.55)
+        self.trailing_activation = self._get_param("trailing_activation", 0.05)
+        self.trailing_stop_pct = self._get_param("trailing_stop_pct", 0.03)
         self.base_stop_loss = self._get_param("base_stop_loss", 0.06)
-        self.base_take_profit = self._get_param("base_take_profit", 0.12)
+        self.base_take_profit = self._get_param("base_take_profit", 0.15)
         self.atr_sl_mult = self._get_param("atr_sl_mult", 2.0)
-        self.atr_tp_mult = self._get_param("atr_tp_mult", 3.5)
+        self.atr_tp_mult = self._get_param("atr_tp_mult", 4.0)
 
         self.target_position_ann_vol = self._get_param("target_position_ann_vol", 0.35)
         self.portfolio_vol_cap = self._get_param("portfolio_vol_cap", 0.45)
-        self.signal_decay_buffer = self._get_param("signal_decay_buffer", 0.03)
+        self.signal_decay_buffer = self._get_param("signal_decay_buffer", 0.05)
         self.min_signal_age_hours = self._get_param("signal_decay_min_hours", 12)
         self.cash_reserve_pct = 0.10
 
@@ -52,6 +52,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.position_size_pct = 0.40
         self.min_notional = 5.0  # lowered per request
         self.min_price_usd = 0.005
+        self.min_dollar_volume_usd = 10000  # minimum 6h avg dollar volume for any mode
 
         self.expected_round_trip_fees = 0.0020
         self.fee_slippage_buffer = 0.002
@@ -138,6 +139,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.btc_returns = deque(maxlen=self.long_period)
         self.btc_prices = deque(maxlen=self.long_period)
         self.btc_volatility = deque(maxlen=self.long_period)
+        self.btc_ema_24 = ExponentialMovingAverage(24)
+        self.min_hold_hours = 3.0
         self._rolling_wins = deque(maxlen=50)
         self._rolling_win_sizes = deque(maxlen=50)
         self._rolling_loss_sizes = deque(maxlen=50)
@@ -176,7 +179,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         # Spike detection settings
         self.explosion_volume_lookback = 24
         self.explosion_bb_lookback = 12
-        self.explosion_high_conviction_threshold = 0.70  # bypass normal scoring
+        self.explosion_high_conviction_threshold = 0.75  # bypass normal scoring
         self.explosion_boost_threshold = 0.40  # boost composite score
         self.spike_position_size_pct = 0.50  # was 0.85; now capped at 50%
         self.spike_stop_loss = 0.08  # wider stop for spike trades
@@ -376,6 +379,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 btc_return = (btc_price - self.btc_prices[-1]) / self.btc_prices[-1]
                 self.btc_returns.append(btc_return)
             self.btc_prices.append(btc_price)
+            self.btc_ema_24.Update(btc_bar.EndTime, btc_price)
             if len(self.btc_returns) >= 10:
                 self.btc_volatility.append(np.std(list(self.btc_returns)[-10:]))
         # === Consume alternative data feeds ===
@@ -576,10 +580,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     def _get_max_daily_trades(self):
         """Return max daily trades adapted to market regime."""
         if self.market_regime == "bear":
-            return 2
-        elif self.market_regime == "sideways":
             return 3
-        return 8  # bull
+        elif self.market_regime == "sideways":
+            return 4
+        return 6  # bull
 
     def _check_correlation(self, new_symbol):
         """Reject candidate if it is too correlated with any existing position (item 8)."""
@@ -665,7 +669,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             self._log_skip(f"drawdown {dd:.1%} > limit")
             return
         if self.consecutive_losses >= self.max_consecutive_losses:
-            self.drawdown_cooldown = 12
+            self.drawdown_cooldown = 24
             self.consecutive_losses = 0
             self._log_skip("consecutive loss cooldown")
             return
@@ -686,6 +690,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if self._compute_portfolio_risk_estimate() > self.portfolio_vol_cap:
             self._log_skip("risk cap")
             return
+        # BTC uptrend gate: require BTC price > BTC 24-period EMA before entering new positions
+        if self.btc_ema_24.IsReady and len(self.btc_prices) > 0:
+            if self.btc_prices[-1] < self.btc_ema_24.Current.Value:
+                self._log_skip("BTC below 24h EMA - no new entries")
+                return
         
         # Diagnostic counters for filter funnel
         total_symbols = len(self.crypto_data)
@@ -734,15 +743,15 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             explosion = snipe_components.get('explosion', 0.0)
 
             # HIGH CONVICTION SNIPE: bypass normal scoring
-            if snipe_score > 0.65:
+            if snipe_score > 0.75:
                 net_score = max(net_score, 0.80)
                 is_spike = True
             # MEDIUM CONVICTION: boost composite score proportionally
-            elif snipe_score > 0.40:
+            elif snipe_score > 0.50:
                 boost = 1.0 + snipe_score * 0.6
                 composite_score *= boost
                 net_score = self._apply_fee_adjustment(composite_score)
-                is_spike = snipe_score > 0.50
+                is_spike = snipe_score > 0.60
             
             # Populate recent_net_scores for persistence filter
             crypto['recent_net_scores'].append(net_score)
@@ -907,7 +916,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 continue
 
             # Snipe bypass: high-conviction snipes skip EMA and momentum gates
-            is_snipe_bypass = cand.get('snipe_score', 0) > 0.60
+            is_snipe_bypass = cand.get('snipe_score', 0) > 0.75
 
             if crypto['ema_short'].IsReady and crypto['ema_medium'].IsReady:
                 ema_short = crypto['ema_short'].Current.Value
@@ -948,9 +957,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if slippage_penalty <= 0.3:
                 self.Debug(f"⚠️ HIGH SLIPPAGE PENALTY: {sym.Value} | size reduced to {slippage_penalty:.0%}")
 
-            if self.LiveMode and len(crypto['dollar_volume']) >= 6:
+            if len(crypto['dollar_volume']) >= 6:
                 recent_dollar_vol6 = np.mean(list(crypto['dollar_volume'])[-6:])
-                if recent_dollar_vol6 < 5000:
+                if recent_dollar_vol6 < self.min_dollar_volume_usd:
                     reject_dollar_volume += 1
                     continue
             recent_dollar_vol3 = np.mean(list(crypto['dollar_volume'])[-3:]) if len(crypto['dollar_volume']) >= 3 else 0
@@ -1121,7 +1130,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         else:
             # Regime-adaptive time stop (item 4)
             if self.market_regime == "bull":
-                time_exit_hours = 36
+                time_exit_hours = 48
                 time_exit_pnl_thresh = 0.005
             elif self.market_regime == "sideways":
                 time_exit_hours = 72
@@ -1139,40 +1148,44 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         trailing_allowed = hours >= self.trailing_grace_hours
         if pnl <= -sl:
             tag = "Stop Loss"
-        elif pnl >= tp:
-            tag = "Take Profit"
-        elif trailing_allowed and pnl > trailing_activation and dd >= trailing_stop_pct:
-            tag = "Trailing Stop"
-        elif self.market_regime == "bear" and pnl > 0.05:
-            tag = "Bear Exit"
-        elif self.whale_net_flow > 8 and hours > 12 and pnl < 0.02:
-            tag = "Whale Exit"
-        elif is_spike_entry and hours > 12 and pnl < 0.02:
-            tag = "Spike Fizzle"
-        elif hours > time_exit_hours and pnl < time_exit_pnl_thresh:
-            tag = "Time Exit"
-        if not tag and trailing_allowed and atr and entry > 0 and holding.Quantity != 0:
-            trail_offset = atr * self.atr_trail_mult
-            trail_level = price - trail_offset
-            current_trail = crypto.get('trail_stop') if crypto else None
-            if current_trail is None or trail_level > current_trail:
-                crypto['trail_stop'] = trail_level
-            if crypto and crypto['trail_stop'] is not None:
-                if holding.Quantity > 0 and price <= crypto['trail_stop']:
-                    tag = "ATR Trail"
-                elif holding.Quantity < 0 and price >= crypto['trail_stop']:
-                    tag = "ATR Trail"
-        if not tag and hours >= self.min_signal_age_hours:
-            try:
-                if crypto and self._is_ready(crypto):
-                    # Require 3 consecutive below-threshold readings before triggering Signal Decay
-                    threshold = self._get_threshold()
-                    decay_threshold = threshold - self.signal_decay_buffer
-                    recent_scores = list(crypto.get('recent_net_scores', []))
-                    if len(recent_scores) >= 3 and all(s < decay_threshold for s in recent_scores[-3:]):
-                        tag = "Signal Decay"
-            except Exception as e:
-                pass
+        elif hours >= self.min_hold_hours:
+            # All non-Stop-Loss exits require minimum hold time to prevent ultra-short-term churn.
+            # This intentionally blocks ATR Trail and Trailing Stop during the hold period —
+            # normal hourly volatility was triggering these too early.
+            if pnl >= tp:
+                tag = "Take Profit"
+            elif trailing_allowed and pnl > trailing_activation and dd >= trailing_stop_pct:
+                tag = "Trailing Stop"
+            elif self.market_regime == "bear" and pnl > 0.05:
+                tag = "Bear Exit"
+            elif self.whale_net_flow > 8 and hours > 12 and pnl < 0.02:
+                tag = "Whale Exit"
+            elif is_spike_entry and hours > 12 and pnl < 0.02:
+                tag = "Spike Fizzle"
+            elif hours > time_exit_hours and pnl < time_exit_pnl_thresh:
+                tag = "Time Exit"
+            if not tag and trailing_allowed and atr and entry > 0 and holding.Quantity != 0:
+                trail_offset = atr * self.atr_trail_mult
+                trail_level = price - trail_offset
+                current_trail = crypto.get('trail_stop') if crypto else None
+                if current_trail is None or trail_level > current_trail:
+                    crypto['trail_stop'] = trail_level
+                if crypto and crypto['trail_stop'] is not None:
+                    if holding.Quantity > 0 and price <= crypto['trail_stop']:
+                        tag = "ATR Trail"
+                    elif holding.Quantity < 0 and price >= crypto['trail_stop']:
+                        tag = "ATR Trail"
+            if not tag and hours >= self.min_signal_age_hours:
+                try:
+                    if crypto and self._is_ready(crypto):
+                        # Require 3 consecutive below-threshold readings before triggering Signal Decay
+                        threshold = self._get_threshold()
+                        decay_threshold = threshold - self.signal_decay_buffer
+                        recent_scores = list(crypto.get('recent_net_scores', []))
+                        if len(recent_scores) >= 3 and all(s < decay_threshold for s in recent_scores[-3:]):
+                            tag = "Signal Decay"
+                except Exception as e:
+                    pass
         if tag:
             if price * abs(holding.Quantity) < min_notional_usd * 0.9:
                 return
