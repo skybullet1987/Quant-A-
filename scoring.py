@@ -264,17 +264,14 @@ class OpusScoringEngine:
         """
         # Dynamic weight adjustment based on Hurst exponent
         weights = dict(self.algo.weights)  # copy base weights
-        
+
+        hurst_mult = 1.0
         if crypto and len(crypto.get('prices', [])) >= 30:
             hurst = self._hurst_exponent(crypto['prices'])
-            if hurst > 0.55:
-                # Trending regime: boost trend, reduce mean reversion
-                weights['trend_strength'] = weights.get('trend_strength', 0.15) + 0.05
-                weights['mean_reversion'] = max(0.02, weights.get('mean_reversion', 0.12) - 0.05)
-            elif hurst < 0.45:
-                # Mean-reverting regime: boost mean reversion, reduce trend
-                weights['mean_reversion'] = weights.get('mean_reversion', 0.12) + 0.05
-                weights['trend_strength'] = max(0.02, weights.get('trend_strength', 0.15) - 0.05)
+            if hurst > 0.6:
+                hurst_mult = 1.05  # trending: boost score
+            elif hurst < 0.4:
+                hurst_mult = 0.95  # mean-reverting: reduce score
         
         # Normalize weights to sum to 1.0
         total_w = sum(weights.values())
@@ -282,6 +279,7 @@ class OpusScoringEngine:
             weights = {k: v / total_w for k, v in weights.items()}
         
         score = sum(factors.get(f, 0.5) * w for f, w in weights.items())
+        score *= hurst_mult  # apply Hurst-based multiplier (item 10)
         
         # Regime adjustments
         if self.algo.market_regime == "bear":
@@ -405,6 +403,15 @@ class OpusScoringEngine:
             score *= 1.3
         elif signals_firing >= 3:
             score *= 1.15
+
+        # === SPIKE CONFIRMATION (item 5) ===
+        if len(crypto['returns']) >= 1:
+            returns_list = list(crypto['returns'])
+            curr_ret = returns_list[-1]
+            if curr_ret < -0.02:
+                score *= 0.3  # Current bar dropped >2%: likely dump, not pump
+            elif len(returns_list) >= 2 and returns_list[-2] <= 0:
+                score *= 0.7  # Previous bar not positive: weaker confirmation
 
         return min(score, 1.0)
 
