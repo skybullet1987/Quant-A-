@@ -283,13 +283,13 @@ class OpusScoringEngine:
         
         # Regime adjustments (mild penalties to avoid stacking with main.py)
         if self.algo.market_regime == "bear":
-            score *= 0.90  # Mild penalty, not crushing
+            score *= 0.92  # Mild penalty
         if self.algo.volatility_regime == "high":
-            score *= 0.85
+            score *= 0.93
         if self.algo.market_breadth > 0.7:
             score *= 1.08
         elif self.algo.market_breadth < 0.3:
-            score *= 0.92  # Mild penalty
+            score *= 0.95  # Mild penalty
         
         # Bonus for strong breakout
         if factors.get('breakout_score', 0) > 0.8:
