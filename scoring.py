@@ -670,7 +670,8 @@ class OpusScoringEngine:
             elif engines_firing >= 2:
                 snipe_score *= 1.10
 
-            is_snipe = snipe_score > 0.45
+            engines_above_half = sum(1 for s in [explosion, accumulation, relative_outperf, smart_money] if s > 0.5)
+            is_snipe = snipe_score > 0.55 and engines_above_half >= 2
 
             components = {
                 'explosion': explosion,

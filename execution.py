@@ -473,12 +473,12 @@ def slip_log(algo, symbol, direction, fill_price):
         abs_slip = abs(slip)
         algo._slip_abs.append(abs_slip)
         
-        # Track slippage per symbol
+        # Track slippage per symbol (store (time, abs_slippage) tuples for time-based decay)
         if hasattr(algo, '_symbol_slippage_history'):
             ticker = symbol.Value if hasattr(symbol, 'Value') else str(symbol)
             if ticker not in algo._symbol_slippage_history:
-                algo._symbol_slippage_history[ticker] = deque(maxlen=10)
-            algo._symbol_slippage_history[ticker].append(abs_slip)
+                algo._symbol_slippage_history[ticker] = deque(maxlen=30)
+            algo._symbol_slippage_history[ticker].append((algo.Time, abs_slip))
         
         # Live slippage alert for unusually high slippage
         if algo.LiveMode and abs(slip) > algo.slip_outlier_threshold:
@@ -602,7 +602,7 @@ def kelly_fraction(algo):
 def get_slippage_penalty(algo, symbol):
     """
     Calculate position size multiplier based on historical slippage for a symbol.
-    Returns a value between 0.3 and 1.0.
+    Returns a value between 0.3 and 1.0. Ignores slippage entries older than 48 hours.
     """
     if not hasattr(algo, '_symbol_slippage_history'):
         return 1.0
@@ -615,7 +615,13 @@ def get_slippage_penalty(algo, symbol):
     if len(slippage_history) == 0:
         return 1.0
     
-    avg_slippage = sum(slippage_history) / len(slippage_history)
+    # Filter out entries older than 48 hours
+    cutoff = algo.Time - timedelta(hours=48)
+    recent_slips = [slip for entry_time, slip in slippage_history if entry_time >= cutoff]
+    if len(recent_slips) == 0:
+        return 1.0
+    
+    avg_slippage = sum(recent_slips) / len(recent_slips)
     
     # Apply penalties based on average slippage
     if avg_slippage > 0.010:  # > 1.0%
