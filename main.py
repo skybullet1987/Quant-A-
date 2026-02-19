@@ -35,7 +35,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.target_position_ann_vol = self._get_param("target_position_ann_vol", 0.35)
         self.portfolio_vol_cap = self._get_param("portfolio_vol_cap", 0.45)
         self.signal_decay_buffer = self._get_param("signal_decay_buffer", 0.03)
-        self.min_signal_age_hours = self._get_param("signal_decay_min_hours", 4)
+        self.min_signal_age_hours = self._get_param("signal_decay_min_hours", 12)
         self.cash_reserve_pct = 0.10
 
         self.ultra_short_period = 3
@@ -115,14 +115,15 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self._cancel_cooldowns = {}
         self._exit_cooldowns = {}
         self._symbol_loss_cooldowns = {}
-        self.exit_cooldown_hours = 1
+        self.exit_cooldown_hours = 6
         self.cancel_cooldown_minutes = 1
+        self.max_symbol_trades_per_day = 2
 
         self._cash_mode_until = None
         self._recent_trade_outcomes = deque(maxlen=20)
 
-        self.trailing_grace_hours = 2
-        self.atr_trail_mult = 1.2
+        self.trailing_grace_hours = 8
+        self.atr_trail_mult = 2.5
 
         self._slip_abs = deque(maxlen=50)
         self._slippage_alert_until = None
@@ -268,6 +269,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     def ResetDailyCounters(self):
         self.daily_trade_count = 0
         self.last_trade_date = self.Time.date()
+        for crypto in self.crypto_data.values():
+            crypto['trade_count_today'] = 0
         if len(self._session_blacklist) > 0:
             self.Debug(f"Clearing session blacklist ({len(self._session_blacklist)} items)")
             self._session_blacklist.clear()
@@ -346,6 +349,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             'bb_upper': deque(maxlen=self.short_period),
             'bb_lower': deque(maxlen=self.short_period),
             'bb_width': deque(maxlen=self.medium_period),
+            'trade_count_today': 0,
+            'last_loss_time': None,
         }
 
     def OnSecuritiesChanged(self, changes):
@@ -465,6 +470,14 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 new_regime = "bear"
             else:
                 new_regime = "sideways"
+            # Momentum confirmation: positive BTC returns over last 12-24 bars bias toward bull
+            if new_regime == "sideways" and len(self.btc_returns) >= 24:
+                btc_mom_12 = np.mean(list(self.btc_returns)[-12:])
+                btc_mom_24 = np.mean(list(self.btc_returns)[-24:])
+                if btc_mom_12 > 0 and btc_mom_24 > 0:
+                    new_regime = "bull"
+                elif btc_mom_12 < 0 and btc_mom_24 < 0:
+                    new_regime = "bear"
             # Hysteresis: only change if held for 6+ bars
             if new_regime != self.market_regime:
                 self._regime_hold_count += 1
@@ -851,6 +864,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             effective_size_cap = self.position_size_pct
             if self.LiveMode and (self.volatility_regime == "high" or self.market_regime == "sideways"):
                 effective_size_cap = min(effective_size_cap, 0.25)
+            # Cap position size for small portfolios to limit concentration risk
+            total_value = self.Portfolio.TotalPortfolioValue
+            if total_value < 100:
+                effective_size_cap = min(effective_size_cap, 0.20)
             # Sentiment-driven position size caps
             if self.fear_greed < 25:
                 effective_size_cap = max(effective_size_cap, 0.70)  # contrarian: allow larger size
@@ -860,7 +877,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if self.whale_net_flow > 5 and not (is_spike and explosion > 0.6):
                 continue
 
-            total_value = self.Portfolio.TotalPortfolioValue
             try:
                 available_cash = self.Portfolio.CashBook["USD"].Amount
             except (KeyError, AttributeError):
@@ -886,8 +902,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if not crypto:
                 continue
 
+            # Per-symbol daily trade limit: max entries per symbol per day
+            if crypto.get('trade_count_today', 0) >= self.max_symbol_trades_per_day:
+                continue
+
             # Snipe bypass: high-conviction snipes skip EMA and momentum gates
-            is_snipe_bypass = cand.get('snipe_score', 0) > 0.50
+            is_snipe_bypass = cand.get('snipe_score', 0) > 0.60
 
             if crypto['ema_short'].IsReady and crypto['ema_medium'].IsReady:
                 ema_short = crypto['ema_short'].Current.Value
@@ -977,6 +997,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     self.Debug(f"ORDER: {sym.Value} | ${val:.2f} | id={ticket.OrderId}")
                     success_count += 1
                     self.trade_count += 1
+                    crypto['trade_count_today'] = crypto.get('trade_count_today', 0) + 1
                     if is_spike:
                         self._spike_entries[sym] = True
                         components = cand.get('snipe_components', {})
@@ -1144,19 +1165,19 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if not tag and hours >= self.min_signal_age_hours:
             try:
                 if crypto and self._is_ready(crypto):
-                    factors = self._calculate_factor_scores(symbol, crypto)
-                    if factors:
-                        comp = self._calculate_composite_score(factors, crypto)
-                        net = self._apply_fee_adjustment(comp)
-                        if net < self._get_threshold() - self.signal_decay_buffer:
-                            tag = "Signal Decay"
+                    # Require 3 consecutive below-threshold readings before triggering Signal Decay
+                    threshold = self._get_threshold()
+                    decay_threshold = threshold - self.signal_decay_buffer
+                    recent_scores = list(crypto.get('recent_net_scores', []))
+                    if len(recent_scores) >= 3 and all(s < decay_threshold for s in recent_scores[-3:]):
+                        tag = "Signal Decay"
             except Exception as e:
                 pass
         if tag:
             if price * abs(holding.Quantity) < min_notional_usd * 0.9:
                 return
             if pnl < 0:
-                self._symbol_loss_cooldowns[symbol] = self.Time + timedelta(hours=6)
+                self._symbol_loss_cooldowns[symbol] = self.Time + timedelta(hours=12)
             smart_liquidate(self, symbol, tag)
             self._exit_cooldowns[symbol] = self.Time + timedelta(hours=self.exit_cooldown_hours)
             self.Debug(f"{tag}: {symbol.Value} | PnL:{pnl:+.2%} | Held:{hours:.0f}h")
