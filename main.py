@@ -67,8 +67,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.max_spread_pct         = 0.005   # 0.5% – tight spread required
         self.spread_median_window   = 12
         self.spread_widen_mult      = 2.5
-        self.min_dollar_volume_usd  = 50000   # $50k/hour minimum
-        self.min_volume_usd         = 100000  # $100k daily for universe
+        self.min_dollar_volume_usd  = 50000   # $50k/hour minimum (checked via 3h avg in execute)
+        self.min_volume_usd         = 100000  # $100k minimum VolumeInUsd for universe filter
 
         # === Trade frequency & timing ===
         self.skip_hours_utc         = []      # 24/7 trading – no skip hours
@@ -206,7 +206,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(minutes=2)), self.VerifyOrderFills)
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(minutes=15)), self.PortfolioSanityCheck)
 
-        self.SetWarmUp(timedelta(days=3))
+        self.SetWarmUp(timedelta(days=4))
         self.SetSecurityInitializer(lambda security: security.SetSlippageModel(RealisticCryptoSlippage()))
         self.Settings.FreePortfolioValuePercentage = 0.01
         self.Settings.InsightScore = False
@@ -603,7 +603,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if self.consecutive_losses >= self.max_consecutive_losses:
             # Pause 3h and halve size for next 5 trades
             self.drawdown_cooldown = 3
-            self._consecutive_loss_halve_remaining = 5
+            self._consecutive_loss_halve_remaining = 3
             self.consecutive_losses = 0
             self._log_skip("consecutive loss cooldown (5 losses)")
             return
@@ -774,7 +774,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
             min_qty = get_min_quantity(self, sym)
             min_notional_usd = get_min_notional_usd(self, sym)
-            if min_qty * price > reserved_cash * 0.95:
+            if min_qty * price > reserved_cash * 0.90:
                 reject_min_qty_too_large += 1
                 continue
 
@@ -896,14 +896,18 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
         # Regime adjustments
         if self.volatility_regime == "high":
-            sl *= 1.5   # wider stops – vol is opportunity
-            tp *= 1.5
+            sl *= 1.2   # modest widening – vol is opportunity but keep risk controlled
+            tp *= 1.2
         elif self.market_regime == "bear":
             tp = min(tp, 0.015)  # tighter TP in bear (take small wins)
 
         # Bull regime: allow wider TP (up to 4%)
         if self.market_regime == "bull":
             tp = min(tp * 1.3, 0.04)
+
+        # Enforce minimum 1.5:1 reward-to-risk ratio
+        if tp < sl * 1.5:
+            tp = sl * 1.5
 
         trailing_activation = self.trail_activation
         trailing_stop_pct   = self.trail_stop_pct
