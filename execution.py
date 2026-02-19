@@ -22,7 +22,7 @@ SYMBOL_BLACKLIST = {
     # Forex pairs
     "GBPUSD", "AUDUSD", "NZDUSD", "JPYUSD", "CADUSD", "CHFUSD", "CNYUSD", "HKDUSD", "SGDUSD",
     "SEKUSD", "NOKUSD", "DKKUSD", "KRWUSD", "TRYUSD", "ZARUSD", "MXNUSD", "INRUSD", "BRLUSD",
-    "PLNUSD", "THBUSD","BTCUSD", "ETHUSD"
+    "PLNUSD", "THBUSD",
 }
 
 KRAKEN_MIN_QTY_FALLBACK = {
@@ -634,7 +634,7 @@ def get_slippage_penalty(algo, symbol):
         return 1.0
 
 
-def place_limit_or_market(algo, symbol, quantity, timeout_seconds=60, tag="Entry"):
+def place_limit_or_market(algo, symbol, quantity, timeout_seconds=30, tag="Entry"):
     """
     Place a limit order at mid-price with fallback to market order after timeout.
     In backtest mode, use market orders directly.
@@ -1161,7 +1161,7 @@ def daily_report(algo):
     """Generate daily report with portfolio status and position details."""
     if algo.IsWarmingUp:
         return
-    
+
     total = algo.winning_trades + algo.losing_trades
     wr = algo.winning_trades / total if total > 0 else 0
     avg = algo.total_pnl / total if total > 0 else 0
@@ -1169,7 +1169,6 @@ def daily_report(algo):
     algo.Debug(f"Portfolio: ${algo.Portfolio.TotalPortfolioValue:.2f} | Cash: ${algo.Portfolio.Cash:.2f}")
     algo.Debug(f"Pos: {get_actual_position_count(algo)}/{algo.base_max_positions} | {algo.market_regime} {algo.volatility_regime} {algo.market_breadth:.0%}")
     algo.Debug(f"Trades: {total} | WR: {wr:.1%} | Avg: {avg:+.2%}")
-    algo.Debug(f"Sentiment: F&G={algo.fear_greed} | WhaleFlow={algo.whale_net_flow}")
     if algo._session_blacklist:
         algo.Debug(f"Blacklist: {len(algo._session_blacklist)}")
     for kvp in algo.Portfolio:
