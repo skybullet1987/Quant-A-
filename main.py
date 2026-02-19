@@ -115,6 +115,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self._retry_pending       = {}
         self._rate_limit_until    = None
         self._last_mismatch_warning = None
+        self._failed_exit_attempts = {}  # tracks consecutive Invalid sell orders per symbol
 
         # Legacy compatibility
         self.signal_decay_buffer  = 0.05
@@ -291,6 +292,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if ticker in SYMBOL_BLACKLIST or ticker in self._session_blacklist:
                 continue
             if not ticker.endswith("USD"):
+                continue
+            # Only allow crypto securities — excludes Kraken FX pairs (e.g. EURUSD)
+            if crypto.SecurityType != SecurityType.Crypto:
                 continue
             if crypto.VolumeInUsd is None or crypto.VolumeInUsd == 0:
                 continue
@@ -863,6 +867,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             return
         for kvp in self.Portfolio:
             if not is_invested_not_dust(self, kvp.Key):
+                self._failed_exit_attempts.pop(kvp.Key, None)
+                continue
+            # Skip symbols that have exceeded exit attempt limit to avoid infinite retry loops
+            if self._failed_exit_attempts.get(kvp.Key, 0) >= 2:
                 continue
             self._check_exit(kvp.Key, self.Securities[kvp.Key].Price, kvp.Value)
 
@@ -1061,6 +1069,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                             self._cash_mode_until = self.Time + timedelta(hours=24)
                             self.Debug(f"⚠️ CASH MODE: WR={recent_wr:.0%} over {len(self._recent_trade_outcomes)} trades. Pausing 24h.")
                     cleanup_position(self, symbol)
+                    self._failed_exit_attempts.pop(symbol, None)
                 slip_log(self, symbol, event.Direction, event.FillPrice)
             elif event.Status == OrderStatus.Canceled:
                 self._pending_orders.pop(symbol, None)
@@ -1077,13 +1086,22 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 self._pending_orders.pop(symbol, None)
                 self._submitted_orders.pop(symbol, None)
                 self._order_retries.pop(event.OrderId, None)
-                if event.Direction == OrderDirection.Sell and symbol not in self.entry_prices:
-                    if is_invested_not_dust(self, symbol):
-                        holding = self.Portfolio[symbol]
-                        self.entry_prices[symbol] = holding.AveragePrice
-                        self.highest_prices[symbol] = holding.AveragePrice
-                        self.entry_times[symbol] = self.Time
-                        self.Debug(f"RE-TRACKED after invalid: {symbol.Value}")
+                if event.Direction == OrderDirection.Sell:
+                    # Track consecutive failed exit attempts to break infinite retry loops
+                    fail_count = self._failed_exit_attempts.get(symbol, 0) + 1
+                    self._failed_exit_attempts[symbol] = fail_count
+                    self.Debug(f"Invalid sell #{fail_count}: {symbol.Value}")
+                    if fail_count >= 2:
+                        # Force cleanup after repeated failures (dust position — stop retrying)
+                        self.Debug(f"FORCE CLEANUP: {symbol.Value} after {fail_count} failed exits — releasing tracking")
+                        cleanup_position(self, symbol)
+                    elif symbol not in self.entry_prices:
+                        if is_invested_not_dust(self, symbol):
+                            holding = self.Portfolio[symbol]
+                            self.entry_prices[symbol] = holding.AveragePrice
+                            self.highest_prices[symbol] = holding.AveragePrice
+                            self.entry_times[symbol] = self.Time
+                            self.Debug(f"RE-TRACKED after invalid: {symbol.Value}")
                 self._session_blacklist.add(symbol.Value)
         except Exception as e:
             self.Debug(f"OnOrderEvent error: {e}")
