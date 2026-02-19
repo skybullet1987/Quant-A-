@@ -116,6 +116,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self._rate_limit_until    = None
         self._last_mismatch_warning = None
         self._failed_exit_attempts = {}  # tracks consecutive Invalid sell orders per symbol
+        self._failed_exit_counts   = {}  # tracks failed exit attempts for dust-loop prevention
 
         # Legacy compatibility
         self.signal_decay_buffer  = 0.05
@@ -293,8 +294,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 continue
             if not ticker.endswith("USD"):
                 continue
-            # Only allow crypto securities — excludes Kraken FX pairs (e.g. EURUSD)
-            if crypto.SecurityType != SecurityType.Crypto:
+            # Filter out forex pairs by checking that the base currency is not a known fiat
+            base = ticker[:-3]  # remove "USD" suffix
+            if base in KNOWN_FIAT_CURRENCIES:
                 continue
             if crypto.VolumeInUsd is None or crypto.VolumeInUsd == 0:
                 continue
@@ -868,9 +870,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         for kvp in self.Portfolio:
             if not is_invested_not_dust(self, kvp.Key):
                 self._failed_exit_attempts.pop(kvp.Key, None)
+                self._failed_exit_counts.pop(kvp.Key, None)
                 continue
             # Skip symbols that have exceeded exit attempt limit to avoid infinite retry loops
-            if self._failed_exit_attempts.get(kvp.Key, 0) >= 2:
+            if self._failed_exit_counts.get(kvp.Key, 0) >= 3:
                 continue
             self._check_exit(kvp.Key, self.Securities[kvp.Key].Price, kvp.Value)
 
@@ -878,6 +881,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if len(self.Transactions.GetOpenOrders(symbol)) > 0:
             return
         if symbol in self._cancel_cooldowns and self.Time < self._cancel_cooldowns[symbol]:
+            return
+        # Dust position detection: position too small to sell — clean up and skip
+        min_notional_usd = get_min_notional_usd(self, symbol)
+        if price > 0 and abs(holding.Quantity) * price < min_notional_usd * 0.5:
+            cleanup_position(self, symbol)
+            self._failed_exit_counts.pop(symbol, None)
             return
         if symbol not in self.entry_prices:
             self.entry_prices[symbol] = holding.AveragePrice
@@ -927,7 +936,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 self.rsi_peaked_above_50[symbol] = True
 
         tag = ""
-        min_notional_usd = get_min_notional_usd(self, symbol)
+        # min_notional_usd already computed above for dust check
 
         # --- Priority 1: Tight Stop Loss (always immediate) ---
         if pnl <= -sl:
@@ -1070,6 +1079,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                             self.Debug(f"⚠️ CASH MODE: WR={recent_wr:.0%} over {len(self._recent_trade_outcomes)} trades. Pausing 24h.")
                     cleanup_position(self, symbol)
                     self._failed_exit_attempts.pop(symbol, None)
+                    self._failed_exit_counts.pop(symbol, None)
                 slip_log(self, symbol, event.Direction, event.FillPrice)
             elif event.Status == OrderStatus.Canceled:
                 self._pending_orders.pop(symbol, None)
@@ -1087,21 +1097,30 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 self._submitted_orders.pop(symbol, None)
                 self._order_retries.pop(event.OrderId, None)
                 if event.Direction == OrderDirection.Sell:
-                    # Track consecutive failed exit attempts to break infinite retry loops
-                    fail_count = self._failed_exit_attempts.get(symbol, 0) + 1
-                    self._failed_exit_attempts[symbol] = fail_count
-                    self.Debug(f"Invalid sell #{fail_count}: {symbol.Value}")
-                    if fail_count >= 2:
-                        # Force cleanup after repeated failures (dust position — stop retrying)
-                        self.Debug(f"FORCE CLEANUP: {symbol.Value} after {fail_count} failed exits — releasing tracking")
+                    price = self.Securities[symbol].Price if symbol in self.Securities else 0
+                    min_notional = get_min_notional_usd(self, symbol)
+                    # Check for dust position: too small to sell — clean up instead of retrying
+                    if price > 0 and symbol in self.Portfolio and abs(self.Portfolio[symbol].Quantity) * price < min_notional:
+                        self.Debug(f"DUST CLEANUP on invalid sell: {symbol.Value} — releasing tracking")
                         cleanup_position(self, symbol)
-                    elif symbol not in self.entry_prices:
-                        if is_invested_not_dust(self, symbol):
-                            holding = self.Portfolio[symbol]
-                            self.entry_prices[symbol] = holding.AveragePrice
-                            self.highest_prices[symbol] = holding.AveragePrice
-                            self.entry_times[symbol] = self.Time
-                            self.Debug(f"RE-TRACKED after invalid: {symbol.Value}")
+                        self._failed_exit_counts.pop(symbol, None)
+                    else:
+                        # Track consecutive failed exit attempts to break infinite retry loops
+                        fail_count = self._failed_exit_counts.get(symbol, 0) + 1
+                        self._failed_exit_counts[symbol] = fail_count
+                        self.Debug(f"Invalid sell #{fail_count}: {symbol.Value}")
+                        if fail_count >= 3:
+                            # Force cleanup after repeated failures (dust position — stop retrying)
+                            self.Debug(f"FORCE CLEANUP: {symbol.Value} after {fail_count} failed exits — releasing tracking")
+                            cleanup_position(self, symbol)
+                            self._failed_exit_counts.pop(symbol, None)
+                        elif symbol not in self.entry_prices:
+                            if is_invested_not_dust(self, symbol):
+                                holding = self.Portfolio[symbol]
+                                self.entry_prices[symbol] = holding.AveragePrice
+                                self.highest_prices[symbol] = holding.AveragePrice
+                                self.entry_times[symbol] = self.Time
+                                self.Debug(f"RE-TRACKED after invalid: {symbol.Value}")
                 self._session_blacklist.add(symbol.Value)
         except Exception as e:
             self.Debug(f"OnOrderEvent error: {e}")
