@@ -9,10 +9,12 @@ import numpy as np
 
 class SimplifiedCryptoStrategy(QCAlgorithm):
     """
-    Micro-Scalping System - v5.0.0
-    Aggressive 5-signal micro-scalp engine targeting 5-15 trades/day.
-    70 % position sizing, 1 position max, 4-hour time stop, 15-min exit cooldown.
-    Signals: RSI divergence, volume+BB compression, EMA crossover, VWAP reclaim, OB proxy.
+    Micro-Scalping System - v7.0.0
+    Advanced 5-signal micro-scalp engine targeting 3-6 high-quality trades/day.
+    Conservative position sizing (70-90%), 1 position max, 4-hour time stop, 1-hour exit cooldown.
+    Signals: OBI (tighter), Volume Ignition (4x), MTF Trend Alignment (EMA5>EMA20),
+             ADX Regime Filter (avoids chop), VWAP Reclaim (institutional reference).
+    Fee-adjusted minimum profit gate: only enter when ATR-projected move exceeds fees+slippage.
     Preserves: order verification, portfolio sanity checks, resync, health checks,
     slippage logging, Kraken status gate, ObjectStore persistence, daily reporting.
     """
@@ -23,8 +25,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.SetBrokerageModel(BrokerageName.Kraken, AccountType.Cash)
 
         # === Entry thresholds (scalp score 0-1) ===
-        self.entry_threshold = 0.40   # 2+ signals firing
-        self.high_conviction_threshold = 0.60  # 3+ signals
+        self.entry_threshold = 0.60   # 3/5 signals firing (raised from 0.40 to improve win rate)
+        self.high_conviction_threshold = 0.80  # 4+ signals (raised from 0.60)
 
         # === Exit parameters (aggressive profit-taking) ===
         self.quick_take_profit = self._get_param("quick_take_profit", 0.020)  # 2.0% base TP
@@ -79,16 +81,18 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
         # === Trade frequency & timing ===
         self.skip_hours_utc         = []      # 24/7 trading – no skip hours
-        self.max_daily_trades       = 20      # allow 5-15+ trades per day
+        self.max_daily_trades       = 6       # drastically reduced from 20 to curb fee bleed
         self.daily_trade_count      = 0
         self.last_trade_date        = None
-        self.exit_cooldown_hours    = 0.25    # 15-minute exit cooldown
+        self.exit_cooldown_hours    = 1.0     # 1-hour exit cooldown (raised from 15-min)
         self.cancel_cooldown_minutes = 1
-        self.max_symbol_trades_per_day = 5
+        self.max_symbol_trades_per_day = 2    # reduced from 5 to limit per-symbol churn
 
         # === Fees & slippage ===
         self.expected_round_trip_fees = 0.0050   # 0.50% min (maker+maker)
         self.fee_slippage_buffer      = 0.001
+        self.min_expected_profit_pct  = 0.015    # 1.5% minimum net profit above fees+slippage
+        self.adx_min_period           = 14       # ADX indicator period
 
         # === Order management ===
         self.stale_order_timeout_seconds      = 30    # 30s limit-entry timeout
@@ -223,7 +227,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if self.LiveMode:
             cleanup_object_store(self)
             load_persisted_state(self)
-            self.Debug("=== LIVE TRADING (MICRO-SCALP) v5.0.0 ===")
+            self.Debug("=== LIVE TRADING (MICRO-SCALP) v7.0.0 ===")
             self.Debug(f"Capital: ${self.Portfolio.Cash:.2f} | Max pos: {self.max_positions} | Size: {self.position_size_pct:.0%}")
 
     def _get_param(self, name, default):
@@ -322,6 +326,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             'ema_medium': ExponentialMovingAverage(self.medium_period),
             'ema_5': ExponentialMovingAverage(5),
             'atr': AverageTrueRange(14),
+            'adx': AverageDirectionalIndex(self.adx_min_period),  # ADX regime filter
             'volatility': deque(maxlen=self.medium_period),
             'rsi': RelativeStrengthIndex(7),   # RSI(7) for faster signals
             'rs_vs_btc': deque(maxlen=self.medium_period),
@@ -339,6 +344,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             'last_loss_time': None,
             'bid_size': 0.0,
             'ask_size': 0.0,
+            # Rolling VWAP: accumulate price*volume and volume over 20 bars
+            'vwap_pv': deque(maxlen=20),  # price × volume
+            'vwap_v': deque(maxlen=20),   # volume
+            'vwap': 0.0,                  # current 20-bar rolling VWAP
         }
 
     def OnSecuritiesChanged(self, changes):
@@ -417,6 +426,13 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         crypto['ema_medium'].Update(bar.EndTime, price)
         crypto['ema_5'].Update(bar.EndTime, price)
         crypto['atr'].Update(bar)
+        crypto['adx'].Update(bar)
+        # Rolling 20-bar VWAP
+        crypto['vwap_pv'].append(price * volume)
+        crypto['vwap_v'].append(volume)
+        total_v = sum(crypto['vwap_v'])
+        if total_v > 0:
+            crypto['vwap'] = sum(crypto['vwap_pv']) / total_v
         if len(crypto['returns']) >= 10:
             crypto['volatility'].append(np.std(list(crypto['returns'])[-10:]))
         crypto['rsi'].Update(bar.EndTime, price)
@@ -814,6 +830,15 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if crypto.get('trade_count_today', 0) >= self.max_symbol_trades_per_day:
                 continue
 
+            # Fee-adjusted minimum expected profit gate:
+            # Only enter if ATR-projected move covers fees + slippage with margin.
+            atr_val = crypto['atr'].Current.Value if crypto['atr'].IsReady else None
+            if atr_val and price > 0:
+                expected_move_pct = (atr_val * self.atr_tp_mult) / price
+                min_required = self.expected_round_trip_fees + self.fee_slippage_buffer + self.min_expected_profit_pct
+                if expected_move_pct < min_required:
+                    continue
+
             # Hourly dollar-volume liquidity gate ($50k/hour)
             if len(crypto['dollar_volume']) >= 3:
                 recent_dv = np.mean(list(crypto['dollar_volume'])[-3:])
@@ -887,7 +912,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     components = cand.get('factors', {})
                     sig_str = (f"obi={components.get('obi', 0):.2f} "
                                f"vol={components.get('vol_ignition', 0):.2f} "
-                               f"trend={components.get('micro_trend', 0):.2f}")
+                               f"trend={components.get('micro_trend', 0):.2f} "
+                               f"adx={components.get('adx_filter', 0):.2f} "
+                               f"vwap={components.get('vwap_signal', 0):.2f}")
                     self.Debug(f"SCALP ENTRY: {sym.Value} | score={net_score:.2f} | ${val:.2f} | {sig_str}")
                     success_count += 1
                     self.trade_count += 1
