@@ -6,13 +6,14 @@ import numpy as np
 
 class MicroScalpEngine:
     """
-    Micro-Scalping Signal Engine - v7.0.0
+    Micro-Scalping Signal Engine - v7.1.0
 
     High-frequency market microstructure scalping system.
     Uses cutting-edge microstructure signals tuned for 1-minute bars on Kraken.
+    Adapts to both trending (Jan–Mar) and ranging/sideways (Apr–Oct) regimes.
 
     Score: 0.0 – 1.0 across five equal signals (0.20 each).
-      >= 0.60 → entry (3/5 signals firing)
+      >= 0.60 → entry (3/5 signals firing; 0.50 in sideways regime)
       >= 0.80 → high-conviction entry (4+ signals) → maximum position size
 
     Signals
@@ -20,7 +21,8 @@ class MicroScalpEngine:
     1. Order Book Imbalance (OBI): bid/ask pressure (tightened threshold)
     2. Volume Ignition: 4× volume surge (tightened from 3×)
     3. MTF Trend Alignment: EMA5 > EMA20 (short-term trend aligned with medium)
-    4. ADX Regime Filter: ADX > 20 (trending market, avoids choppy environments)
+    4. ADX / Mean Reversion: ADX > 20 in trending markets (avoids chop);
+       RSI oversold + price near lower Bollinger Band in ranging markets (Apr–Oct)
     5. VWAP Reclaim: price above rolling 20-bar VWAP (institutional reference level)
     """
 
@@ -32,6 +34,10 @@ class MicroScalpEngine:
     ADX_STRONG_THRESHOLD    = 25     # strong directional trend
     ADX_MODERATE_THRESHOLD  = 20     # moderate directional trend
     VWAP_BUFFER             = 1.001  # 0.1% above VWAP for confirmed reclaim
+    # Ranging-market mean reversion thresholds (used when ADX < ADX_MODERATE_THRESHOLD)
+    RSI_OVERSOLD_THRESHOLD        = 40   # RSI < 40 → oversold, mean reversion buy signal
+    RSI_MILDLY_OVERSOLD_THRESHOLD = 45   # RSI < 45 → mildly oversold, partial credit
+    BB_NEAR_LOWER_PCT             = 0.02  # within 2% of lower Bollinger Band = near support
 
     def __init__(self, algorithm):
         self.algo = algorithm
@@ -115,10 +121,12 @@ class MicroScalpEngine:
                     components['micro_trend'] = 0.10
 
             # ----------------------------------------------------------
-            # Signal 4: ADX Regime Filter
-            # ADX > 20 → market is trending (not choppy/ranging).
-            # DI+ > DI- → bullish directional bias.
-            # Prevents entries in low-probability sideways conditions.
+            # Signal 4: ADX Regime Filter OR Mean Reversion
+            # Trending market (ADX > 20): ADX directional bias confirms trend.
+            # Ranging market (ADX ≤ 20): Mean reversion setup (RSI oversold +
+            # price near lower Bollinger Band) serves as the entry signal.
+            # This adaptation allows the engine to trade profitably in both
+            # trending (Jan–Mar) and sideways/consolidating (Apr–Oct) regimes.
             # ----------------------------------------------------------
             adx_indicator = crypto.get('adx')
             if adx_indicator is not None and adx_indicator.IsReady:
@@ -131,6 +139,24 @@ class MicroScalpEngine:
                 elif adx_val > self.ADX_MODERATE_THRESHOLD and di_plus > di_minus:
                     # Moderate trend with bullish bias
                     components['adx_filter'] = 0.10
+                elif adx_val <= self.ADX_MODERATE_THRESHOLD:
+                    # Ranging market: use mean reversion signal instead of ADX
+                    if (crypto['rsi'].IsReady and len(crypto['bb_lower']) >= 1
+                            and len(crypto['prices']) >= 1):
+                        rsi_val = crypto['rsi'].Current.Value
+                        price = crypto['prices'][-1]
+                        bb_lower = crypto['bb_lower'][-1]
+                        if (rsi_val < self.RSI_OVERSOLD_THRESHOLD and bb_lower > 0
+                                and price <= bb_lower * (1 + self.BB_NEAR_LOWER_PCT)):
+                            # Oversold near lower band → strong mean reversion signal
+                            components['adx_filter'] = 0.20
+                            if not self.algo.IsWarmingUp:
+                                self.algo.Debug(
+                                    f"Mean Reversion Signal: rsi={rsi_val:.1f} "
+                                    f"price={price:.4f} bb_lower={bb_lower:.4f}")
+                        elif rsi_val < self.RSI_MILDLY_OVERSOLD_THRESHOLD:
+                            # Mildly oversold in ranging market → partial credit
+                            components['adx_filter'] = 0.10
 
             # ----------------------------------------------------------
             # Signal 5: VWAP Reclaim
