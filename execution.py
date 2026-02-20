@@ -38,6 +38,11 @@ KNOWN_FIAT_CURRENCIES = frozenset({
 # values below the lot_size boundary while keeping the sell amount virtually identical.
 QUANTITY_HAIRCUT_FACTOR = 0.9999
 
+# Tolerance multiplier used when comparing a rounded quantity to the actual holding.
+# A tiny IEEE 754 overshoot (e.g. 0.09440399000000001 vs 0.09440399) is far smaller
+# than 0.01%, so this threshold distinguishes real overshoots from floating-point noise.
+QUANTITY_OVERSHOOT_TOLERANCE = 1.0001
+
 KRAKEN_MIN_QTY_FALLBACK = {
     'AXSUSD': 5.0, 'SANDUSD': 10.0, 'MANAUSD': 10.0, 'ADAUSD': 10.0,
     'MATICUSD': 10.0, 'DOTUSD': 1.0, 'LINKUSD': 0.5, 'AVAXUSD': 0.2,
@@ -151,7 +156,13 @@ def round_quantity(algo, symbol, quantity):
     try:
         lot_size = algo.Securities[symbol].SymbolProperties.LotSize
         if lot_size is not None and lot_size > 0:
-            return float(math.floor(quantity / lot_size)) * lot_size
+            rounded = float(math.floor(quantity / lot_size)) * lot_size
+            # Clamp: never return more than the input (IEEE 754 safety)
+            if rounded > quantity:
+                rounded = rounded - lot_size
+                if rounded < 0:
+                    rounded = 0.0
+            return rounded
         return quantity
     except Exception as e:
         algo.Debug(f"Error rounding quantity for {symbol.Value}: {e}")
@@ -223,8 +234,8 @@ def smart_liquidate(algo, symbol, tag="Liquidate"):
     # the ordered quantity).  Apply a haircut before re-rounding to guarantee floor division
     # stays at or below actual_qty.
     actual_qty = abs(algo.Portfolio[symbol].Quantity)
-    if safe_qty > actual_qty:
-        safe_qty = round_quantity(algo, symbol, actual_qty * QUANTITY_HAIRCUT_FACTOR)
+    if safe_qty > actual_qty * QUANTITY_OVERSHOOT_TOLERANCE:  # tolerance for floating-point
+        safe_qty = round_quantity(algo, symbol, actual_qty)
     # Final hard cap — never exceed actual holding regardless of floating-point rounding
     safe_qty = min(safe_qty, actual_qty)
     if safe_qty < exit_min_qty:
