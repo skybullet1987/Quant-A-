@@ -47,7 +47,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.atr_trail_mult      = 2.0
 
         # === Position sizing (aggressive compounding) ===
-        self.position_size_pct  = 0.70   # 70% base size
+        self.position_size_pct  = 0.90   # minimum base size; scoring engine scales to 99% at full conviction
         self.base_max_positions = 1
         self.max_positions      = 1
         self.min_notional       = 5.0
@@ -63,12 +63,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.portfolio_vol_cap       = self._get_param("portfolio_vol_cap", 0.80)
         self.min_asset_vol_floor     = 0.05
 
-        # === Indicator periods (optimised for hourly scalping) ===
+        # === Indicator periods (optimised for 1-minute scalping) ===
         self.ultra_short_period = 3
         self.short_period       = 6
         self.medium_period      = 12   # was 24
         self.lookback           = 48
-        self.sqrt_annualization = np.sqrt(24 * 365)
+        self.sqrt_annualization = np.sqrt(60 * 24 * 365)  # minute-resolution annualisation
 
         # === Liquidity filters ===
         self.max_spread_pct         = 0.005   # 0.5% – tight spread required
@@ -196,17 +196,15 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             'risk_adjusted_momentum': 0.15,
         }
 
-        self.UniverseSettings.Resolution = Resolution.Hour
+        self.UniverseSettings.Resolution = Resolution.Minute
         self.AddUniverse(CryptoUniverse.Kraken(self.UniverseFilter))
 
         try:
-            btc = self.AddCrypto("BTCUSD", Resolution.Hour, Market.Kraken)
+            btc = self.AddCrypto("BTCUSD", Resolution.Minute, Market.Kraken)
             self.btc_symbol = btc.Symbol
         except Exception as e:
             self.Debug(f"Warning: Could not add BTC - {e}")
 
-        self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(hours=1)), self.Rebalance)
-        self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(hours=1)), self.CheckExits)
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.At(0, 1), self.DailyReport)
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.At(0, 0), self.ResetDailyCounters)
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.Every(timedelta(hours=6)), self.ReviewPerformance)
@@ -322,6 +320,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             'ema_ultra_short': ExponentialMovingAverage(self.ultra_short_period),
             'ema_short': ExponentialMovingAverage(self.short_period),
             'ema_medium': ExponentialMovingAverage(self.medium_period),
+            'ema_5': ExponentialMovingAverage(5),
             'atr': AverageTrueRange(14),
             'volatility': deque(maxlen=self.medium_period),
             'rsi': RelativeStrengthIndex(7),   # RSI(7) for faster signals
@@ -338,6 +337,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             'bb_width': deque(maxlen=self.medium_period),
             'trade_count_today': 0,
             'last_loss_time': None,
+            'bid_size': 0.0,
+            'ask_size': 0.0,
         }
 
     def OnSecuritiesChanged(self, changes):
@@ -371,7 +372,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if not data.Bars.ContainsKey(symbol):
                 continue
             try:
-                self._update_symbol_data(symbol, data.Bars[symbol])
+                quote_bar = data.QuoteBars[symbol] if data.QuoteBars.ContainsKey(symbol) else None
+                self._update_symbol_data(symbol, data.Bars[symbol], quote_bar)
             except Exception as e:
                 self.Debug(f"Error updating symbol data for {symbol.Value}: {e}")
                 pass
@@ -390,8 +392,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             ready_count = sum(1 for c in self.crypto_data.values() if self._is_ready(c))
             self.Debug(f"Post-warmup: {ready_count} symbols ready")
         self._update_market_context()
+        self.Rebalance()
+        self.CheckExits()
 
-    def _update_symbol_data(self, symbol, bar):
+    def _update_symbol_data(self, symbol, bar, quote_bar=None):
         crypto = self.crypto_data[symbol]
         price = float(bar.Close)
         high = float(bar.High)
@@ -411,6 +415,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         crypto['ema_ultra_short'].Update(bar.EndTime, price)
         crypto['ema_short'].Update(bar.EndTime, price)
         crypto['ema_medium'].Update(bar.EndTime, price)
+        crypto['ema_5'].Update(bar.EndTime, price)
         crypto['atr'].Update(bar)
         if len(crypto['returns']) >= 10:
             crypto['volatility'].append(np.std(list(crypto['returns'])[-10:]))
@@ -431,6 +436,16 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         sp = get_spread_pct(self, symbol)
         if sp is not None:
             crypto['spreads'].append(sp)
+        # Update bid/ask sizes from QuoteBar for Order Book Imbalance calculation
+        if quote_bar is not None:
+            try:
+                bid_sz = float(quote_bar.LastBidSize) if quote_bar.LastBidSize else 0.0
+                ask_sz = float(quote_bar.LastAskSize) if quote_bar.LastAskSize else 0.0
+                if bid_sz > 0 or ask_sz > 0:
+                    crypto['bid_size'] = bid_sz
+                    crypto['ask_size'] = ask_sz
+            except Exception:
+                pass
 
     def _update_market_context(self):
         if len(self.btc_prices) >= 48:
@@ -870,11 +885,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 if ticket is not None:
                     self._recent_tickets.append(ticket)
                     components = cand.get('factors', {})
-                    sig_str = (f"rsi={components.get('rsi_divergence', 0):.1f} "
-                               f"vbb={components.get('volume_bb_compression', 0):.1f} "
-                               f"ema={components.get('ema_crossover', 0):.1f} "
-                               f"vwap={components.get('vwap_reclaim', 0):.1f} "
-                               f"ob={components.get('orderbook_proxy', 0):.1f}")
+                    sig_str = (f"obi={components.get('obi', 0):.2f} "
+                               f"vol={components.get('vol_ignition', 0):.2f} "
+                               f"trend={components.get('micro_trend', 0):.2f}")
                     self.Debug(f"SCALP ENTRY: {sym.Value} | score={net_score:.2f} | ${val:.2f} | {sig_str}")
                     success_count += 1
                     self.trade_count += 1
@@ -1012,14 +1025,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             elif pnl > trailing_activation and dd >= trailing_stop_pct:
                 tag = "Trailing Stop"
 
-            # ATR trailing stop
+            # ATR trailing stop: trail at highest_since_entry - 2x ATR (highest-anchored)
             elif atr and entry > 0 and holding.Quantity != 0:
                 trail_offset = atr * self.atr_trail_mult
-                trail_level  = price - trail_offset
-                current_trail = crypto.get('trail_stop') if crypto else None
-                if current_trail is None or trail_level > current_trail:
-                    if crypto:
-                        crypto['trail_stop'] = trail_level
+                trail_level = highest - trail_offset  # anchor to highest price since entry
+                if crypto:
+                    crypto['trail_stop'] = trail_level
                 if crypto and crypto['trail_stop'] is not None:
                     if holding.Quantity > 0 and price <= crypto['trail_stop']:
                         tag = "ATR Trail"
