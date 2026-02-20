@@ -142,6 +142,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.highest_prices   = {}
         self.entry_times      = {}
         self.entry_volumes    = {}   # for volume dry-up exit
+        self._partial_tp_taken      = {}       # True after 50% sold at +2.5%
+        self._breakeven_stops       = {}       # per-symbol breakeven SL price after partial TP
+        self._partial_sell_symbols  = set()    # symbols with in-flight partial TP sell orders
+        self.partial_tp_threshold   = 0.025    # +2.5% triggers partial scale-out
+        self.stagnation_minutes     = 15       # stagnation exit: trade must be > 15 min old
+        self.stagnation_pnl_threshold = 0.005  # stagnation exit: pnl must be >= 0.5%
         self.rsi_peaked_above_50 = {}  # for RSI momentum exit
         self.trade_count      = 0
         self._pending_orders  = {}
@@ -350,6 +356,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             'vwap_pv': deque(maxlen=20),  # price × volume
             'vwap_v': deque(maxlen=20),   # volume
             'vwap': 0.0,                  # current 20-bar rolling VWAP
+            'volume_long': deque(maxlen=1440),  # ~24h volume for adaptive thresholds
+            'vwap_sd': 0.0,                     # VWAP rolling standard deviation
+            'vwap_sd2_lower': 0.0,              # VWAP - 2*SD lower band
+            'vwap_sd3_lower': 0.0,              # VWAP - 3*SD lower band
         }
 
     def OnSecuritiesChanged(self, changes):
@@ -435,6 +445,19 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         total_v = sum(crypto['vwap_v'])
         if total_v > 0:
             crypto['vwap'] = sum(crypto['vwap_pv']) / total_v
+        # Long-term volume baseline for adaptive scoring thresholds (~24h window)
+        crypto['volume_long'].append(volume)
+        # VWAP SD bands: compute std of bar prices within the rolling VWAP window
+        if len(crypto['vwap_v']) >= 5 and crypto['vwap'] > 0:
+            vwap_val = crypto['vwap']
+            pv_list = list(crypto['vwap_pv'])
+            v_list = list(crypto['vwap_v'])
+            bar_prices = [pv / v for pv, v in zip(pv_list, v_list) if v > 0]
+            if len(bar_prices) >= 5:
+                sd = float(np.std(bar_prices))
+                crypto['vwap_sd'] = sd
+                crypto['vwap_sd2_lower'] = vwap_val - 2.0 * sd
+                crypto['vwap_sd3_lower'] = vwap_val - 3.0 * sd
         if len(crypto['returns']) >= 10:
             crypto['volatility'].append(np.std(list(crypto['returns'])[-10:]))
         crypto['rsi'].Update(bar.EndTime, price)
@@ -857,6 +880,13 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     reject_dollar_volume += 1
                     continue
 
+            # Relative strength vs BTC: altcoin must outperform BTC on recent momentum
+            # to avoid fake-out entries during BTC-driven liquidity sweeps
+            if self.btc_symbol is not None and len(crypto.get('rs_vs_btc', [])) >= 1:
+                rs_latest = crypto['rs_vs_btc'][-1]
+                if rs_latest < 0:
+                    continue
+
             # Position sizing: 70% base, Kelly-adjusted
             vol = self._annualized_vol(crypto)
             size = self._calculate_position_size(net_score, threshold_now, vol)
@@ -1012,6 +1042,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         crypto = self.crypto_data.get(symbol)
         dd = (highest - price) / highest if highest > 0 else 0
         hours = (self.Time - self.entry_times.get(symbol, self.Time)).total_seconds() / 3600
+        minutes = hours * 60
 
         # ATR-scaled TP and SL (with scalp floors)
         atr = crypto['atr'].Current.Value if crypto and crypto['atr'].IsReady else None
@@ -1050,17 +1081,34 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if rsi_now > 50:
                 self.rsi_peaked_above_50[symbol] = True
 
+        # --- Dynamic Partial Take Profit: sell 50% at +2.5%, move SL to breakeven ---
+        if (not self._partial_tp_taken.get(symbol, False)
+                and pnl >= self.partial_tp_threshold):
+            if partial_smart_sell(self, symbol, 0.50, "Partial TP"):
+                self._partial_tp_taken[symbol] = True
+                self._breakeven_stops[symbol] = entry
+                self.Debug(f"PARTIAL TP: {symbol.Value} | PnL:{pnl:+.2%} | SL→breakeven")
+                return  # Don't trigger full exit this bar
+
         tag = ""
         # min_notional_usd already computed above for dust check
 
-        # --- Priority 1: Tight Stop Loss (always immediate) ---
-        if pnl <= -sl:
+        # --- Priority 1: Stop Loss (or Breakeven Stop after partial TP) ---
+        if self._partial_tp_taken.get(symbol, False):
+            be_price = self._breakeven_stops.get(symbol, entry)
+            if price <= be_price:
+                tag = "Breakeven Stop"
+        elif pnl <= -sl:
             tag = "Stop Loss"
 
+        # --- Stagnation Exit: 15+ minutes with < 0.5% unrealized profit ---
+        if not tag and minutes > self.stagnation_minutes and pnl < self.stagnation_pnl_threshold:
+            tag = "Stagnation Exit"
+
         # --- Priority 2: Non-stop exits (require min hold time) ---
-        elif hours >= self.min_hold_hours:
-            # Quick Take Profit
-            if pnl >= tp:
+        elif not tag and hours >= self.min_hold_hours:
+            # Quick Take Profit (skip if partial TP already taken — let trailing stop handle exit)
+            if not self._partial_tp_taken.get(symbol, False) and pnl >= tp:
                 tag = "Take Profit"
 
             # Trailing Stop: activate at +0.8%, trail 0.5% from high
@@ -1178,37 +1226,41 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                         self.entry_volumes[symbol] = crypto['volume'][-1]
                     self.rsi_peaked_above_50.pop(symbol, None)
                 else:
-                    entry = self.entry_prices.get(symbol, None)
-                    if entry is None:
-                        entry = event.FillPrice
-                        self.Debug(f"⚠️ WARNING: Missing entry price for {symbol.Value} sell, using fill price")
-                    pnl = (event.FillPrice - entry) / entry if entry > 0 else 0
-                    self._rolling_wins.append(1 if pnl > 0 else 0)
-                    self._recent_trade_outcomes.append(1 if pnl > 0 else 0)
-                    if pnl > 0:
-                        self._rolling_win_sizes.append(pnl)
-                        self.winning_trades += 1
-                        self.consecutive_losses = 0
+                    # Partial TP sell: the remaining 50% is still held — skip cleanup and PnL recording
+                    if symbol in self._partial_sell_symbols:
+                        self._partial_sell_symbols.discard(symbol)
                     else:
-                        self._rolling_loss_sizes.append(abs(pnl))
-                        self.losing_trades += 1
-                        self.consecutive_losses += 1
-                    self.total_pnl += pnl
-                    self.trade_log.append({
-                        'time': self.Time,
-                        'symbol': symbol.Value,
-                        'pnl_pct': pnl,
-                        'exit_reason': 'filled_sell',
-                    })
-                    # Activate cash mode if recent win rate is very low
-                    if len(self._recent_trade_outcomes) >= 8:
-                        recent_wr = sum(self._recent_trade_outcomes) / len(self._recent_trade_outcomes)
-                        if recent_wr < 0.25:
-                            self._cash_mode_until = self.Time + timedelta(hours=24)
-                            self.Debug(f"⚠️ CASH MODE: WR={recent_wr:.0%} over {len(self._recent_trade_outcomes)} trades. Pausing 24h.")
-                    cleanup_position(self, symbol)
-                    self._failed_exit_attempts.pop(symbol, None)
-                    self._failed_exit_counts.pop(symbol, None)
+                        entry = self.entry_prices.get(symbol, None)
+                        if entry is None:
+                            entry = event.FillPrice
+                            self.Debug(f"⚠️ WARNING: Missing entry price for {symbol.Value} sell, using fill price")
+                        pnl = (event.FillPrice - entry) / entry if entry > 0 else 0
+                        self._rolling_wins.append(1 if pnl > 0 else 0)
+                        self._recent_trade_outcomes.append(1 if pnl > 0 else 0)
+                        if pnl > 0:
+                            self._rolling_win_sizes.append(pnl)
+                            self.winning_trades += 1
+                            self.consecutive_losses = 0
+                        else:
+                            self._rolling_loss_sizes.append(abs(pnl))
+                            self.losing_trades += 1
+                            self.consecutive_losses += 1
+                        self.total_pnl += pnl
+                        self.trade_log.append({
+                            'time': self.Time,
+                            'symbol': symbol.Value,
+                            'pnl_pct': pnl,
+                            'exit_reason': 'filled_sell',
+                        })
+                        # Activate cash mode if recent win rate is very low
+                        if len(self._recent_trade_outcomes) >= 8:
+                            recent_wr = sum(self._recent_trade_outcomes) / len(self._recent_trade_outcomes)
+                            if recent_wr < 0.25:
+                                self._cash_mode_until = self.Time + timedelta(hours=24)
+                                self.Debug(f"⚠️ CASH MODE: WR={recent_wr:.0%} over {len(self._recent_trade_outcomes)} trades. Pausing 24h.")
+                        cleanup_position(self, symbol)
+                        self._failed_exit_attempts.pop(symbol, None)
+                        self._failed_exit_counts.pop(symbol, None)
                 slip_log(self, symbol, event.Direction, event.FillPrice)
             elif event.Status == OrderStatus.Canceled:
                 self._pending_orders.pop(symbol, None)
