@@ -85,20 +85,27 @@ class MicroScalpEngine:
 
             # ----------------------------------------------------------
             # Signal 2: Volume Ignition
-            # Current 1-minute volume > 4× the 20-bar moving-average volume.
-            # Tightened from 3× → 4× to target only strong conviction bars.
+            # Current volume surge vs adaptive rolling baseline (Apr-Oct fix).
+            # Uses 24h long-term average when available instead of a fixed
+            # 20-bar (20-minute) window, so thresholds stay relevant during
+            # low-volatility summer periods.
             # ----------------------------------------------------------
             if len(crypto['volume']) >= 20:
                 volumes = list(crypto['volume'])
-                vol_ma_20 = np.mean(volumes[-20:])
                 current_vol = volumes[-1]
-                if vol_ma_20 > 0:
-                    ratio = current_vol / vol_ma_20
+                # Adaptive baseline: prefer long-term rolling average (up to 24h)
+                vol_long = list(crypto.get('volume_long', []))
+                if len(vol_long) >= 60:
+                    vol_baseline = float(np.mean(vol_long))
+                else:
+                    vol_baseline = float(np.mean(volumes[-20:]))
+                if vol_baseline > 0:
+                    ratio = current_vol / vol_baseline
                     if ratio >= self.VOL_SURGE_STRONG:
                         components['vol_ignition'] = 0.20
                         if not self.algo.IsWarmingUp:
                             self.algo.Debug(
-                                f"Volume Ignition: vol={current_vol:.2f} ma20={vol_ma_20:.2f} ratio={ratio:.1f}x")
+                                f"Volume Ignition: vol={current_vol:.2f} baseline={vol_baseline:.2f} ratio={ratio:.1f}x")
                     elif ratio >= self.VOL_SURGE_PARTIAL:
                         # Partial credit for a meaningful volume spike
                         components['vol_ignition'] = 0.10
@@ -159,11 +166,16 @@ class MicroScalpEngine:
                             components['adx_filter'] = 0.10
 
             # ----------------------------------------------------------
-            # Signal 5: VWAP Reclaim
-            # Price > rolling 20-bar VWAP → price is above the volume-
-            # weighted average, indicating institutional buying support.
+            # Signal 5: VWAP Reclaim / SD Band Bounce
+            # Price > rolling 20-bar VWAP → institutional buying support.
+            # Price bouncing aggressively off -2 or -3 SD lower band →
+            # extreme mean-reversion entry signal (higher score than bare
+            # VWAP reclaim in some cases).
             # ----------------------------------------------------------
             vwap = crypto.get('vwap', 0.0)
+            vwap_sd = crypto.get('vwap_sd', 0.0)
+            vwap_sd2_lower = crypto.get('vwap_sd2_lower', 0.0)
+            vwap_sd3_lower = crypto.get('vwap_sd3_lower', 0.0)
             if vwap > 0 and len(crypto['prices']) >= 1:
                 price = crypto['prices'][-1]
                 if price > vwap * self.VWAP_BUFFER:
@@ -172,6 +184,21 @@ class MicroScalpEngine:
                 elif price > vwap:
                     # Price marginally above VWAP
                     components['vwap_signal'] = 0.10
+                elif (vwap_sd > 0 and vwap_sd3_lower > 0
+                      and price >= vwap_sd3_lower * 1.005
+                      and price < vwap_sd2_lower):
+                    # Aggressive bounce off -3 SD lower band (extreme support)
+                    components['vwap_signal'] = 0.20
+                    if not self.algo.IsWarmingUp:
+                        self.algo.Debug(
+                            f"VWAP -3SD Bounce: price={price:.4f} sd3_lower={vwap_sd3_lower:.4f}")
+                elif (vwap_sd > 0 and vwap_sd2_lower > 0
+                      and price >= vwap_sd2_lower * 1.003):
+                    # Bounce off -2 SD lower band (strong support)
+                    components['vwap_signal'] = 0.15
+                    if not self.algo.IsWarmingUp:
+                        self.algo.Debug(
+                            f"VWAP -2SD Bounce: price={price:.4f} sd2_lower={vwap_sd2_lower:.4f}")
 
         except Exception as e:
             self.algo.Debug(f"MicroScalpEngine.calculate_scalp_score error: {e}")
