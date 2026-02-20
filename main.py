@@ -9,10 +9,11 @@ import numpy as np
 
 class SimplifiedCryptoStrategy(QCAlgorithm):
     """
-    Micro-Scalping System - v5.0.0
-    Aggressive 5-signal micro-scalp engine targeting 5-15 trades/day.
-    70 % position sizing, 1 position max, 4-hour time stop, 15-min exit cooldown.
-    Signals: RSI divergence, volume+BB compression, EMA crossover, VWAP reclaim, OB proxy.
+    Micro-Scalping System - v6.0.0
+    Five-signal micro-scalp engine with regime filters and fixed-fractional sizing.
+    Targets 5-8 high-quality trades/day using VWAP, EMA cross, OBI, volume ignition,
+    and micro-trend confluence. Max 50% position size, 0.8% stop-loss, 1h exit cooldown.
+    Signals: OBI, Volume Ignition, EMA-5 cross, VWAP filter, EMA trend structure.
     Preserves: order verification, portfolio sanity checks, resync, health checks,
     slippage logging, Kraken status gate, ObjectStore persistence, daily reporting.
     """
@@ -23,20 +24,20 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.SetBrokerageModel(BrokerageName.Kraken, AccountType.Cash)
 
         # === Entry thresholds (scalp score 0-1) ===
-        self.entry_threshold = 0.40   # 2+ signals firing
-        self.high_conviction_threshold = 0.60  # 3+ signals
+        self.entry_threshold = 0.55   # 3+ of 5 signals firing
+        self.high_conviction_threshold = 0.80  # 4+ of 5 signals
 
         # === Exit parameters (aggressive profit-taking) ===
-        self.quick_take_profit = self._get_param("quick_take_profit", 0.020)  # 2.0% base TP
-        self.tight_stop_loss   = self._get_param("tight_stop_loss",   0.012)  # 1.2% base SL
-        self.atr_tp_mult  = self._get_param("atr_tp_mult",  2.5)   # ATR × 2.5 for TP
-        self.atr_sl_mult  = self._get_param("atr_sl_mult",  1.5)   # ATR × 1.5 for SL
-        self.trail_activation  = self._get_param("trail_activation",  0.005)  # activate at +0.5%
-        self.trail_stop_pct    = self._get_param("trail_stop_pct",    0.005)  # trail 0.5% from high
-        self.time_stop_hours   = self._get_param("time_stop_hours",   4.0)    # exit after 4h if PnL < +0.3%
-        self.time_stop_pnl_min = self._get_param("time_stop_pnl_min", 0.003)  # +0.3% floor
-        self.extended_time_stop_hours   = self._get_param("extended_time_stop_hours",   6.0)   # exit after 6h if not clearly winning
-        self.extended_time_stop_pnl_max = self._get_param("extended_time_stop_pnl_max", 0.015) # +1.5% ceiling
+        self.quick_take_profit = self._get_param("quick_take_profit", 0.015)  # 1.5% base TP
+        self.tight_stop_loss   = self._get_param("tight_stop_loss",   0.008)  # 0.8% base SL
+        self.atr_tp_mult  = self._get_param("atr_tp_mult",  2.0)   # ATR × 2.0 for TP
+        self.atr_sl_mult  = self._get_param("atr_sl_mult",  1.0)   # ATR × 1.0 for SL
+        self.trail_activation  = self._get_param("trail_activation",  0.003)  # activate at +0.3%
+        self.trail_stop_pct    = self._get_param("trail_stop_pct",    0.003)  # trail 0.3% from high
+        self.time_stop_hours   = self._get_param("time_stop_hours",   2.0)    # exit after 2h when PnL < time_stop_pnl_min
+        self.time_stop_pnl_min = self._get_param("time_stop_pnl_min", 0.008)  # must show +0.8% gain to stay after 2h
+        self.extended_time_stop_hours   = self._get_param("extended_time_stop_hours",   3.0)   # exit after 3h if not clearly winning
+        self.extended_time_stop_pnl_max = self._get_param("extended_time_stop_pnl_max", 0.012) # +1.2% ceiling
         self.stale_position_hours       = self._get_param("stale_position_hours",       8.0)   # unconditional exit after 8h
 
         # Keep legacy names used elsewhere
@@ -44,10 +45,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.trailing_stop_pct   = self.trail_stop_pct
         self.base_stop_loss      = self.tight_stop_loss
         self.base_take_profit    = self.quick_take_profit
-        self.atr_trail_mult      = 2.0
+        self.atr_trail_mult      = 1.2
 
-        # === Position sizing (aggressive compounding) ===
-        self.position_size_pct  = 0.90   # minimum base size; scoring engine scales to 99% at full conviction
+        # === Position sizing (conservative fixed-fractional compounding) ===
+        self.position_size_pct  = 0.50   # base size; scoring engine scales to 70% at full conviction
         self.base_max_positions = 1
         self.max_positions      = 1
         self.min_notional       = 5.0
@@ -79,12 +80,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
         # === Trade frequency & timing ===
         self.skip_hours_utc         = []      # 24/7 trading – no skip hours
-        self.max_daily_trades       = 20      # allow 5-15+ trades per day
+        self.max_daily_trades       = 8       # max 8 high-conviction trades per day
         self.daily_trade_count      = 0
         self.last_trade_date        = None
-        self.exit_cooldown_hours    = 0.25    # 15-minute exit cooldown
+        self.exit_cooldown_hours    = 1.0     # 1-hour exit cooldown between trades per symbol
         self.cancel_cooldown_minutes = 1
-        self.max_symbol_trades_per_day = 5
+        self.max_symbol_trades_per_day = 2
 
         # === Fees & slippage ===
         self.expected_round_trip_fees = 0.0050   # 0.50% min (maker+maker)
@@ -105,7 +106,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.rate_limit_cooldown_minutes        = 10
 
         # === Risk management ===
-        self.max_drawdown_limit    = 0.25   # 25% – pause 6h
+        self.max_drawdown_limit    = 0.15   # 15% – pause 6h
         self.cooldown_hours        = 6
         self.consecutive_losses    = 0
         self.max_consecutive_losses = 5    # pause + halve size for next 5 trades after 5 losses
@@ -152,7 +153,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.slip_alert_duration_hours = 2
         self._bad_symbol_counts = {}
         self._recent_tickets  = deque(maxlen=25)
-        self.min_hold_hours   = 0.5   # 30-minute minimum hold
+        self.min_hold_hours   = 0.25   # 15-minute minimum hold (allow faster cuts)
 
         # Rolling performance tracking (for Kelly)
         self._rolling_wins      = deque(maxlen=50)
@@ -223,8 +224,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if self.LiveMode:
             cleanup_object_store(self)
             load_persisted_state(self)
-            self.Debug("=== LIVE TRADING (MICRO-SCALP) v5.0.0 ===")
-            self.Debug(f"Capital: ${self.Portfolio.Cash:.2f} | Max pos: {self.max_positions} | Size: {self.position_size_pct:.0%}")
+            self.Debug("=== LIVE TRADING (MICRO-SCALP) v6.0.0 ===")            self.Debug(f"Capital: ${self.Portfolio.Cash:.2f} | Max pos: {self.max_positions} | Size: {self.position_size_pct:.0%}")
 
     def _get_param(self, name, default):
         try:
@@ -821,7 +821,15 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     reject_dollar_volume += 1
                     continue
 
-            # Position sizing: 70% base, Kelly-adjusted
+            # Fee-viability gate: ATR/price must be ≥ 2× expected round-trip fees.
+            # Avoids trading in dead markets where fees consume the entire move.
+            if crypto['atr'].IsReady and price > 0:
+                atr_pct = crypto['atr'].Current.Value / price
+                if atr_pct < 2 * self.expected_round_trip_fees:
+                    reject_dollar_volume += 1
+                    continue
+
+            # Position sizing: 50% base, Kelly-adjusted
             vol = self._annualized_vol(crypto)
             size = self._calculate_position_size(net_score, threshold_now, vol)
 
@@ -887,7 +895,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     components = cand.get('factors', {})
                     sig_str = (f"obi={components.get('obi', 0):.2f} "
                                f"vol={components.get('vol_ignition', 0):.2f} "
-                               f"trend={components.get('micro_trend', 0):.2f}")
+                               f"trend={components.get('micro_trend', 0):.2f} "
+                               f"vwap={components.get('vwap', 0):.2f} "
+                               f"ema={components.get('ema_cross', 0):.2f}")
                     self.Debug(f"SCALP ENTRY: {sym.Value} | score={net_score:.2f} | ${val:.2f} | {sig_str}")
                     success_count += 1
                     self.trade_count += 1
