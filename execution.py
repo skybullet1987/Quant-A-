@@ -8,6 +8,7 @@ from datetime import timedelta
 
 # Constants from main_qa.py lines 31-68
 SYMBOL_BLACKLIST = {
+    "BTCUSD",  # Reference symbol only — never trade (too expensive for small capital, always dust)
     "USDTUSD", "USDCUSD", "PYUSDUSD", "EURCUSD", "USTUSD",
     "DAIUSD", "TUSDUSD", "WETHUSD", "WBTCUSD", "WAXLUSD",
     "SHIBUSD", "XMRUSD", "ZECUSD", "DASHUSD",
@@ -30,6 +31,11 @@ KNOWN_FIAT_CURRENCIES = frozenset({
     "EUR", "GBP", "AUD", "NZD", "JPY", "CAD", "CHF", "CNY", "HKD", "SGD",
     "SEK", "NOK", "DKK", "KRW", "TRY", "ZAR", "MXN", "INR", "BRL", "PLN", "THB",
 })
+
+# Fractional haircut applied before re-rounding a sell quantity that exceeds the actual
+# portfolio holding.  The 0.9999 factor (0.01% reduction) is enough to push floating-point
+# values below the lot_size boundary while keeping the sell amount virtually identical.
+QUANTITY_HAIRCUT_FACTOR = 0.9999
 
 KRAKEN_MIN_QTY_FALLBACK = {
     'AXSUSD': 5.0, 'SANDUSD': 10.0, 'MANAUSD': 10.0, 'ADAUSD': 10.0,
@@ -210,10 +216,16 @@ def smart_liquidate(algo, symbol, tag="Liquidate"):
     # The portfolio already reflects the post-fee quantity (Kraken deducts fees from
     # the base asset at buy time), so no fee buffer is needed on the sell side.
     safe_qty = round_quantity(algo, symbol, abs(holding_qty))
-    # Ensure we never attempt to sell more than the actual portfolio quantity
+    # Ensure we never attempt to sell more than the actual portfolio quantity.
+    # round_quantity can round UP due to floating-point, causing "insufficient buying power"
+    # errors on Kraken Cash Modeling (e.g. post-fee BTC holdings are slightly less than
+    # the ordered quantity).  Apply a haircut before re-rounding to guarantee floor division
+    # stays at or below actual_qty.
     actual_qty = abs(algo.Portfolio[symbol].Quantity)
     if safe_qty > actual_qty:
-        safe_qty = round_quantity(algo, symbol, actual_qty)
+        safe_qty = round_quantity(algo, symbol, actual_qty * QUANTITY_HAIRCUT_FACTOR)
+    # Final hard cap — never exceed actual holding regardless of floating-point rounding
+    safe_qty = min(safe_qty, actual_qty)
     if safe_qty < exit_min_qty:
         # Position rounded down below MinimumOrderSize — treat as dust, cannot sell
         return False

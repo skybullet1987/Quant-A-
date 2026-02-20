@@ -50,6 +50,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.min_notional       = 5.0
         self.min_price_usd      = 0.005
         self.cash_reserve_pct   = 0.0    # no dead-money reserve at $20
+        # Buffer multiplier applied to min_notional_usd before entry: a 50 % buffer ensures
+        # the post-fee position quantity (Kraken deducts fees from the base asset) remains
+        # above MinimumOrderSize so the position can always be sold later.
+        self.min_notional_fee_buffer = 1.5
 
         # === Volatility / risk targets (kept for ATR sizing) ===
         self.target_position_ann_vol = self._get_param("target_position_ann_vol", 0.35)
@@ -823,7 +827,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if total_cost_with_fee > available_cash:
                 reject_cash_reserve += 1
                 continue
-            if val < min_notional_usd or val < self.min_notional or val > reserved_cash:
+            if val < min_notional_usd * self.min_notional_fee_buffer or val < self.min_notional or val > reserved_cash:
                 reject_notional += 1
                 continue
 
@@ -913,6 +917,17 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         # Dust position detection: position too small to sell — clean up and skip
         min_notional_usd = get_min_notional_usd(self, symbol)
         if price > 0 and abs(holding.Quantity) * price < min_notional_usd * 0.5:
+            cleanup_position(self, symbol)
+            self._failed_exit_counts.pop(symbol, None)
+            return
+        # Sell-overshoot dust detection: rounded sell qty would exceed actual holding
+        # (Kraken Cash Modeling deducts fees from base asset at buy time, so actual qty
+        # is slightly less than ordered qty).  This position will ALWAYS fail to sell —
+        # detect it early and clean up instead of looping.
+        actual_qty = abs(holding.Quantity)
+        rounded_sell = round_quantity(self, symbol, actual_qty)
+        if rounded_sell > actual_qty:
+            self.Debug(f"DUST (rounded sell > actual): {symbol.Value} | actual={actual_qty} rounded={rounded_sell} — cleaning up")
             cleanup_position(self, symbol)
             self._failed_exit_counts.pop(symbol, None)
             return
