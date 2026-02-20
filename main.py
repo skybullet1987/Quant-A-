@@ -827,15 +827,33 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 reject_notional += 1
                 continue
 
-            # Exit feasibility check: qty must be >= lot_size so the position can be sold later
+            # Exit feasibility check: qty (and post-fee qty) must be >= MinimumOrderSize
+            # so the position can be sold later. Use max(MinimumOrderSize, lot_size) as
+            # the effective floor because the brokerage enforces MinimumOrderSize on exits.
             try:
-                lot_size = self.Securities[sym].SymbolProperties.LotSize
-                if lot_size is not None and lot_size > 0 and qty < lot_size:
-                    self.Debug(f"REJECT ENTRY {sym.Value}: qty={qty} < lot_size={lot_size} (unsellable)")
+                sec = self.Securities[sym]
+                min_order_size = float(sec.SymbolProperties.MinimumOrderSize or 0)
+                lot_size = float(sec.SymbolProperties.LotSize or 0)
+                actual_min = max(min_order_size, lot_size)
+                if actual_min > 0 and qty < actual_min:
+                    self.Debug(f"REJECT ENTRY {sym.Value}: qty={qty} < min_order_size={actual_min} (unsellable)")
                     reject_notional += 1
                     continue
+                # Ensure post-fee quantity (Kraken deducts ~0.6% from base asset on buy)
+                # will still be >= MinimumOrderSize so the position is immediately sellable.
+                if min_order_size > 0:
+                    post_fee_qty = qty * (1.0 - KRAKEN_SELL_FEE_BUFFER)
+                    if post_fee_qty < min_order_size:
+                        required_qty = round_quantity(self, sym, min_order_size / (1.0 - KRAKEN_SELL_FEE_BUFFER))
+                        if required_qty * price <= available_cash * 0.99:  # 1% cash safety margin
+                            qty = required_qty
+                            val = qty * price
+                        else:
+                            self.Debug(f"REJECT ENTRY {sym.Value}: post-fee qty={post_fee_qty:.6f} < min_order_size={min_order_size} and can't upsize")
+                            reject_notional += 1
+                            continue
             except Exception as e:
-                self.Debug(f"Warning: could not get lot_size for {sym.Value}: {e}")
+                self.Debug(f"Warning: could not check min_order_size for {sym.Value}: {e}")
 
             try:
                 if self.LiveMode:

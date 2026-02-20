@@ -192,29 +192,30 @@ def smart_liquidate(algo, symbol, tag="Liquidate"):
                 algo.entry_times[symbol] = algo.Time
             return False
     algo.Transactions.CancelOpenOrders(symbol)
-    # For exits: use lot_size as the floor, not min_qty (entry min order size).
-    # Kraken allows selling holdings at lot_size granularity.
+    # For exits: use MinimumOrderSize from the security (brokerage-enforced floor).
+    # lot_size < MinimumOrderSize for some assets (e.g. ETHUSD: lot=0.001, min=0.002),
+    # so using lot_size alone allows placing orders the brokerage will reject.
     try:
-        lot_size = algo.Securities[symbol].SymbolProperties.LotSize
-        if lot_size is not None and lot_size > 0:
-            exit_min_qty = lot_size
+        sec = algo.Securities[symbol]
+        min_order_size = sec.SymbolProperties.MinimumOrderSize
+        if min_order_size is not None and min_order_size > 0:
+            exit_min_qty = float(min_order_size)
         else:
             exit_min_qty = min_qty
     except Exception as e:
-        algo.Debug(f"Warning: could not get lot_size for {symbol.Value}: {e}")
+        algo.Debug(f"Warning: could not get MinimumOrderSize for {symbol.Value}: {e}")
         exit_min_qty = min_qty
     if abs(holding_qty) < exit_min_qty:
         return False
-    # Apply a fee safety buffer so we never attempt to sell more than Kraken
-    # actually holds after fee deduction from the base asset (Cash Modeling).
-    # Use the same 0.6% estimate already referenced in the fee-reserve check above.
-    adjusted_qty = abs(holding_qty) * (1.0 - KRAKEN_SELL_FEE_BUFFER)
-    safe_qty = round_quantity(algo, symbol, adjusted_qty)
+    # The portfolio already reflects the post-fee quantity (Kraken deducts fees from
+    # the base asset at buy time), so no fee buffer is needed on the sell side.
+    safe_qty = round_quantity(algo, symbol, abs(holding_qty))
     # Ensure we never attempt to sell more than the actual portfolio quantity
     actual_qty = abs(algo.Portfolio[symbol].Quantity)
     if safe_qty > actual_qty:
         safe_qty = round_quantity(algo, symbol, actual_qty)
     if safe_qty < exit_min_qty:
+        # Position rounded down below MinimumOrderSize — treat as dust, cannot sell
         return False
     if safe_qty > 0:
         direction_mult = -1 if holding_qty > 0 else 1
