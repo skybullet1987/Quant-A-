@@ -1,6 +1,7 @@
 # region imports
 from AlgorithmImports import *
 import json
+import math
 import numpy as np
 from collections import deque
 from datetime import timedelta
@@ -150,7 +151,7 @@ def round_quantity(algo, symbol, quantity):
     try:
         lot_size = algo.Securities[symbol].SymbolProperties.LotSize
         if lot_size is not None and lot_size > 0:
-            return float(int(quantity / lot_size) * lot_size)
+            return float(math.floor(quantity / lot_size)) * lot_size
         return quantity
     except Exception as e:
         algo.Debug(f"Error rounding quantity for {symbol.Value}: {e}")
