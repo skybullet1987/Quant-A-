@@ -827,6 +827,16 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 reject_notional += 1
                 continue
 
+            # Exit feasibility check: qty must be >= lot_size so the position can be sold later
+            try:
+                lot_size = self.Securities[sym].SymbolProperties.LotSize
+                if lot_size is not None and lot_size > 0 and qty < lot_size:
+                    self.Debug(f"REJECT ENTRY {sym.Value}: qty={qty} < lot_size={lot_size} (unsellable)")
+                    reject_notional += 1
+                    continue
+            except Exception as e:
+                self.Debug(f"Warning: could not get lot_size for {sym.Value}: {e}")
+
             try:
                 if self.LiveMode:
                     ticket = place_limit_or_market(self, sym, qty, timeout_seconds=30, tag="Entry")
@@ -990,12 +1000,20 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 return
             if pnl < 0:
                 self._symbol_loss_cooldowns[symbol] = self.Time + timedelta(hours=1)
-            smart_liquidate(self, symbol, tag)
-            self._exit_cooldowns[symbol] = self.Time + timedelta(hours=self.exit_cooldown_hours)
-            # Clean up RSI peak tracking
-            self.rsi_peaked_above_50.pop(symbol, None)
-            self.entry_volumes.pop(symbol, None)
-            self.Debug(f"{tag}: {symbol.Value} | PnL:{pnl:+.2%} | Held:{hours:.1f}h")
+            sold = smart_liquidate(self, symbol, tag)
+            if sold:
+                self._exit_cooldowns[symbol] = self.Time + timedelta(hours=self.exit_cooldown_hours)
+                # Clean up RSI peak tracking
+                self.rsi_peaked_above_50.pop(symbol, None)
+                self.entry_volumes.pop(symbol, None)
+                self.Debug(f"{tag}: {symbol.Value} | PnL:{pnl:+.2%} | Held:{hours:.1f}h")
+            else:
+                # smart_liquidate failed — position is stuck (likely too small to sell)
+                # Force cleanup tracking to unblock the algo
+                self.Debug(f"⚠️ EXIT FAILED ({tag}): {symbol.Value} | PnL:{pnl:+.2%} | Held:{hours:.1f}h -- position unsellable, cleaning up")
+                cleanup_position(self, symbol)
+                self.rsi_peaked_above_50.pop(symbol, None)
+                self.entry_volumes.pop(symbol, None)
 
     def OnOrderEvent(self, event):
         try:
