@@ -9,11 +9,13 @@ import numpy as np
 
 class SimplifiedCryptoStrategy(QCAlgorithm):
     """
-    Micro-Scalping System - v7.0.0
+    Micro-Scalping System - v7.1.0
     Advanced 5-signal micro-scalp engine targeting 3-6 high-quality trades/day.
     Conservative position sizing (70-90%), 1 position max, 4-hour time stop, 1-hour exit cooldown.
     Signals: OBI (tighter), Volume Ignition (4x), MTF Trend Alignment (EMA5>EMA20),
-             ADX Regime Filter (avoids chop), VWAP Reclaim (institutional reference).
+             ADX/Mean-Reversion (trending: ADX>20; ranging: RSI oversold + BB lower), VWAP Reclaim.
+    Regime-adaptive: trending mode (Jan–Mar) uses ADX signal; sideways mode (Apr–Oct) uses mean
+    reversion (RSI<40 + price near lower Bollinger Band) with relaxed profit/volume gates.
     Fee-adjusted minimum profit gate: only enter when ATR-projected move exceeds fees+slippage.
     Preserves: order verification, portfolio sanity checks, resync, health checks,
     slippage logging, Kraken status gate, ObjectStore persistence, daily reporting.
@@ -474,12 +476,14 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 new_regime = "bear"
             else:
                 new_regime = "sideways"
-            # Momentum confirmation using last 12 hours
+            # Momentum confirmation: only override sideways if momentum is significant
             if new_regime == "sideways" and len(self.btc_returns) >= 12:
                 btc_mom_12 = np.mean(list(self.btc_returns)[-12:])
-                if btc_mom_12 > 0:
+                # Require >+0.03%/min or <-0.03%/min to upgrade from sideways to bull/bear;
+                # weaker noise stays as sideways so ranging-market logic can activate.
+                if btc_mom_12 > 0.0003:
                     new_regime = "bull"
-                elif btc_mom_12 < 0:
+                elif btc_mom_12 < -0.0003:
                     new_regime = "bear"
             # Hysteresis: only change if held for 3+ bars
             if new_regime != self.market_regime:
@@ -562,6 +566,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         return self.max_daily_trades
 
     def _get_threshold(self):
+        # In ranging/sideways markets, lower the entry threshold so that
+        # mean-reversion setups (which score slightly below 0.60) can enter.
+        if self.market_regime == "sideways":
+            return max(0.50, self.entry_threshold - 0.10)
         return self.entry_threshold
 
     def _check_correlation(self, new_symbol):
@@ -832,17 +840,20 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
             # Fee-adjusted minimum expected profit gate:
             # Only enter if ATR-projected move covers fees + slippage with margin.
+            # In sideways/ranging markets ATR is naturally smaller, so relax the gate.
             atr_val = crypto['atr'].Current.Value if crypto['atr'].IsReady else None
             if atr_val and price > 0:
                 expected_move_pct = (atr_val * self.atr_tp_mult) / price
-                min_required = self.expected_round_trip_fees + self.fee_slippage_buffer + self.min_expected_profit_pct
+                min_profit_gate = 0.008 if self.market_regime == "sideways" else self.min_expected_profit_pct
+                min_required = self.expected_round_trip_fees + self.fee_slippage_buffer + min_profit_gate
                 if expected_move_pct < min_required:
                     continue
 
-            # Hourly dollar-volume liquidity gate ($50k/hour)
+            # Dollar-volume liquidity gate (relaxed in sideways/low-activity periods)
             if len(crypto['dollar_volume']) >= 3:
                 recent_dv = np.mean(list(crypto['dollar_volume'])[-3:])
-                if recent_dv < self.min_dollar_volume_usd:
+                dv_threshold = 5000 if self.market_regime == "sideways" else self.min_dollar_volume_usd
+                if recent_dv < dv_threshold:
                     reject_dollar_volume += 1
                     continue
 
@@ -1017,6 +1028,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             tp *= 1.2
         elif self.market_regime == "bear":
             tp = min(tp, 0.015)  # tighter TP in bear (take small wins)
+        elif self.market_regime == "sideways":
+            # Ranging market: take quick mean-reversion wins before price reverts
+            tp = min(tp, 0.015)  # cap TP at 1.5% in sideways
+            sl = min(sl, 0.010)  # tighter stop in ranging to preserve capital
 
         # Bull regime: allow wider TP (up to 4%)
         if self.market_regime == "bull":
