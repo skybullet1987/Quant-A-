@@ -911,15 +911,29 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if self._failed_exit_counts.get(kvp.Key, 0) >= 3:
                 continue
             self._check_exit(kvp.Key, self.Securities[kvp.Key].Price, kvp.Value)
+        # Orphan recovery: re-track positions that exist in Portfolio but lost tracking
+        for kvp in self.Portfolio:
+            symbol = kvp.Key
+            if not is_invested_not_dust(self, symbol):
+                continue
+            if symbol not in self.entry_prices:
+                self.entry_prices[symbol] = kvp.Value.AveragePrice
+                self.highest_prices[symbol] = kvp.Value.AveragePrice
+                self.entry_times[symbol] = self.Time
+                self.Debug(f"ORPHAN RECOVERY: {symbol.Value} re-tracked")
 
     def _check_exit(self, symbol, price, holding):
         if len(self.Transactions.GetOpenOrders(symbol)) > 0:
             return
         if symbol in self._cancel_cooldowns and self.Time < self._cancel_cooldowns[symbol]:
             return
-        # Dust position detection: position too small to sell — clean up and skip
+        # Dust position detection: position too small to sell — try to liquidate, then clean up
         min_notional_usd = get_min_notional_usd(self, symbol)
-        if price > 0 and abs(holding.Quantity) * price < min_notional_usd * 0.5:
+        if price > 0 and abs(holding.Quantity) * price < min_notional_usd * 0.3:
+            try:
+                self.Liquidate(symbol)
+            except Exception as e:
+                self.Debug(f"DUST liquidation failed for {symbol.Value}: {e}")
             cleanup_position(self, symbol)
             self._failed_exit_counts.pop(symbol, None)
             return
