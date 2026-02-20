@@ -31,10 +31,13 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.tight_stop_loss   = self._get_param("tight_stop_loss",   0.012)  # 1.2% base SL
         self.atr_tp_mult  = self._get_param("atr_tp_mult",  2.5)   # ATR × 2.5 for TP
         self.atr_sl_mult  = self._get_param("atr_sl_mult",  1.5)   # ATR × 1.5 for SL
-        self.trail_activation  = self._get_param("trail_activation",  0.008)  # activate at +0.8%
+        self.trail_activation  = self._get_param("trail_activation",  0.005)  # activate at +0.5%
         self.trail_stop_pct    = self._get_param("trail_stop_pct",    0.005)  # trail 0.5% from high
-        self.time_stop_hours   = self._get_param("time_stop_hours",   4.0)    # exit after 4h if PnL < +0.5%
-        self.time_stop_pnl_min = self._get_param("time_stop_pnl_min", 0.005)  # +0.5% floor
+        self.time_stop_hours   = self._get_param("time_stop_hours",   4.0)    # exit after 4h if PnL < +0.3%
+        self.time_stop_pnl_min = self._get_param("time_stop_pnl_min", 0.003)  # +0.3% floor
+        self.extended_time_stop_hours   = self._get_param("extended_time_stop_hours",   6.0)   # exit after 6h if not clearly winning
+        self.extended_time_stop_pnl_max = self._get_param("extended_time_stop_pnl_max", 0.015) # +1.5% ceiling
+        self.stale_position_hours       = self._get_param("stale_position_hours",       8.0)   # unconditional exit after 8h
 
         # Keep legacy names used elsewhere
         self.trailing_activation = self.trail_activation
@@ -1015,8 +1018,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 if self.rsi_peaked_above_50.get(symbol, False) and rsi_now < 50:
                     tag = "RSI Momentum Exit"
 
-            # Volume Dry-up Exit: volume drops below 50% of entry volume for 2 bars
-            if not tag and crypto and len(crypto['volume']) >= 2:
+            # Volume Dry-up Exit: volume drops below 50% of entry volume for 2 bars (min 2h hold)
+            if not tag and hours >= 2.0 and crypto and len(crypto['volume']) >= 2:
                 entry_vol = self.entry_volumes.get(symbol, 0)
                 if entry_vol > 0:
                     v1 = crypto['volume'][-1]
@@ -1024,9 +1027,17 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     if v1 < entry_vol * 0.50 and v2 < entry_vol * 0.50:
                         tag = "Volume Dry-up"
 
-            # Time Stop: exit after 4h if PnL < +0.5%
+            # Time Stop: exit after 4h if PnL < +0.3%
             if not tag and hours >= self.time_stop_hours and pnl < self.time_stop_pnl_min:
                 tag = "Time Stop"
+
+            # Extended Time Stop: exit after 6h if PnL < +1.5% (closes the dead zone between Time Stop and Take Profit)
+            if not tag and hours >= self.extended_time_stop_hours and pnl < self.extended_time_stop_pnl_max:
+                tag = "Extended Time Stop"
+
+            # Stale Position Kill: after 8h, exit unconditionally
+            if not tag and hours >= self.stale_position_hours:
+                tag = "Stale Position Exit"
 
         if tag:
             if price * abs(holding.Quantity) < min_notional_usd * 0.9:
