@@ -55,6 +55,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.base_max_positions = 1
         self.max_positions      = 1
         self.min_notional       = 5.0
+        self.max_position_usd   = self._get_param("max_position_usd", 1500.0)
         self.min_price_usd      = 0.005
         self.cash_reserve_pct   = 0.0    # no dead-money reserve at $20
         # Buffer multiplier applied to min_notional_usd before entry: a 50 % buffer ensures
@@ -317,7 +318,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 continue
             if crypto.VolumeInUsd is None or crypto.VolumeInUsd == 0:
                 continue
-            if crypto.VolumeInUsd >= self.min_volume_usd:
+            min_vol = 5_000_000 if self.Portfolio.TotalPortfolioValue > 1000 else self.min_volume_usd
+            if crypto.VolumeInUsd >= min_vol:
                 selected.append(crypto)
         selected.sort(key=lambda x: x.VolumeInUsd, reverse=True)
         return [c.Symbol for c in selected[:self.max_universe_size]]
@@ -682,7 +684,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             self.consecutive_losses = 0
             self._log_skip("consecutive loss cooldown (5 losses)")
             return
-        dynamic_max_pos = self.base_max_positions
+        dynamic_max_pos = min(4, max(self.base_max_positions, int(val // self.max_position_usd) + 1))
         pos_count = get_actual_position_count(self)
         if pos_count >= dynamic_max_pos:
             self._log_skip("at max positions")
@@ -903,6 +905,15 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             size *= slippage_penalty
 
             val = reserved_cash * size
+
+            # Volume-Pegged Position Sizing ("Whale Rule"): cap at 2% of recent 3-min dollar volume
+            if len(crypto['dollar_volume']) >= 3:
+                whale_cap = sum(list(crypto['dollar_volume'])[-3:]) * 0.02
+                val = min(val, whale_cap)
+
+            # Absolute Hard Cap on position size
+            val = min(val, self.max_position_usd)
+
             qty = round_quantity(self, sym, val / price)
             if qty < min_qty:
                 qty = round_quantity(self, sym, min_qty)
