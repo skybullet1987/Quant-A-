@@ -482,7 +482,7 @@ def sync_existing_positions(algo):
             continue
         if symbol not in algo.Securities:
             try:
-                algo.AddCrypto(ticker, Resolution.Hour, Market.Kraken)
+                algo.AddCrypto(ticker, Resolution.Minute, Market.Kraken)
             except Exception as e:
                 algo.Debug(f"Error adding crypto {ticker}: {e}")
                 continue
@@ -719,12 +719,15 @@ def place_limit_or_market(algo, symbol, quantity, timeout_seconds=30, tag="Entry
             algo.Debug(f"BID/ASK unavailable for {symbol.Value}, using market order")
             return algo.MarketOrder(symbol, quantity, tag=tag)
         
-        # Calculate mid price
-        mid = 0.5 * (bid + ask)
-        
-        # Place limit order at mid price
-        limit_ticket = algo.LimitOrder(symbol, quantity, mid, tag=tag)
-        
+        # Place limit order at or slightly above bid (Maker order for 0.25% fee)
+        # Placing just above bid keeps us in the order book as a maker while
+        # improving fill odds slightly vs. the raw bid.
+        limit_price = bid * 1.0005  # 0.05% above bid – still below mid, still maker
+        limit_price = min(limit_price, ask)  # never cross the spread
+
+        # Place maker limit order
+        limit_ticket = algo.LimitOrder(symbol, quantity, limit_price, tag=tag)
+
         # Track for fallback in VerifyOrderFills
         if hasattr(algo, '_submitted_orders'):
             algo._submitted_orders[symbol] = {
@@ -735,8 +738,8 @@ def place_limit_or_market(algo, symbol, quantity, timeout_seconds=30, tag="Entry
                 'timeout_seconds': timeout_seconds,
                 'intent': 'entry'
             }
-        
-        algo.Debug(f"LIMIT ORDER: {symbol.Value} | qty={quantity} | mid=${mid:.4f} | timeout={timeout_seconds}s")
+
+        algo.Debug(f"MAKER LIMIT: {symbol.Value} | qty={quantity} | bid=${bid:.4f} | limit=${limit_price:.4f} | timeout={timeout_seconds}s")
         return limit_ticket
         
     except Exception as e:
@@ -886,7 +889,7 @@ def resync_holdings_full(algo):
         for symbol in missing:
             try:
                 if symbol not in algo.Securities:
-                    algo.AddCrypto(symbol.Value, Resolution.Hour, Market.Kraken)
+                    algo.AddCrypto(symbol.Value, Resolution.Minute, Market.Kraken)
                 holding = algo.Portfolio[symbol]
                 entry = holding.AveragePrice
                 algo.entry_prices[symbol] = entry
