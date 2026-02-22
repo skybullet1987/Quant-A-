@@ -9,16 +9,8 @@ import numpy as np
 
 class SimplifiedCryptoStrategy(QCAlgorithm):
     """
-    Micro-Scalping System - v7.1.0
-    Advanced 5-signal micro-scalp engine targeting 3-6 high-quality trades/day.
-    Conservative position sizing (70-90%), 1 position max, 4-hour time stop, 1-hour exit cooldown.
-    Signals: OBI (tighter), Volume Ignition (4x), MTF Trend Alignment (EMA5>EMA20),
-             ADX/Mean-Reversion (trending: ADX>20; ranging: RSI oversold + BB lower), VWAP Reclaim.
-    Regime-adaptive: trending mode (Jan–Mar) uses ADX signal; sideways mode (Apr–Oct) uses mean
-    reversion (RSI<40 + price near lower Bollinger Band) with relaxed profit/volume gates.
-    Fee-adjusted minimum profit gate: only enter when ATR-projected move exceeds fees+slippage.
-    Preserves: order verification, portfolio sanity checks, resync, health checks,
-    slippage logging, Kraken status gate, ObjectStore persistence, daily reporting.
+    Micro-Scalping System - v7.1.0 (Mega-Trend Fix 2)
+    5-signal micro-scalp engine, regime-adaptive, bull/sideways/bear-aware.
     """
 
     def Initialize(self):
@@ -58,9 +50,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.max_position_usd   = self._get_param("max_position_usd", 1500.0)
         self.min_price_usd      = 0.005
         self.cash_reserve_pct   = 0.0    # no dead-money reserve at $20
-        # Buffer multiplier applied to min_notional_usd before entry: a 50 % buffer ensures
-        # the post-fee position quantity (Kraken deducts fees from the base asset) remains
-        # above MinimumOrderSize so the position can always be sold later.
+        # 50% buffer ensures post-fee qty stays above MinimumOrderSize.
         self.min_notional_fee_buffer = 1.5
 
         # === Volatility / risk targets (kept for ATR sizing) ===
@@ -132,10 +122,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self._failed_exit_attempts = {}  # tracks consecutive Invalid sell orders per symbol
         self._failed_exit_counts   = {}  # tracks failed exit attempts for dust-loop prevention
 
-        # Legacy compatibility
-        self.signal_decay_buffer  = 0.05
-        self.min_signal_age_hours = 1
-
         self.peak_value       = None
         self.drawdown_cooldown = 0
         self.crypto_data      = {}
@@ -165,7 +151,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.slip_alert_duration_hours = 2
         self._bad_symbol_counts = {}
         self._recent_tickets  = deque(maxlen=25)
-        self.min_hold_hours   = 0.5   # 30-minute minimum hold
 
         # Rolling performance tracking (for Kelly)
         self._rolling_wins      = deque(maxlen=50)
@@ -198,16 +183,6 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         # Kraken status gate
         self.kraken_status = "unknown"
         self._last_skip_reason = None
-
-        # === Weights (kept for legacy compatibility with execution helpers) ===
-        self.weights = {
-            'relative_strength': 0.25,
-            'volume_momentum': 0.20,
-            'trend_strength': 0.20,
-            'mean_reversion': 0.10,
-            'liquidity': 0.10,
-            'risk_adjusted_momentum': 0.15,
-        }
 
         self.UniverseSettings.Resolution = Resolution.Minute
         self.AddUniverse(CryptoUniverse.Kraken(self.UniverseFilter))
@@ -622,6 +597,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         # mean-reversion setups (which score slightly below 0.60) can enter.
         if self.market_regime == "sideways":
             return max(0.50, self.entry_threshold - 0.10)
+        elif self.market_regime == "bull":
+            return max(0.45, self.entry_threshold - 0.15) # Relax threshold significantly in bull runs
         return self.entry_threshold
 
     def _check_correlation(self, new_symbol):
@@ -890,9 +867,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if crypto.get('trade_count_today', 0) >= self.max_symbol_trades_per_day:
                 continue
 
-            # Fee-adjusted minimum expected profit gate:
-            # Only enter if ATR-projected move covers fees + slippage with margin.
-            # In sideways/ranging markets ATR is naturally smaller, so relax the gate.
+            # Fee-adjusted profit gate: ATR-projected move must cover fees + slippage.
             atr_val = crypto['atr'].Current.Value if crypto['atr'].IsReady else None
             if atr_val and price > 0:
                 expected_move_pct = (atr_val * self.atr_tp_mult) / price
@@ -909,8 +884,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     reject_dollar_volume += 1
                     continue
 
-            # Relative strength vs BTC: altcoin must outperform BTC on recent momentum
-            # to avoid fake-out entries during BTC-driven liquidity sweeps
+            # Relative strength vs BTC: altcoin must outperform BTC momentum
             if self.btc_symbol is not None and len(crypto.get('rs_vs_btc', [])) >= 1:
                 rs_latest = crypto['rs_vs_btc'][-1]
                 if rs_latest < 0:
@@ -953,9 +927,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 reject_notional += 1
                 continue
 
-            # Exit feasibility check: qty (and post-fee qty) must be >= MinimumOrderSize
-            # so the position can be sold later. Use max(MinimumOrderSize, lot_size) as
-            # the effective floor because the brokerage enforces MinimumOrderSize on exits.
+            # Exit feasibility check: qty must be >= MinimumOrderSize so the position can be sold.
             try:
                 sec = self.Securities[sym]
                 min_order_size = float(sec.SymbolProperties.MinimumOrderSize or 0)
@@ -965,8 +937,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     self.Debug(f"REJECT ENTRY {sym.Value}: qty={qty} < min_order_size={actual_min} (unsellable)")
                     reject_notional += 1
                     continue
-                # Ensure post-fee quantity (Kraken deducts ~0.6% from base asset on buy)
-                # will still be >= MinimumOrderSize so the position is immediately sellable.
+                # Ensure post-fee qty >= MinimumOrderSize so position is sellable.
                 if min_order_size > 0:
                     post_fee_qty = qty * (1.0 - KRAKEN_SELL_FEE_BUFFER)
                     if post_fee_qty < min_order_size:
@@ -1056,10 +1027,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             cleanup_position(self, symbol)
             self._failed_exit_counts.pop(symbol, None)
             return
-        # Sell-overshoot dust detection: rounded sell qty would exceed actual holding
-        # (Kraken Cash Modeling deducts fees from base asset at buy time, so actual qty
-        # is slightly less than ordered qty).  This position will ALWAYS fail to sell —
-        # detect it early and clean up instead of looping.
+        # Sell-overshoot dust: rounded sell qty would exceed actual holding — clean up.
         actual_qty = abs(holding.Quantity)
         rounded_sell = round_quantity(self, symbol, actual_qty)
         if rounded_sell > actual_qty:
@@ -1102,10 +1070,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             tp = min(tp, 0.015)  # cap TP at 1.5% in sideways
             sl = min(sl, 0.010)  # tighter stop in ranging to preserve capital
 
-        # Bull regime: uncap TP and widen SL to let the trend run
+        # Bull regime: allow wider TP
         if self.market_regime == "bull":
-            tp = max(tp * 2.0, 0.10)  # 10% floor, let it run
-            sl = max(sl * 1.5, 0.03)  # 3% stop loss to survive retests
+            tp = max(tp * 3.0, 0.25)  # Let it run to 25% or 3x ATR
+            sl = max(sl * 2.0, 0.05)  # Give it 5% breathing room
 
         # Enforce minimum 1.5:1 reward-to-risk ratio
         if tp < sl * 1.5:
@@ -1144,8 +1112,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         if not tag and self.market_regime != "bull" and minutes > self.stagnation_minutes and pnl < self.stagnation_pnl_threshold:
             tag = "Stagnation Exit"
 
-        # --- Priority 2: Non-stop exits (require min hold time) ---
-        elif not tag and hours >= self.min_hold_hours:
+        # --- Priority 2: Non-stop exits (no minimum hold time — allow immediate exits for rapid spikes) ---
+        elif not tag:
             # Quick Take Profit (skip if partial TP already taken — let trailing stop handle exit)
             if not self._partial_tp_taken.get(symbol, False) and pnl >= tp:
                 tag = "Take Profit"
