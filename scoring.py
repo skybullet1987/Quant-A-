@@ -200,6 +200,31 @@ class MicroScalpEngine:
                         self.algo.Debug(
                             f"VWAP -2SD Bounce: price={price:.4f} sd2_lower={vwap_sd2_lower:.4f}")
 
+            # ----------------------------------------------------------
+            # Signal 6: CVD Divergence (Absorption)
+            # Price at or below VWAP -2SD lower band AND CVD trending up
+            # over last 5 bars → limit buyers absorbing sellers at support.
+            # ----------------------------------------------------------
+            cvd = crypto.get('cvd')
+            if (vwap_sd2_lower > 0 and len(crypto['prices']) >= 1
+                    and cvd is not None and len(cvd) >= 5):
+                price = crypto['prices'][-1]
+                if price <= vwap_sd2_lower and cvd[-1] > cvd[-5]:
+                    components['cvd_absorption'] = 0.25
+
+            # ----------------------------------------------------------
+            # Signal 7: Kalman Mean Reversion
+            # In choppy markets (KER < 0.3), price extending >0.4% below
+            # Kalman estimate → over-extension likely to revert.
+            # ----------------------------------------------------------
+            ker = crypto.get('ker')
+            kalman_estimate = crypto.get('kalman_estimate', 0.0)
+            if (ker is not None and len(ker) > 0 and ker[-1] < 0.3
+                    and kalman_estimate > 0 and len(crypto['prices']) >= 1):
+                price = crypto['prices'][-1]
+                if price < kalman_estimate * 0.996:
+                    components['kalman_reversion'] = 0.20
+
         except Exception as e:
             self.algo.Debug(f"MicroScalpEngine.calculate_scalp_score error: {e}")
 
