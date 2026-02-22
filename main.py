@@ -362,6 +362,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             'vwap_sd': 0.0,                     # VWAP rolling standard deviation
             'vwap_sd2_lower': 0.0,              # VWAP - 2*SD lower band
             'vwap_sd3_lower': 0.0,              # VWAP - 3*SD lower band
+            'cvd': deque(maxlen=self.lookback),  # Cumulative Volume Delta
+            'ker': deque(maxlen=self.short_period),  # Kaufman Efficiency Ratio
+            'kalman_estimate': 0.0,             # Kalman filter price estimate
+            'kalman_error_cov': 1.0,            # Kalman filter error covariance
         }
 
     def OnSecuritiesChanged(self, changes):
@@ -476,6 +480,32 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 crypto['bb_upper'].append(mean + 2 * std)
                 crypto['bb_lower'].append(mean - 2 * std)
                 crypto['bb_width'].append(4 * std / mean if mean > 0 else 0)
+        # CVD: Tick Delta approximation
+        high_low = high - low
+        if high_low > 0:
+            bar_delta = volume * ((price - low) - (high - price)) / high_low
+        else:
+            bar_delta = 0.0
+        prev_cvd = crypto['cvd'][-1] if len(crypto['cvd']) > 0 else 0.0
+        crypto['cvd'].append(prev_cvd + bar_delta)
+        # KER: Kaufman Efficiency Ratio (15-period)
+        if len(crypto['prices']) >= 15:
+            price_change = abs(crypto['prices'][-1] - crypto['prices'][-15])
+            volatility_sum = sum(abs(crypto['prices'][i] - crypto['prices'][i-1]) for i in range(-14, 0))
+            if volatility_sum > 0:
+                crypto['ker'].append(price_change / volatility_sum)
+            else:
+                crypto['ker'].append(0.0)
+        # 1D Kalman Filter for price
+        Q = 1e-5  # Process noise variance
+        R = 0.01  # Measurement noise variance
+        if crypto['kalman_estimate'] == 0.0:
+            crypto['kalman_estimate'] = price
+        estimate_pred = crypto['kalman_estimate']
+        error_cov_pred = crypto['kalman_error_cov'] + Q
+        kalman_gain = error_cov_pred / (error_cov_pred + R)
+        crypto['kalman_estimate'] = estimate_pred + kalman_gain * (price - estimate_pred)
+        crypto['kalman_error_cov'] = (1 - kalman_gain) * error_cov_pred
         sp = get_spread_pct(self, symbol)
         if sp is not None:
             crypto['spreads'].append(sp)
@@ -493,23 +523,33 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     def _update_market_context(self):
         if len(self.btc_prices) >= 48:
             btc_arr = np.array(list(self.btc_prices))
-            btc_sma = np.mean(btc_arr[-48:])
             current_btc = btc_arr[-1]
-            if current_btc > btc_sma * 1.05:
-                new_regime = "bull"
-            elif current_btc < btc_sma * 0.95:
-                new_regime = "bear"
-            else:
-                new_regime = "sideways"
-            # Momentum confirmation: only override sideways if momentum is significant
-            if new_regime == "sideways" and len(self.btc_returns) >= 12:
-                btc_mom_12 = np.mean(list(self.btc_returns)[-12:])
-                # Require >+0.03%/min or <-0.03%/min to upgrade from sideways to bull/bear;
-                # weaker noise stays as sideways so ranging-market logic can activate.
-                if btc_mom_12 > 0.0003:
+            btc_mom_12 = np.mean(list(self.btc_returns)[-12:]) if len(self.btc_returns) >= 12 else 0.0
+            btc_crypto = self.crypto_data.get(self.btc_symbol) if self.btc_symbol else None
+            if btc_crypto is not None and len(btc_crypto['ker']) > 0:
+                btc_ker = btc_crypto['ker'][-1]
+                if btc_ker < 0.25:
+                    new_regime = "sideways"
+                elif btc_mom_12 > 0:
                     new_regime = "bull"
-                elif btc_mom_12 < -0.0003:
+                else:
                     new_regime = "bear"
+            else:
+                btc_sma = np.mean(btc_arr[-48:])
+                if current_btc > btc_sma * 1.05:
+                    new_regime = "bull"
+                elif current_btc < btc_sma * 0.95:
+                    new_regime = "bear"
+                else:
+                    new_regime = "sideways"
+                # Momentum confirmation: only override sideways if momentum is significant
+                if new_regime == "sideways" and len(self.btc_returns) >= 12:
+                    # Require >+0.03%/min or <-0.03%/min to upgrade from sideways to bull/bear;
+                    # weaker noise stays as sideways so ranging-market logic can activate.
+                    if btc_mom_12 > 0.0003:
+                        new_regime = "bull"
+                    elif btc_mom_12 < -0.0003:
+                        new_regime = "bear"
             # Hysteresis: only change if held for 3+ bars
             if new_regime != self.market_regime:
                 self._regime_hold_count += 1
