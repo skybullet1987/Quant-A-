@@ -147,7 +147,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self._breakeven_stops       = {}       # per-symbol breakeven SL price after partial TP
         self._partial_sell_symbols  = set()    # symbols with in-flight partial TP sell orders
         self.partial_tp_threshold   = 0.025    # +2.5% triggers partial scale-out
-        self.stagnation_minutes     = 15       # stagnation exit: trade must be > 15 min old
+        self.stagnation_minutes     = 45       # stagnation exit: trade must be > 45 min old
         self.stagnation_pnl_threshold = 0.005  # stagnation exit: pnl must be >= 0.5%
         self.rsi_peaked_above_50 = {}  # for RSI momentum exit
         self.trade_count      = 0
@@ -318,8 +318,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 continue
             if crypto.VolumeInUsd is None or crypto.VolumeInUsd == 0:
                 continue
-            min_vol = 5_000_000 if self.Portfolio.TotalPortfolioValue > 1000 else self.min_volume_usd
-            if crypto.VolumeInUsd >= min_vol:
+            if crypto.VolumeInUsd >= self.min_volume_usd:
                 selected.append(crypto)
         selected.sort(key=lambda x: x.VolumeInUsd, reverse=True)
         return [c.Symbol for c in selected[:self.max_universe_size]]
@@ -525,31 +524,19 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             btc_arr = np.array(list(self.btc_prices))
             current_btc = btc_arr[-1]
             btc_mom_12 = np.mean(list(self.btc_returns)[-12:]) if len(self.btc_returns) >= 12 else 0.0
-            btc_crypto = self.crypto_data.get(self.btc_symbol) if self.btc_symbol else None
-            if btc_crypto is not None and len(btc_crypto['ker']) > 0:
-                btc_ker = btc_crypto['ker'][-1]
-                if btc_ker < 0.25:
-                    new_regime = "sideways"
-                elif btc_mom_12 > 0:
-                    new_regime = "bull"
-                else:
-                    new_regime = "bear"
+            btc_sma = np.mean(btc_arr[-48:])
+            if current_btc > btc_sma * 1.02:
+                new_regime = "bull"
+            elif current_btc < btc_sma * 0.98:
+                new_regime = "bear"
             else:
-                btc_sma = np.mean(btc_arr[-48:])
-                if current_btc > btc_sma * 1.05:
+                new_regime = "sideways"
+            # Keep momentum confirmation but make it more sensitive
+            if new_regime == "sideways" and len(self.btc_returns) >= 12:
+                if btc_mom_12 > 0.0001:
                     new_regime = "bull"
-                elif current_btc < btc_sma * 0.95:
+                elif btc_mom_12 < -0.0001:
                     new_regime = "bear"
-                else:
-                    new_regime = "sideways"
-                # Momentum confirmation: only override sideways if momentum is significant
-                if new_regime == "sideways" and len(self.btc_returns) >= 12:
-                    # Require >+0.03%/min or <-0.03%/min to upgrade from sideways to bull/bear;
-                    # weaker noise stays as sideways so ranging-market logic can activate.
-                    if btc_mom_12 > 0.0003:
-                        new_regime = "bull"
-                    elif btc_mom_12 < -0.0003:
-                        new_regime = "bear"
             # Hysteresis: only change if held for 3+ bars
             if new_regime != self.market_regime:
                 self._regime_hold_count += 1
@@ -1115,9 +1102,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             tp = min(tp, 0.015)  # cap TP at 1.5% in sideways
             sl = min(sl, 0.010)  # tighter stop in ranging to preserve capital
 
-        # Bull regime: allow wider TP (up to 4%)
+        # Bull regime: uncap TP and widen SL to let the trend run
         if self.market_regime == "bull":
-            tp = min(tp * 1.3, 0.04)
+            tp = max(tp * 2.0, 0.10)  # 10% floor, let it run
+            sl = max(sl * 1.5, 0.03)  # 3% stop loss to survive retests
 
         # Enforce minimum 1.5:1 reward-to-risk ratio
         if tp < sl * 1.5:
@@ -1137,8 +1125,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 and pnl >= self.partial_tp_threshold):
             if partial_smart_sell(self, symbol, 0.50, "Partial TP"):
                 self._partial_tp_taken[symbol] = True
-                self._breakeven_stops[symbol] = entry
-                self.Debug(f"PARTIAL TP: {symbol.Value} | PnL:{pnl:+.2%} | SL→breakeven")
+                self._breakeven_stops[symbol] = entry * 0.99
+                self.Debug(f"PARTIAL TP: {symbol.Value} | PnL:{pnl:+.2%} | SL→entry-1%")
                 return  # Don't trigger full exit this bar
 
         tag = ""
@@ -1152,8 +1140,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         elif pnl <= -sl:
             tag = "Stop Loss"
 
-        # --- Stagnation Exit: 15+ minutes with < 0.5% unrealized profit ---
-        if not tag and minutes > self.stagnation_minutes and pnl < self.stagnation_pnl_threshold:
+        # --- Stagnation Exit: 45+ minutes with < 0.5% unrealized profit (skipped in bull market) ---
+        if not tag and self.market_regime != "bull" and minutes > self.stagnation_minutes and pnl < self.stagnation_pnl_threshold:
             tag = "Stagnation Exit"
 
         # --- Priority 2: Non-stop exits (require min hold time) ---

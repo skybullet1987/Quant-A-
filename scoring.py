@@ -128,6 +128,23 @@ class MicroScalpEngine:
                     components['micro_trend'] = 0.10
 
             # ----------------------------------------------------------
+            # Signal 3b: Steady Grind (Bull Market Only)
+            # Rewards a slow, steady EMA stack even when ADX is weak.
+            # Price pulled back to the ultra-short EMA but trend is intact.
+            # ----------------------------------------------------------
+            if self.algo.market_regime == "bull":
+                if (crypto['ema_ultra_short'].IsReady and crypto['ema_short'].IsReady
+                        and crypto.get('ema_medium') is not None and crypto['ema_medium'].IsReady
+                        and len(crypto['prices']) >= 1):
+                    price = crypto['prices'][-1]
+                    ema_ultra = crypto['ema_ultra_short'].Current.Value
+                    ema_short = crypto['ema_short'].Current.Value
+                    ema_medium = crypto['ema_medium'].Current.Value
+                    if ema_ultra > ema_short and ema_short > ema_medium:
+                        if price <= ema_ultra * 1.002 and price > ema_short:
+                            components['steady_grind'] = 0.25
+
+            # ----------------------------------------------------------
             # Signal 4: ADX Regime Filter OR Mean Reversion
             # Trending market (ADX > 20): ADX directional bias confirms trend.
             # Ranging market (ADX ≤ 20): Mean reversion setup (RSI oversold +
