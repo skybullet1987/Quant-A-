@@ -1059,31 +1059,29 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             sl = self.tight_stop_loss   # 1.0-2.0% stop floor
             tp = self.quick_take_profit  # 1.5-3.0% take-profit floor
 
-        # Regime adjustments
         if self.volatility_regime == "high":
-            sl *= 1.2   # modest widening – vol is opportunity but keep risk controlled
+            sl *= 1.2
             tp *= 1.2
         elif self.market_regime == "bear":
-            tp = min(tp, 0.015)  # tighter TP in bear (take small wins)
+            tp = min(tp, 0.015)
         elif self.market_regime == "sideways":
-            # Ranging market: take quick mean-reversion wins before price reverts
-            tp = min(tp, 0.015)  # cap TP at 1.5% in sideways
-            sl = min(sl, 0.010)  # tighter stop in ranging to preserve capital
-
-        # Bull regime: allow wider TP
+            tp = min(tp, 0.015)
+            sl = min(sl, 0.010)
         if self.market_regime == "bull":
-            tp = max(tp * 3.0, 0.25)  # Let it run to 25% or 3x ATR
-            sl = max(sl * 2.0, 0.05)  # Give it 5% breathing room
-
-        # Enforce minimum 1.5:1 reward-to-risk ratio
+            tp = max(tp * 3.0, 0.25)
+            sl = max(sl * 2.0, 0.05)
         if tp < sl * 1.5:
             tp = sl * 1.5
 
         trailing_activation = self.trail_activation
         trailing_stop_pct   = self.trail_stop_pct
+        atr_trail_multiplier = self.atr_trail_mult
+        if self.market_regime == "bull":
+            trailing_activation = max(trailing_activation, 0.02)
+            trailing_stop_pct = max(trailing_stop_pct, 0.02)
+            atr_trail_multiplier = 4.0
 
-        # Track whether RSI was above 50 since entry (for momentum exit)
-        if crypto and crypto['rsi'].IsReady:
+        if self.market_regime != "bull" and crypto and crypto['rsi'].IsReady:
             rsi_now = crypto['rsi'].Current.Value
             if rsi_now > 50:
                 self.rsi_peaked_above_50[symbol] = True
@@ -1122,9 +1120,9 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             elif pnl > trailing_activation and dd >= trailing_stop_pct:
                 tag = "Trailing Stop"
 
-            # ATR trailing stop: trail at highest_since_entry - 2x ATR (highest-anchored)
+            # ATR trailing stop: trail at highest_since_entry - 4x ATR in bull (highest-anchored)
             elif atr and entry > 0 and holding.Quantity != 0:
-                trail_offset = atr * self.atr_trail_mult
+                trail_offset = atr * atr_trail_multiplier
                 trail_level = highest - trail_offset  # anchor to highest price since entry
                 if crypto:
                     crypto['trail_stop'] = trail_level
@@ -1134,8 +1132,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     elif holding.Quantity < 0 and price >= crypto['trail_stop']:
                         tag = "ATR Trail"
 
-            # RSI Momentum Exit: RSI crosses back below 50 after being above it
-            if not tag and crypto and crypto['rsi'].IsReady:
+            # RSI Momentum Exit: RSI crosses back below 50 after being above it (skipped in bull market)
+            if not tag and self.market_regime != "bull" and crypto and crypto['rsi'].IsReady:
                 rsi_now = crypto['rsi'].Current.Value
                 if self.rsi_peaked_above_50.get(symbol, False) and rsi_now < 50:
                     tag = "RSI Momentum Exit"
