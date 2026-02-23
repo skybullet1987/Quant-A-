@@ -74,12 +74,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
         # === Trade frequency & timing ===
         self.skip_hours_utc         = []      # 24/7 trading – no skip hours
-        self.max_daily_trades       = 6       # drastically reduced from 20 to curb fee bleed
+        self.max_daily_trades       = 24      # increased to allow more opportunities
         self.daily_trade_count      = 0
         self.last_trade_date        = None
         self.exit_cooldown_hours    = 1.0     # 1-hour exit cooldown (raised from 15-min)
         self.cancel_cooldown_minutes = 1
-        self.max_symbol_trades_per_day = 2    # reduced from 5 to limit per-symbol churn
+        self.max_symbol_trades_per_day = 4    # increased from 2 to allow more per-symbol trades
 
         # === Fees & slippage ===
         self.expected_round_trip_fees = 0.0050   # 0.50% min (maker+maker)
@@ -107,6 +107,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.consecutive_losses    = 0
         self.max_consecutive_losses = 5    # pause + halve size for next 5 trades after 5 losses
         self._consecutive_loss_halve_remaining = 0
+        self.circuit_breaker_expiry = None  # halt new entries for 12h after 3 consecutive losses
 
         # === State ===
         self._positions_synced    = False
@@ -682,6 +683,15 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             self.consecutive_losses = 0
             self._log_skip("consecutive loss cooldown (5 losses)")
             return
+        # Circuit breaker: halt new entries for 12h after 3 consecutive losses
+        if self.consecutive_losses >= 3:
+            self.circuit_breaker_expiry = self.Time + timedelta(hours=12)
+            self.consecutive_losses = 0
+            self._log_skip("circuit breaker triggered (3 consecutive losses)")
+            return
+        if self.circuit_breaker_expiry is not None and self.Time < self.circuit_breaker_expiry:
+            self._log_skip("circuit breaker active")
+            return
         dynamic_max_pos = min(4, max(self.base_max_positions, int(val // self.max_position_usd) + 1))
         pos_count = get_actual_position_count(self)
         if pos_count >= dynamic_max_pos:
@@ -1081,8 +1091,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 and pnl >= self.partial_tp_threshold):
             if partial_smart_sell(self, symbol, 0.50, "Partial TP"):
                 self._partial_tp_taken[symbol] = True
-                self._breakeven_stops[symbol] = entry * 0.99
-                self.Debug(f"PARTIAL TP: {symbol.Value} | PnL:{pnl:+.2%} | SL→entry-1%")
+                if self.market_regime == "bull":
+                    self._breakeven_stops[symbol] = entry * 0.95
+                    self.Debug(f"PARTIAL TP: {symbol.Value} | PnL:{pnl:+.2%} | SL→entry-5% (bull)")
+                else:
+                    self._breakeven_stops[symbol] = entry * 0.98
+                    self.Debug(f"PARTIAL TP: {symbol.Value} | PnL:{pnl:+.2%} | SL→entry-2%")
                 return  # Don't trigger full exit this bar
 
         tag = ""
@@ -1126,7 +1140,10 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             if not tag and crypto and crypto['rsi'].IsReady:
                 rsi_now = crypto['rsi'].Current.Value
                 if self.rsi_peaked_above_50.get(symbol, False) and rsi_now < 50:
-                    tag = "RSI Momentum Exit"
+                    if self.market_regime == "bull" and pnl < 0.005:
+                        pass  # Do not exit at a loss during bull regime
+                    else:
+                        tag = "RSI Momentum Exit"
 
             # Volume Dry-up Exit: volume drops below 50% of entry volume for 2 bars (min 2h hold)
             if not tag and hours >= 2.0 and crypto and len(crypto['volume']) >= 2:
