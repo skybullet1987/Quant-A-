@@ -163,6 +163,21 @@ class MicroScalpEngine:
                 elif adx_val > self.ADX_MODERATE_THRESHOLD and di_plus > di_minus:
                     # Moderate trend with bullish bias
                     components['adx_filter'] = 0.10
+                elif adx_val < self.ADX_STRONG_THRESHOLD and self.algo.market_regime == 'sideways':
+                    # Deep mean-reversion signal for sideways regime
+                    rsi_indicator = crypto.get('rsi')
+                    bb_lower_data = crypto.get('bb_lower', [])
+                    if (rsi_indicator is not None and rsi_indicator.IsReady
+                            and len(bb_lower_data) >= 1 and len(crypto['prices']) >= 1):
+                        rsi_val = rsi_indicator.Current.Value
+                        price = crypto['prices'][-1]
+                        lower_bb = bb_lower_data[-1]
+                        if lower_bb > 0 and price <= lower_bb * 1.005 and rsi_val < 35:
+                            components['adx_filter'] = 0.25
+                            if not self.algo.IsWarmingUp:
+                                self.algo.Debug(
+                                    f"Deep Mean Reversion (Sideways): rsi={rsi_val:.1f} "
+                                    f"price={price:.4f} bb_lower={lower_bb:.4f}")
                 elif adx_val <= self.ADX_MODERATE_THRESHOLD:
                     # Ranging market: use mean reversion signal instead of ADX
                     if (crypto['rsi'].IsReady and len(crypto['bb_lower']) >= 1
@@ -271,7 +286,10 @@ class MicroScalpEngine:
             size = 0.50
 
         if self.algo.market_regime == "bear":
-            size *= 0.70
+            size *= 0.25  # Bear: 25% of standard allocation
+        elif self.algo.market_regime == "sideways":
+            size *= 0.50  # Sideways: 50% of standard allocation
+        # Bull market: 100% of standard allocation (no adjustment needed)
 
         kelly = self.algo._kelly_fraction()
         return size * kelly
