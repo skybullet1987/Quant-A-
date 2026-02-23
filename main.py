@@ -70,7 +70,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         self.spread_median_window   = 12
         self.spread_widen_mult      = 2.5
         self.min_dollar_volume_usd  = 50000   # $50k/hour minimum (checked via 3h avg in execute)
-        self.min_volume_usd         = 100000  # $100k minimum VolumeInUsd for universe filter
+        self.min_volume_usd         = 10000000  # $10M minimum VolumeInUsd for universe filter
 
         # === Trade frequency & timing ===
         self.skip_hours_utc         = []      # 24/7 trading – no skip hours
