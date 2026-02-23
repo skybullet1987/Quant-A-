@@ -286,9 +286,9 @@ class MicroScalpEngine:
             size = 0.50
 
         if self.algo.market_regime == "bear":
-            size *= 0.25  # Bear: 25% of standard allocation
+            size *= 0.50  # Bear: 50% of standard allocation
         elif self.algo.market_regime == "sideways":
-            size *= 0.50  # Sideways: 50% of standard allocation
+            size *= 1.00  # Sideways: 100% of standard allocation
         # Bull market: 100% of standard allocation (no adjustment needed)
 
         kelly = self.algo._kelly_fraction()

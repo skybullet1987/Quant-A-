@@ -1069,7 +1069,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         elif self.market_regime == "bear":
             tp = min(tp, 0.015)
         elif self.market_regime == "sideways":
-            tp = min(tp, 0.015)
+            tp = min(tp, 0.030)
             sl = min(sl, 0.010)
         if self.market_regime == "bull":
             tp = max(tp * 3.0, 0.25)
@@ -1095,8 +1095,8 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     self._breakeven_stops[symbol] = entry * 0.95
                     self.Debug(f"PARTIAL TP: {symbol.Value} | PnL:{pnl:+.2%} | SL→entry-5% (bull)")
                 else:
-                    self._breakeven_stops[symbol] = entry * 0.98
-                    self.Debug(f"PARTIAL TP: {symbol.Value} | PnL:{pnl:+.2%} | SL→entry-2%")
+                    self._breakeven_stops[symbol] = entry * 1.002
+                    self.Debug(f"PARTIAL TP: {symbol.Value} | PnL:{pnl:+.2%} | SL→entry+0.2%")
                 return  # Don't trigger full exit this bar
 
         tag = ""
