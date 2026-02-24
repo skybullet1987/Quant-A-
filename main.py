@@ -15,7 +15,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
 
     def Initialize(self):
         self.SetStartDate(2025, 1, 1)
-        self.SetCash(20)
+        self.SetCash(1000)
         self.SetBrokerageModel(BrokerageName.Kraken, AccountType.Cash)
 
         # === Entry thresholds (scalp score 0-1) ===
@@ -993,7 +993,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
     def CheckExits(self):
         if self.IsWarmingUp:
             return
-        # Check rate limit hard block
+
         if self._rate_limit_until is not None and self.Time < self._rate_limit_until:
             return
         for kvp in self.Portfolio:
@@ -1001,11 +1001,11 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 self._failed_exit_attempts.pop(kvp.Key, None)
                 self._failed_exit_counts.pop(kvp.Key, None)
                 continue
-            # Skip symbols that have exceeded exit attempt limit to avoid infinite retry loops
+
             if self._failed_exit_counts.get(kvp.Key, 0) >= 3:
                 continue
             self._check_exit(kvp.Key, self.Securities[kvp.Key].Price, kvp.Value)
-        # Orphan recovery: re-track positions that exist in Portfolio but lost tracking
+
         for kvp in self.Portfolio:
             symbol = kvp.Key
             if not is_invested_not_dust(self, symbol):
@@ -1021,7 +1021,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             return
         if symbol in self._cancel_cooldowns and self.Time < self._cancel_cooldowns[symbol]:
             return
-        # Dust position detection: position too small to sell — try to liquidate, then clean up
+
         min_notional_usd = get_min_notional_usd(self, symbol)
         if price > 0 and abs(holding.Quantity) * price < min_notional_usd * 0.3:
             try:
@@ -1031,7 +1031,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             cleanup_position(self, symbol)
             self._failed_exit_counts.pop(symbol, None)
             return
-        # Sell-overshoot dust: rounded sell qty would exceed actual holding — clean up.
+
         actual_qty = abs(holding.Quantity)
         rounded_sell = round_quantity(self, symbol, actual_qty)
         if rounded_sell > actual_qty:
@@ -1054,7 +1054,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         hours = (self.Time - self.entry_times.get(symbol, self.Time)).total_seconds() / 3600
         minutes = hours * 60
 
-        # ATR-scaled TP and SL (with scalp floors)
+
         atr = crypto['atr'].Current.Value if crypto and crypto['atr'].IsReady else None
         if atr and entry > 0:
             sl = max((atr * self.atr_sl_mult) / entry, self.tight_stop_loss)
@@ -1080,13 +1080,13 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         trailing_activation = self.trail_activation
         trailing_stop_pct   = self.trail_stop_pct
 
-        # Track whether RSI was above 50 since entry (for momentum exit)
+
         if crypto and crypto['rsi'].IsReady:
             rsi_now = crypto['rsi'].Current.Value
             if rsi_now > 50:
                 self.rsi_peaked_above_50[symbol] = True
 
-        # --- Dynamic Partial Take Profit: sell 50% at +2.5%, move SL to breakeven ---
+
         if (not self._partial_tp_taken.get(symbol, False)
                 and pnl >= self.partial_tp_threshold):
             if partial_smart_sell(self, symbol, 0.50, "Partial TP"):
@@ -1100,9 +1100,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 return  # Don't trigger full exit this bar
 
         tag = ""
-        # min_notional_usd already computed above for dust check
 
-        # --- Priority 1: Stop Loss (or Breakeven Stop after partial TP) ---
         if self._partial_tp_taken.get(symbol, False):
             be_price = self._breakeven_stops.get(symbol, entry)
             if price <= be_price:
@@ -1110,21 +1108,21 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
         elif pnl <= -sl:
             tag = "Stop Loss"
 
-        # --- Stagnation Exit: 45+ minutes with < 0.5% unrealized profit (skipped in bull market) ---
+
         if not tag and self.market_regime != "bull" and minutes > self.stagnation_minutes and pnl < self.stagnation_pnl_threshold:
             tag = "Stagnation Exit"
 
-        # --- Priority 2: Non-stop exits (no minimum hold time — allow immediate exits for rapid spikes) ---
+
         elif not tag:
-            # Quick Take Profit (skip if partial TP already taken — let trailing stop handle exit)
+
             if not self._partial_tp_taken.get(symbol, False) and pnl >= tp:
                 tag = "Take Profit"
 
-            # Trailing Stop: activate at +0.8%, trail 0.5% from high
+
             elif pnl > trailing_activation and dd >= trailing_stop_pct:
                 tag = "Trailing Stop"
 
-            # ATR trailing stop: trail at highest_since_entry - 2x ATR (highest-anchored)
+
             elif atr and entry > 0 and holding.Quantity != 0:
                 trail_offset = atr * self.atr_trail_mult
                 trail_level = highest - trail_offset  # anchor to highest price since entry
@@ -1136,7 +1134,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     elif holding.Quantity < 0 and price >= crypto['trail_stop']:
                         tag = "ATR Trail"
 
-            # RSI Momentum Exit: RSI crosses back below 50 after being above it
+
             if not tag and crypto and crypto['rsi'].IsReady:
                 rsi_now = crypto['rsi'].Current.Value
                 if self.rsi_peaked_above_50.get(symbol, False) and rsi_now < 50:
@@ -1145,7 +1143,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     else:
                         tag = "RSI Momentum Exit"
 
-            # Volume Dry-up Exit: volume drops below 50% of entry volume for 2 bars (min 2h hold)
+
             if not tag and hours >= 2.0 and crypto and len(crypto['volume']) >= 2:
                 entry_vol = self.entry_volumes.get(symbol, 0)
                 if entry_vol > 0:
@@ -1154,15 +1152,15 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     if v1 < entry_vol * 0.50 and v2 < entry_vol * 0.50:
                         tag = "Volume Dry-up"
 
-            # Time Stop: exit after 4h if PnL < +0.3%
+
             if not tag and hours >= self.time_stop_hours and pnl < self.time_stop_pnl_min:
                 tag = "Time Stop"
 
-            # Extended Time Stop: exit after 6h if PnL < +1.5% (closes the dead zone between Time Stop and Take Profit)
+
             if not tag and hours >= self.extended_time_stop_hours and pnl < self.extended_time_stop_pnl_max:
                 tag = "Extended Time Stop"
 
-            # Stale Position Kill: after 8h, exit unconditionally
+
             if not tag and hours >= self.stale_position_hours:
                 tag = "Stale Position Exit"
 
@@ -1174,13 +1172,12 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
             sold = smart_liquidate(self, symbol, tag)
             if sold:
                 self._exit_cooldowns[symbol] = self.Time + timedelta(hours=self.exit_cooldown_hours)
-                # Clean up RSI peak tracking
+
                 self.rsi_peaked_above_50.pop(symbol, None)
                 self.entry_volumes.pop(symbol, None)
                 self.Debug(f"{tag}: {symbol.Value} | PnL:{pnl:+.2%} | Held:{hours:.1f}h")
             else:
-                # smart_liquidate failed — position is stuck (likely too small to sell)
-                # Force cleanup tracking to unblock the algo
+
                 self.Debug(f"⚠️ EXIT FAILED ({tag}): {symbol.Value} | PnL:{pnl:+.2%} | Held:{hours:.1f}h -- position unsellable, cleaning up")
                 cleanup_position(self, symbol)
                 self.rsi_peaked_above_50.pop(symbol, None)
@@ -1232,13 +1229,13 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                     self.highest_prices[symbol] = event.FillPrice
                     self.entry_times[symbol] = self.Time
                     self.daily_trade_count += 1
-                    # Record entry-hour volume for volume dry-up exit
+
                     crypto = self.crypto_data.get(symbol)
                     if crypto and len(crypto['volume']) >= 1:
                         self.entry_volumes[symbol] = crypto['volume'][-1]
                     self.rsi_peaked_above_50.pop(symbol, None)
                 else:
-                    # Partial TP sell: the remaining 50% is still held — skip cleanup and PnL recording
+
                     if symbol in self._partial_sell_symbols:
                         self._partial_sell_symbols.discard(symbol)
                     else:
@@ -1264,7 +1261,7 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                             'pnl_pct': pnl,
                             'exit_reason': 'filled_sell',
                         })
-                        # Activate cash mode if recent win rate is very low
+
                         if len(self._recent_trade_outcomes) >= 8:
                             recent_wr = sum(self._recent_trade_outcomes) / len(self._recent_trade_outcomes)
                             if recent_wr < 0.25:
@@ -1292,18 +1289,18 @@ class SimplifiedCryptoStrategy(QCAlgorithm):
                 if event.Direction == OrderDirection.Sell:
                     price = self.Securities[symbol].Price if symbol in self.Securities else 0
                     min_notional = get_min_notional_usd(self, symbol)
-                    # Check for dust position: too small to sell — clean up instead of retrying
+
                     if price > 0 and symbol in self.Portfolio and abs(self.Portfolio[symbol].Quantity) * price < min_notional:
                         self.Debug(f"DUST CLEANUP on invalid sell: {symbol.Value} — releasing tracking")
                         cleanup_position(self, symbol)
                         self._failed_exit_counts.pop(symbol, None)
                     else:
-                        # Track consecutive failed exit attempts to break infinite retry loops
+
                         fail_count = self._failed_exit_counts.get(symbol, 0) + 1
                         self._failed_exit_counts[symbol] = fail_count
                         self.Debug(f"Invalid sell #{fail_count}: {symbol.Value}")
                         if fail_count >= 3:
-                            # Force cleanup after repeated failures (dust position — stop retrying)
+
                             self.Debug(f"FORCE CLEANUP: {symbol.Value} after {fail_count} failed exits — releasing tracking")
                             cleanup_position(self, symbol)
                             self._failed_exit_counts.pop(symbol, None)
